@@ -71,6 +71,14 @@ func rotateAccount(a CookieAccount) (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
+	// 429 = 换得太勤，**不是失败**：响应体里带着服务端建议的下次间隔，照它重排即可。
+	// 旧代码把它当致命错误 return，scheduler 于是退回默认 600s —— 而 1PSIDTS 实测
+	// 约 10~15 分钟就过期，600s 的节奏刚好会踩到过期窗口。这里改成不报错、
+	// 不动 cookie、只回报间隔。真根因见 renewBoundCookies() 的说明。
+	if status == 429 {
+		logf("[rotate] 账号 #%d 保活被限流（429），按服务端建议间隔重排", a.ID)
+		return interval, nil
+	}
 	if status != 200 {
 		return 0, fmt.Errorf("RotateCookies 返回 HTTP %d: %s", status, truncate(string(respBody), 120))
 	}
@@ -221,6 +229,76 @@ func rotateDo(method, url string, headers map[string]string, body []byte, proxyU
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	return resp.StatusCode, resp.Header.Values("Set-Cookie"), b, err
+}
+
+// renewBoundCookies 主动续一次「设备绑定 cookie」（__Secure-1PSIDTS 一族）。
+//
+// ★ 为什么必须做这件事（2026-09-12 实测，本轮的真根因）★
+//
+//	__Secure-1PSIDTS 是有寿命的票，实测约 10~20 分钟就过期。过期后拿它打
+//	https://gemini.google.com/app 会返回「匿名单页」：HTTP 200，但页面里没有
+//	SNlM0e —— 上游把这次请求当匿名用户处理。于是 gw2a 判「cookie 失效」、
+//	fail_count 累加、账号被自动停用，客户端看到 502「重定向到登录页」。
+//	实测对照（同一份 cookie，只换 1PSIDTS 一项）：
+//	    刚换的新票 -> OK ；16/21/71 分钟前的旧票 -> 匿名单页。
+//
+//	POST https://accounts.google.com/RotateCookies 会直接下发新的
+//	__Secure-1PSIDTS / __Secure-3PSIDTS（实测 200 + Set-Cookie），续票后同一份
+//	cookie 立刻恢复可用。所以这不是「号坏了」，是「票旧了」，能自愈。
+//
+// 与 rotateAccount 的区别：rotateAccount 是给整个会话保活（拿 SIDCC 三项），
+// 本函数只关心把 *PSIDTS 续新，且**不把 429 当致命错误** —— Google 对
+// RotateCookies 有频率限制，回 429 时响应体里带着下一次该等多久，照着排即可。
+func renewBoundCookies(a CookieAccount) error {
+	proxyURL := ""
+	if a.ProxyID > 0 {
+		proxyURL = proxyURLByID(a.ProxyID)
+	}
+	id, _, pageSet, err := fetchRotateParams(a.Cookie, proxyURL)
+	if err != nil {
+		return err
+	}
+	cookie := mergeSetCookie(a.Cookie, pageSet)
+	body := fmt.Sprintf(`[%d,"%s"]`, rotateProductID, id)
+	headers := rotatePostHeaders()
+	headers["Cookie"] = cookie
+	status, setCookie, respBody, err := rotatePost(rotatePostURL, headers, []byte(body), proxyURL)
+	if err != nil {
+		return err
+	}
+	// 429 = 换得太勤，不是失败：响应体里带着服务端建议的间隔，照它等就行。
+	// 这种情况不改 cookie（也没给 Set-Cookie），直接当成功返回，别让健康度背锅。
+	if status == 429 {
+		logf("[renew] 账号 #%d 续票被限流（429），等下一轮：%s", a.ID, truncate(string(respBody), 90))
+		return nil
+	}
+	if status != 200 {
+		return fmt.Errorf("RotateCookies 返回 HTTP %d: %s", status, truncate(string(respBody), 120))
+	}
+	merged := mergeSetCookie(cookie, setCookie)
+	if names := setCookieNames(setCookie); len(names) > 0 {
+		logf("[renew] 账号 #%d 续票刷新了 %s", a.ID, strings.Join(names, ", "))
+	}
+	if merged != a.Cookie {
+		updateAccountCookie(a.ID, merged)
+	}
+	return nil
+}
+
+// renewAccountBoundCookies 按 id 续票，返回续票后的新 cookie（失败返回原 cookie）。
+func renewAccountBoundCookies(id int64) string {
+	a := accountByID(id)
+	if a == nil {
+		return ""
+	}
+	if err := renewBoundCookies(*a); err != nil {
+		logf("[renew] 账号 #%d 续票失败（忽略，不改健康度）：%v", id, err)
+		return a.Cookie
+	}
+	if fresh := accountByID(id); fresh != nil {
+		return fresh.Cookie
+	}
+	return a.Cookie
 }
 
 // rotateAllAccounts 给池子里每个启用的账号做一次保活，返回下次该等多久。

@@ -513,15 +513,63 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了
 	invalidateXSRF(a.Cookie)
 	_, err = getXSRF(a.Cookie, proxyURL)
+	// ★ 续票复检（2026-09-12 实测的真根因）★
+	//   __Secure-1PSIDTS 是有寿命的票（实测约 10~20 分钟）。票一旧，带着它打
+	//   /app 就只会拿到「匿名单页」（200 但没有 SNlM0e），看起来跟 cookie 真失效
+	//   一模一样。但这不是号坏了 —— POST RotateCookies 换张新票，同一份 cookie
+	//   立刻恢复。所以检测遇到这个症状时，先自动续一次票再复检，
+	//   只有续票之后仍然不行，才真的判失效（否则好号会被一遍遍误停用）。
+	stale := looksLikeStaleSession(err)
+	if stale {
+		// 第一步：进程内续票（最便宜，不动浏览器）。
+		if fresh := renewAccountBoundCookies(a.ID); fresh != "" && fresh != a.Cookie {
+			a.Cookie = fresh
+			invalidateXSRF(fresh)
+			if tok, err2 := getXSRF(fresh, proxyURL); err2 == nil && tok != "" {
+				logf("[cookie] 账号 #%d 检测时续票成功，恢复可用", a.ID)
+				err = nil
+			} else {
+				err = err2
+			}
+		}
+	}
+	if err != nil && looksLikeStaleSession(err) {
+		// 第二步：票已经彻底过期时 RotateCookies 会回 401，换不出新票了。
+		// 但**浏览器里那份 cookie 永远是新鲜的**，所以回落到「浏览器刷新」这条
+		// 真实自愈路径：让 Chromium 重新访问 Gemini，把新票读回来入库。
+		// 实测这条路径可用（[browser] profile "acct1" cookie 已刷新）。
+		if a.Source == "browser" && a.Profile != "" {
+			logf("[browser] 账号 #%d 会话票已过期，尝试用浏览器刷新自愈", a.ID)
+			if ok2, _, berr := browserRefreshOne(a.Label, a.Profile); ok2 && berr == nil {
+				if fresh := accountByID(a.ID); fresh != nil && fresh.Cookie != "" {
+					a.Cookie = fresh.Cookie
+					invalidateXSRF(fresh.Cookie)
+					if tok, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil && tok != "" {
+						logf("[cookie] 账号 #%d 浏览器刷新后恢复可用", a.ID)
+						err = nil
+					} else {
+						err = err2
+					}
+				}
+			} else if berr != nil {
+				logf("[browser] 账号 #%d 浏览器刷新未成功（忽略，不改健康度）：%v", a.ID, berr)
+			}
+		}
+	}
 	took := time.Since(t0).Milliseconds()
 	if err != nil {
 		// 只有确凿的鉴权失败才记进 fail_count。断网/代理挂时 getXSRF 返回
 		// EOF，如果也累加，点几次「检测」就能把好号停用（历史上真发生过）。
-		if st := xsrfAuthStatus(err); st == 401 || st == 403 {
+		//
+		// ★ 会话票过期（no SNlM0e）同样不算 ★
+		//   实测它绝大多数只是 __Secure-1PSIDTS 过期，续票/浏览器刷新就能恢复，
+		//   属于「可自愈的暂时态」。若也累加 fail_count，3 次就会把好号自动停用，
+		//   于是「web 明明登录着」却永久 502 —— 这正是用户报的故障。
+		//   只更新 last_error 让面板看得见，不碰 fail_count。
+		if st := xsrfAuthStatus(err); (st == 401 || st == 403) && !looksLikeStaleSession(err) {
 			markAccountResult(a.ID, false, err.Error())
 		} else {
-			// 网络类失败顺手把 last_error 清掉，避免面板一直挂着旧的鉴权错误
-			_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=? AND fail_count=0`, "", a.ID)
+			_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`, err.Error(), a.ID)
 		}
 		return CookieCheck{Detail: explainCookieFailure(err), ProxyName: name, TookMs: took}
 	}
@@ -533,14 +581,40 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	return CookieCheck{OK: true, Detail: detail, ProxyName: name, TookMs: took}
 }
 
+// looksLikeStaleSession 判断这个错误是不是「票旧了」而不是「号没了」。
+//
+// 「票旧」的症状：/app 打得开（200）但页面里没有 SNlM0e —— 上游把请求当匿名处理。
+// 实测这几乎总是 __Secure-1PSIDTS 过期导致的（见 renewBoundCookies 的说明），
+// 换张新票就好，不该判号死。
+func looksLikeStaleSession(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no SNlM0e")
+}
+
 // explainCookieFailure 把底层错误翻成运维看得懂的结论。
 func explainCookieFailure(err error) string {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no SNlM0e"):
-		return "cookie 已失效：页面能打开但没有登录态，请求会被当匿名处理"
-	case strings.Contains(msg, "HTTP 302"):
-		return "cookie 无效：被重定向到登录页"
+		return "cookie 的会话票已过期（页面能打开但被当匿名）：多为 __Secure-1PSIDTS 过期，续票后即可恢复；若持续如此才考虑重新登录"
+	case strings.Contains(msg, "HTTP 302"), strings.Contains(msg, "HTTP 30"):
+		// 302 有好几种来源，必须分开说 —— 见 xsrf.go 的 httpStatusErr()。
+		// 历史上这里把所有 302 都当 cookie 失效，害得出口被反爬时
+		// 好 cookie 被反复判死。
+		switch {
+		case strings.Contains(msg, "sorry/index"), strings.Contains(msg, "/sorry/"):
+			return "出口被上游反爬拦截（302 sorry 页），不是 cookie 的问题；换出口或等几分钟再试"
+		case strings.Contains(msg, "consent"):
+			return "出口需要过同意页（302 consent），不是 cookie 的问题"
+		case strings.Contains(msg, "ServiceLogin"), strings.Contains(msg, "signin"),
+			strings.Contains(msg, "accountchooser"), strings.Contains(msg, "accounts.google.com"):
+			return "cookie 无效：被重定向到登录页"
+		default:
+			return "上游返回 302（非登录跳转），cookie 大概率没问题：" + msg
+		}
 	case strings.Contains(msg, "HTTP 429"), strings.Contains(msg, "sorry"):
 		return "出口被上游限流，换个代理再试（不是 cookie 的问题）"
 	default:

@@ -102,6 +102,51 @@
 
 上游行为：代理一挂，所有请求报错 → cookie 被标 401 → `fail_count` 累加 → 账号被自动停用 → 代理恢复后还得手动启用。修复后网络错误不计入健康度，只有确凿的 401/403 才降级。
 
+### 4b. 会话票过期（__Secure-1PSIDTS）自愈
+
+**这是「web 明明登录着，抓到的 cookie 却报 502 / 重定向登录页」的真根因**，
+2026-09-12 用对照实验钉死。
+
+Google 的登录态里有一张**有寿命的票** `__Secure-1PSIDTS`（`__Secure-3PSIDTS` 同值）。
+它约 **10~20 分钟**就会过期。过期后拿它去请求 `https://gemini.google.com/app`：
+
+| 实验（同一份 cookie，只换 `__Secure-1PSIDTS` 一项） | 结果 |
+|---|---|
+| 刚换到的新票 | HTTP 200 + 页面含 `SNlM0e`（**已登录**）|
+| 16 分钟前的票 | HTTP 200 但**无 `SNlM0e`**（**匿名单页**）|
+| 21 分钟前的票 | 匿名单页 |
+| 71 分钟前的票 | 匿名单页 |
+| 把该项删掉 / 改成垃圾值 | 匿名单页（3/3 复现）|
+
+关键点：**这种情况下 `SID` / `SAPISID` / `__Secure-1PSID` 全都完好、有效期到 2027**，
+所以只按 cookie 名字判断会说「已登录」，而服务端其实把请求当匿名处理。
+原代码把它翻译成「cookie 无效 → 累加 `fail_count` → 3 次自动停用账号」，
+于是好号被判死、客户端一路 502。
+
+**修复**（都在 `internal/app/`）：
+
+1. `rotate.go` 新增 `renewBoundCookies()`：主动 `POST accounts.google.com/RotateCookies`
+   换新票（实测 200 + `Set-Cookie: __Secure-1PSIDTS=...`），换完同一份 cookie
+   立刻恢复。429 视为「换太勤」而非失败，不报错、不改健康度。
+2. `cookie_pool.go` 的 `checkAccountCookie()`：出现「匿名单页」症状时先自动续票复检；
+   票已彻底过期（RotateCookies 回 401）则回落到**浏览器刷新**这条自愈路径
+   （Chromium 里那份 cookie 永远是新鲜的）。**且该症状不再累加 `fail_count`**。
+3. `scheduler.go`：保活间隔从服务端建议的 600s 收紧到 `min(建议值, 300s)`
+   （`maxRotateInterval`）。服务端提示的 600s 恰好压在票据过期边界上，
+   按 600s 走会周期性踩进「票已过期、下一轮还没到」的窗口。
+4. `xsrf.go` 的 `xsrfAuthStatus()`：`no SNlM0e` 不再算 401（原因同上）。
+
+实测验证（故障注入 → 自愈）：
+
+```
+[renew]   账号 #63 续票失败（忽略，不改健康度）：取轮转页返回 HTTP 401
+[browser] 账号 #63 会话票已过期，尝试用浏览器刷新自愈
+[browser] profile "acct1" cookie 已刷新 -> 账号 #63
+[cookie]  账号 #63 浏览器刷新后恢复可用
+```
+
+故障注入期间 `fail_count` 保持 0、账号未被停用；连续 25 次 chat 请求 25/25 成功。
+
 ### 5. 生图会话删除独立开关
 
 上游只有一个「自动删网页会话」开关，对对话和生图一视同仁。但两者的诉求正好相反：
@@ -436,6 +481,26 @@ docker compose up -d          # 监听 :4010
 2. 扩展是否装上 —— `curl -s http://127.0.0.1:9280/extension-id` 应该返回扩展 ID。
 3. 出口 IP 是否一致 —— 浏览器和 cookie 池必须走同一个出口。NAS 双栈时 v4/v6 出口不一致，直连会被 Google 判定可疑。
 4. 扩展 ID 是否与 systemd 里的 `GW2A_EXT_ID` 一致 —— 重装扩展会换 ID。
+
+**Q：web 明明登录着，但抓到的 cookie 一直报 502 / 重定向登录页？**
+
+多半是 `__Secure-1PSIDTS` 这张**有寿命的票**过期了（约 10~20 分钟）：
+过期后 `/app` 会返回「匿名单页」（HTTP 200 但无 `SNlM0e`），表现和 cookie 真失效
+一模一样。项目已内置三层自愈（续票 → 浏览器刷新 → 不累加 `fail_count`），
+正常情况下无需人工干预。详见上一节「4b. 会话票过期自愈」。
+
+若长时间不恢复，按顺序排查：
+
+1. VNC 打开 Chromium，确认 `gemini.google.com/app` 里确实是已登录状态；
+2. `docker logs --tail 50 gemini-web2api | grep -E 'rotate|renew|browser'`
+   看保活是否在按 ~300s 周期刷新 `__Secure-1PSIDTS`；
+3. 手动触发一次检测自愈：
+
+```bash
+curl -s -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  http://127.0.0.1:8083/admin/api/cookies/<id>/check
+```
+
 
 **Q：所有请求 502。**
 

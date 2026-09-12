@@ -40,11 +40,28 @@ func startScheduler() {
 			case <-proxyReload.C:
 				loadProxies()
 			case <-rotate.C:
-				rotate.Reset(rotateAllAccounts())
+				// 把保活周期压到最多 5 分钟：__Secure-1PSIDTS 实测约 10~20 分钟就
+				// 过期，过期后 /app 会变「匿名单页」、请求被判 cookie 失效（真根因，
+				// 2026-09-12 定位）。服务端在轮转页里给的是 600s，光听它的会踩到
+				// 过期窗口，所以再取 min 兜底。
+				next := rotateAllAccounts()
+				if next <= 0 || next > maxRotateInterval {
+					next = maxRotateInterval
+				}
+				rotate.Reset(next)
 			}
 		}
 	}()
 }
+
+// maxRotateInterval 是会话保活的最大间隔。
+//
+// 服务端在 RotateCookiesPage 里提示 600s，但 __Secure-1PSIDTS 本身约 10~20 分钟
+// 就过期，按 600s 走会踩到「票刚过期、下一轮还没到」的窗口 —— 那段时间里每个请求
+// 都拿不到 SNlM0e，会被一路判成 cookie 失效。实测证据见 renewBoundCookies()。
+// 取 300s 留出余量：既不会频繁到被 Google 限流（RotateCookies 会回 429），
+// 又保证票据在过期前就被换新。
+const maxRotateInterval = 5 * time.Minute
 
 // aggregateHourlyCatchup walks every hour bucket from the latest aggregated
 // hour up to (now - 1h), so a long downtime catches up cleanly.
