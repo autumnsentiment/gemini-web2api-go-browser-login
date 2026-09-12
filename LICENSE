@@ -1,16 +1,7 @@
 MIT License
 
 Copyright (c) 2026 gemini-web2api-go contributors
-
-This project is a derivative work based on
-  gemini-web2api-go  (https://github.com/zexadev/gemini-web2api-go)
-which is licensed under the MIT License and whose original copyright
-notice is reproduced above. Substantial portions of this repository
-(the Go backend under internal/ and main.go) originate from that project.
-
-Modifications and additional components in this repository
-(browser login automation under tools/, OpenAI image endpoints, and
-deployment assets under deploy/) are released under the same MIT terms.
+Copyright (c) 2026 gemini-web2api-go-browser-login contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

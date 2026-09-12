@@ -430,11 +430,13 @@ curl -s -o /dev/null -w '%{http_code}\n' -x http://<你的代理> https://gemini
 
 MIT License —— 详见 [LICENSE](LICENSE)。
 
-上游 `gemini-web2api-go` 同样是 MIT，原始版权声明已在本仓库 LICENSE 中保留：
+上游 `gemini-web2api-go` 同样是 MIT，其原始版权声明已在本仓库 LICENSE 中保留：
 
 ```
-Copyright (c) 2026 gemini-web2api-go contributors   (上游)
-Copyright (c) 2026 gemini-web2api-go contributors   (本派生版)
+Copyright (c) 2026 gemini-web2api-go contributors              (上游)
+Copyright (c) 2026 gemini-web2api-go-browser-login contributors (本派生版)
 ```
+
+详细的来源与改动清单见 [NOTICE.md](NOTICE.md)。
 
 再次致谢上游作者 [@zexadev](https://github.com/zexadev)。
