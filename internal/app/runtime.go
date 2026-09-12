@@ -46,7 +46,11 @@ type RuntimeConfig struct {
 	// 对话不撞单请求墙——对 Codex 这类长会话有用，对"喂长文档"没用。
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果自动删掉 gemini.google.com 上的这条会话（#19）。只登录态生效。默认 false。
+	// 作用于**非生图**请求（对话 / 音乐 / 视频 / 画布）。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
+	// AutoDeleteImageConversation 单独控制**生图**（gemini-image）是否自动删网页会话。
+	// 生图会话常常想留着复看 / 二次编辑，跟对话的诉求相反，所以拆成独立开关。默认 false。
+	AutoDeleteImageConversation bool `json:"auto_delete_image_conversation"`
 	// 浏览器登录自动刷新间隔（分钟）。0 = 用启动配置/默认 10。
 	BrowserRefreshMinutes int `json:"browser_refresh_minutes"`
 }
@@ -81,7 +85,8 @@ func initRuntimeConfig() {
 		MaxPromptBytes:   cfg.MaxPromptBytes,
 		MultiTurn:        cfg.MultiTurn,
 
-		AutoDeleteConversation: cfg.AutoDeleteConversation,
+		AutoDeleteConversation:      cfg.AutoDeleteConversation,
+		AutoDeleteImageConversation: cfg.AutoDeleteImageConversation,
 	}
 	base.BrowserRefreshMinutes = cfg.BrowserRefreshMinutes
 	if raw := kvGet(runtimeConfigKey); raw != "" {

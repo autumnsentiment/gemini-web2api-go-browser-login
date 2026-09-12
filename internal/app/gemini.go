@@ -685,7 +685,11 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
 		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
-		if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
+		//
+		// 开关按模型类型分流：生图（gemini-image）走独立开关 AutoDeleteImageConversation，
+		// 其余（对话 / 音乐 / 视频 / 画布）走 AutoDeleteConversation。生图会话常要留着
+		// 复看或二次编辑，跟对话的诉求相反，所以面板上是两个开关。
+		if autoDeleteForTool(mc.Tool) && cookieStr != "" && xsrfToken != "" {
 			if cid := extractConversationID(string(raw)); cid != "" {
 				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
 			}
@@ -696,6 +700,19 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		markCookieByStatus(cookieID, lastStatus, lastErr.Error())
 	}
 	return attrib(lastErr)
+}
+
+// autoDeleteForTool 决定某个模型类型出完结果后要不要自动删网页会话。
+//
+// 生图（toolImage）单独一个开关，其余（对话 / 音乐 / 视频 / 画布）共用原来那个。
+// 拆开的原因：生图会话是「资产」，用户常想回网页端复看或二次编辑；对话会话是
+// 「过程」，留着只会在账号里堆垃圾。两者的诉求正好相反，用一个开关绑死必然有一边别扭。
+func autoDeleteForTool(tool int) bool {
+	rt := rtCfg()
+	if tool == toolImage {
+		return rt.AutoDeleteImageConversation
+	}
+	return rt.AutoDeleteConversation
 }
 
 // upstreamModelRe 匹配响应帧里服务端自报的模型显示名（帧的 [42] 位）。

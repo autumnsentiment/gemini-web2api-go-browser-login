@@ -43,7 +43,12 @@ type Config struct {
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果是否自动删掉 gemini.google.com 上留下的这条会话（#19，rpc GzXR5e）。
 	// 只登录态生效（删除要 XSRF）；异步 best-effort，删失败只记日志不影响响应。默认 false。
+	// 作用于**非生图**请求（对话 / 音乐 / 视频 / 画布）；生图另有开关，见下一项。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
+	// AutoDeleteImageConversation 单独控制**生图**（gemini-image）是否自动删网页会话。
+	// 生图会话常常想留着复看 / 二次编辑，跟对话的诉求相反，所以从上面那个开关里拆出来。
+	// 同样只登录态生效，异步 best-effort。默认 false。
+	AutoDeleteImageConversation bool `json:"auto_delete_image_conversation"`
 
 	// 浏览器登录（Chromium CDP）支持。浏览器跑在旁边的 chromium(VNC) 容器，
 	// 由 controller.js 管理独立 Chromium profile。留空 = 关闭该功能。
@@ -91,6 +96,8 @@ func defaultConfig() Config {
 		MaxPromptBytes:         128000,
 		MultiTurn:              false,
 		AutoDeleteConversation: false,
+		// 生图会话单独开关，默认与对话一致（都不删）。
+		AutoDeleteImageConversation: false,
 	}
 }
 
