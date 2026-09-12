@@ -1,0 +1,46 @@
+services:
+  gemini-web2api:
+    # 本地构建镜像：加入 Chromium CDP「浏览器登录」支持
+    image: gemini-web2api:local-browser
+    container_name: gemini-web2api
+    restart: unless-stopped
+    ports:
+      - "8083:8083"
+    volumes:
+      - gw2a-data:/data
+    environment:
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-change-me-in-production}"
+      TZ: "${TZ:-UTC}"
+      # 浏览器登录：宿主机上的 profile 控制器（systemd: gw2a-browser-controller）
+      # 172.21.0.1 = gemini-web2api-go_default 网络的 docker 宿主网关
+      BROWSER_CONTROLLER_URL: "http://172.21.0.1:9280"
+      BROWSER_CDP_HOST: "172.21.0.1"
+      # 用户在自己浏览器打开 Chromium 桌面(VNC Web) 的地址
+      BROWSER_ACCESS_URL: "http://NAS_HOST:16100/"
+    networks:
+      - default
+      - newapinet
+      - trim
+    healthcheck:
+      test: ["CMD", "/app/gemini-web2api", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  gw2a-data:
+
+networks:
+  default:
+    name: gemini-web2api-go_default
+  newapinet:
+    external: true
+    name: new-api_new-api-network
+  trim:
+    external: true
+    name: trim-default

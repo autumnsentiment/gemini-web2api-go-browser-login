@@ -1,0 +1,21 @@
+[Unit]
+Description=gw2a VNC path proxy (/chromium/ on 127.0.0.1:3000 -> Xkasmvnc :13 @16100)
+After=network-online.target gw2a-xkasmvnc.service
+Wants=network-online.target gw2a-xkasmvnc.service
+
+[Service]
+Type=simple
+User=root
+Environment=GW2A_VNC_PROXY_HOST=127.0.0.1
+Environment=GW2A_VNC_PROXY_PORT=3000
+Environment=GW2A_VNC_UPSTREAM_HOST=127.0.0.1
+Environment=GW2A_VNC_UPSTREAM_PORT=16100
+Environment=GW2A_VNC_PREFIX=/chromium
+ExecStart=/usr/bin/node /opt/gw2a-browser-controller/vnc-proxy.js
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/gw2a-vnc-proxy.log
+StandardError=append:/var/log/gw2a-vnc-proxy.log
+
+[Install]
+WantedBy=multi-user.target

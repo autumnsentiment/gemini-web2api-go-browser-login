@@ -1,0 +1,21 @@
+[Unit]
+Description=gw2a Chromium desktop (Xkasmvnc :13) for gemini-web2api browser login
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fygo-browser
+Group=fygo-browser
+WorkingDirectory=/vol2/@appcenter/fygo-browser/app/vendor/runtime
+Environment=HOME=/vol2/@appdata/gw2a-browser/home
+Environment=XDG_RUNTIME_DIR=/vol2/@appdata/gw2a-browser/run
+Environment=LD_LIBRARY_PATH=/vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/lib/x86_64-linux-gnu:/vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/lib
+Environment=PATH=/vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/bin:/vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/sbin:/vol2/@appcenter/fygo-browser/app/vendor/runtime/bin:/usr/bin:/bin
+ExecStart=/vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/bin/Xkasmvnc :13 -geometry 1280x720 -depth 24 -desktop gw2a-browser -interface 0.0.0.0 -rfbport 16101 -websocketPort 16100 -httpd /vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/share/kasmvnc/www -disableBasicAuth -SecurityTypes None -xkbdir /vol2/@appcenter/fygo-browser/app/vendor/runtime/usr/share/X11/xkb
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

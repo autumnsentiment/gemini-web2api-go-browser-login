@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Gemini Cookie Sync</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --fg:#e8eaed; --muted:#9aa0a6; --ok:#34a853; --bad:#ea4335; --warn:#fbbc04; --line:#2a2f3a; }
+  * { box-sizing:border-box; }
+  body { width:340px; margin:0; padding:14px; background:var(--bg); color:var(--fg);
+         font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:14px; margin:0 0 10px; display:flex; align-items:center; gap:6px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); } .dot.warn { background:var(--warn); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; margin-bottom:10px; }
+  .row { display:flex; justify-content:space-between; gap:8px; margin:4px 0; }
+  .row .k { color:var(--muted); flex:0 0 auto; }
+  .row .v { text-align:right; word-break:break-all; }
+  label.f { display:block; margin:8px 0 2px; color:var(--muted); }
+  input[type=text], input[type=number] { width:100%; background:#0b0d11; border:1px solid var(--line);
+       color:var(--fg); border-radius:7px; padding:6px 8px; font:inherit; }
+  .chk { display:flex; align-items:center; gap:6px; margin:6px 0; }
+  .btns { display:flex; gap:8px; margin-top:10px; }
+  button { flex:1; background:#2b6cb0; border:0; color:#fff; border-radius:8px; padding:7px 8px;
+       font:inherit; cursor:pointer; }
+  button.sec { background:#2a2f3a; }
+  button:disabled { opacity:.5; cursor:default; }
+  .hint { color:var(--muted); font-size:11px; margin-top:8px; }
+  .mono { font-family:ui-monospace,Consolas,monospace; font-size:11px; }
+</style>
+</head>
+<body>
+  <h1><span id="dot" class="dot"></span> Gemini Cookie Sync</h1>
+
+  <div class="card">
+    <div class="row"><span class="k">登录状态</span><span class="v" id="login">—</span></div>
+    <div class="row"><span class="k">Cookie 数</span><span class="v" id="ckcount">—</span></div>
+    <div class="row"><span class="k">上次保活</span><span class="v" id="lastka">—</span></div>
+    <div class="row"><span class="k">上次入池</span><span class="v" id="lastsync">—</span></div>
+    <div class="row"><span class="k">入池结果</span><span class="v mono" id="syncdetail">—</span></div>
+  </div>
+
+  <div class="card">
+    <label class="f">Profile 标识</label>
+    <input type="text" id="profile" placeholder="browser1">
+    <label class="f">控制器地址</label>
+    <input type="text" id="controller" placeholder="http://127.0.0.1:9280">
+    <label class="f">控制器密钥（可空）</label>
+    <input type="text" id="token" placeholder="">
+
+    <div class="chk"><input type="checkbox" id="enabled"><label for="enabled">启用扩展（自动保活/入池）</label></div>
+    <div class="chk"><input type="checkbox" id="autoKeepalive"><label for="autoKeepalive">自动保活</label></div>
+    <label class="f">保活间隔（分钟）</label>
+    <input type="number" id="keepalivePeriodMin" min="1" step="1">
+    <label class="f">入池间隔（分钟）</label>
+    <input type="number" id="autoSyncMin" min="1" step="1">
+    <label class="f">刷新冷却（秒，防风控）</label>
+    <input type="number" id="refreshCooldownSec" min="10" step="5">
+  </div>
+
+  <div class="btns">
+    <button id="btnSave" class="sec">保存</button>
+    <button id="btnKa" class="sec">立即保活</button>
+    <button id="btnSync">立即入池</button>
+  </div>
+  <div class="hint">保活/入池=刷新已有 gemini 页面（不新开页面）让 Google 轮换会话 cookie；每次刷新后有冷却窗口，窗口内只提取 cookie、不重复刷新。</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

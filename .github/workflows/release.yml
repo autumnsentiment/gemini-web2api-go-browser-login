@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 建 Release、传附件要写权限
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # tag 和代码里的 Version 常量对不上就直接失败。
+      # 否则会发出一个 v4.0.1 的包、里面 --version 却打印 4.0.0，
+      # 而这种错要等用户报上来才会发现。
+      - name: Check tag matches Version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # 用 sed 不用 grep -oP：-P 依赖 PCRE 且在非 UTF-8 locale 下直接罢工
+          code=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' internal/app/server.go)
+          echo "tag=$tag  internal/app/server.go=$code"
+          [ "$tag" = "$code" ] || { echo "::error::tag $tag 与 internal/app/server.go 里的 $code 不一致"; exit 1; }
+
+      - run: go test ./...
+
+      # CGO_ENABLED=0：SQLite 用的是 modernc.org/sqlite（纯 Go），
+      # 所以交叉编译不需要各平台的 C 工具链，直接 GOOS/GOARCH 就行。
+      - name: Cross compile
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          ver="${GITHUB_REF_NAME}"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            out="dist/gemini-web2api-go_${ver}_${os}_${arch}"
+            [ "$os" = "windows" ] && bin="$out.exe" || bin="$out"
+            echo "building $bin"
+            GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "$bin" .
+          done
+          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      # 从 CHANGELOG.md 抽出本 tag 对应的那一节，拼进 Release 说明。
+      # 抽法：从 `## <版本号>` 那行的下一行起，到下一个 `## ` 之前。
+      # 抽不到（没写 CHANGELOG）就留空，靠下面 generate_release_notes 的提交列表兜底。
+      - name: Build release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          {
+            echo "单二进制，下载对应平台的那个直接跑，不需要 Go 也不需要 Docker："
+            echo
+            echo '```bash'
+            echo 'chmod +x gemini-web2api-go_*'
+            echo './gemini-web2api-go_* --port 8083 --admin-token your-admin-token'
+            echo '```'
+            echo
+            echo "容器部署见 \`ghcr.io/${{ github.repository }}\`。校验完整性用 \`SHA256SUMS.txt\`。"
+            section=$(awk -v v="$ver" '$0=="## "v{f=1;next} /^## /{f=0} f' CHANGELOG.md)
+            if [ -n "$section" ]; then
+              echo
+              echo "## 本版更新"
+              echo "$section"
+            fi
+          } > release_body.md
+          cat release_body.md
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body_path: release_body.md

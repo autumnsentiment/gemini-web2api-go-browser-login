@@ -1,0 +1,20 @@
+{
+  "port": 8083,
+  "host": "0.0.0.0",
+  "db_path": "./data/gemini.db",
+  "admin_enabled": true,
+  "admin_token": "",
+  "impersonate": "chrome_146",
+  "default_model": "gemini-3.6-flash",
+  "retry_attempts": 3,
+  "retry_delay_sec": 2,
+  "request_timeout_sec": 180,
+  "retention_days": 30,
+  "per_ip_concurrent": 5,
+  "per_ip_rpm": 30,
+  "per_ip_rph": 80,
+  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+  "cookie_file": "",
+  "proxy": "",
+  "log_requests": true
+}

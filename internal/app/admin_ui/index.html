@@ -1,0 +1,2312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gemini-web2api 管理面板</title>
+<!-- Chart.js 随二进制一起 embed，不走 CDN：内网/离线部署也要能开面板 -->
+<script src="chart.umd.min.js"></script>
+<style>
+  /* ── Gemini 设计语言（亮色）────────────────────────────────────────────
+     照 gemini.google.com 本体：页面是带蓝调的白(#F8FAFD)，卡片纯白**不描边**，
+     靠底色反差和 16px 圆角分离——满屏描边会让页面变成一堆盒子，这是最不像
+     Gemini 的做法。侧栏与页面同色、无分隔线，可折叠；选中态是 Material 3 的
+     secondary-container(#D3E3FD) 配 #0B57D0。
+     品牌三色（蓝→紫→粉）全站只出现在一个地方：那条封禁红线轨道。 */
+  :root {
+    --g-blue: #4285F4;
+    --g-purple: #9B72CB;
+    --g-pink: #D96570;
+    --g-sweep: linear-gradient(90deg, #4285F4 0%, #9B72CB 58%, #D96570 100%);
+
+    --bg: #F8FAFD;
+    --card: #FFFFFF;
+    --surface-hi: #EFF3FA;
+    --surface-press: #E2E8F1;
+    --outline: #D5DAE1;
+    --outline-soft: #E8ECF1;
+    --nav-on: #D3E3FD;
+    --nav-on-fg: #0B57D0;
+
+    --text: #1F1F1F;
+    --text-2: #3C4043;
+    --muted: #5F6368;
+    --ok: #146C2E;
+    --ok-bg: #E6F4EA;
+    --fail: #B3261E;
+    --fail-bg: #FCEEEE;
+    --warn: #8F5000;
+    --warn-bg: #FDF0E0;
+
+    --sb-w: 244px;
+    --sb-w-collapsed: 72px;
+    --topbar-h: 60px;
+    --r-card: 16px;
+    --r-pill: 999px;
+    --sans: "Google Sans Text", "Google Sans", "Product Sans", -apple-system,
+            BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+            "Microsoft YaHei", sans-serif;
+    --mono: "Roboto Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+    --shadow: 0 1px 2px rgba(60,64,67,.06), 0 1px 3px 1px rgba(60,64,67,.05);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--sans); background: var(--bg); color: var(--text);
+    font-size: 14px; line-height: 1.55; -webkit-font-smoothing: antialiased;
+  }
+  #app { display: flex; min-height: 100vh; }
+  ::selection { background: var(--nav-on); }
+
+  /* ── 侧栏 ───────────────────────────────────────────────────────────── */
+  .sidebar {
+    width: var(--sb-w); flex: 0 0 var(--sb-w); padding: 10px 12px 14px;
+    display: flex; flex-direction: column;
+    position: sticky; top: 0; height: 100vh;
+    transition: width .2s cubic-bezier(.2,0,0,1), flex-basis .2s cubic-bezier(.2,0,0,1);
+  }
+  .sidebar.collapsed { width: var(--sb-w-collapsed); flex-basis: var(--sb-w-collapsed); }
+  .side-top { display: flex; align-items: center; gap: 6px; height: var(--topbar-h); }
+  .icon-btn {
+    all: unset; cursor: pointer; width: 40px; height: 40px; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: var(--r-pill); color: var(--text-2); transition: background .15s;
+  }
+  .icon-btn:hover { background: var(--surface-press); }
+  .icon-btn:focus-visible { outline: 2px solid var(--g-blue); outline-offset: 2px; }
+  .brand-text {
+    display: flex; align-items: center; gap: 9px; font-size: 15px;
+    color: var(--text-2); white-space: nowrap; overflow: hidden;
+  }
+  .spark {
+    width: 20px; height: 20px; flex: none; background: var(--g-sweep);
+    clip-path: polygon(50% 0,61% 39%,100% 50%,61% 61%,50% 100%,39% 61%,0 50%,39% 39%);
+  }
+  .sidebar.collapsed .brand-text { display: none; }
+
+  .sidebar nav { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+  .sidebar nav button {
+    all: unset; cursor: pointer; display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; border-radius: var(--r-pill); color: var(--text-2);
+    font-size: 14px; font-family: var(--sans); white-space: nowrap;
+    transition: background .15s;
+  }
+  .sidebar nav button svg { width: 20px; height: 20px; flex: none; fill: currentColor; opacity: .75; }
+  .sidebar nav button:hover { background: var(--surface-press); }
+  .sidebar nav button.active { background: var(--nav-on); color: var(--nav-on-fg); font-weight: 500; }
+  .sidebar nav button.active svg { opacity: 1; }
+  .sidebar nav button:focus-visible { outline: 2px solid var(--g-blue); outline-offset: 2px; }
+  .sidebar.collapsed nav button { justify-content: center; padding: 10px 0; }
+  .sidebar.collapsed .nav-label { display: none; }
+
+  .side-foot { margin-top: auto; padding: 12px 16px 2px; font-size: 12px; color: var(--muted); }
+  .side-foot .sf-row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; }
+  .side-foot .sf-row b { color: var(--text-2); font-weight: 500; }
+  .sf-sep { height: 1px; background: var(--outline-soft); margin: 9px 0; }
+  .logout-btn {
+    all: unset; box-sizing: border-box; cursor: pointer; width: 100%;
+    display: flex; align-items: center; gap: 13px; padding: 9px 14px;
+    border-radius: var(--r-pill); color: var(--muted); font-size: 13px;
+    font-family: var(--sans); transition: background .15s, color .15s;
+  }
+  .logout-btn svg { width: 18px; height: 18px; flex: none; fill: currentColor; }
+  .logout-btn:hover { background: var(--fail-bg); color: var(--fail); }
+  .logout-btn:focus-visible { outline: 2px solid var(--g-blue); outline-offset: 2px; }
+  /* 折叠时状态行藏起来，但退出按钮必须留着——否则收起侧栏就没法登出了 */
+  .sidebar.collapsed .side-foot { padding: 12px 8px 2px; }
+  .sidebar.collapsed #sideStat, .sidebar.collapsed .sf-sep { display: none; }
+  .sidebar.collapsed .logout-btn { justify-content: center; padding: 9px 0; }
+
+  /* ── 内容区 ─────────────────────────────────────────────────────────── */
+  .content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    height: var(--topbar-h); flex: none; display: flex; align-items: center;
+    justify-content: space-between; gap: 16px; padding: 0 24px;
+    position: sticky; top: 0; z-index: 10; background: var(--bg);
+  }
+  .page-title { font-size: 20px; font-weight: 400; letter-spacing: -.01em; color: var(--text); }
+  .topbar-right { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok);
+         box-shadow: 0 0 0 3px rgba(20,108,46,.14); }
+  .dot.bad { background: var(--fail); box-shadow: 0 0 0 3px rgba(179,38,30,.14); }
+
+  main { flex: 1; padding: 4px 24px 36px; min-width: 0; }
+  h2 {
+    font-size: 15px; font-weight: 500; color: var(--text); margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; min-height: 32px;
+  }
+
+  /* ── 卡片：纯白无描边 ───────────────────────────────────────────────── */
+  .panel, .card {
+    background: var(--card); border-radius: var(--r-card);
+    padding: 20px 22px; margin-bottom: 14px; box-shadow: var(--shadow);
+  }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .grid-main { display: grid; grid-template-columns: minmax(0,2fr) minmax(310px,1fr);
+               gap: 14px; margin-bottom: 14px; align-items: start; }
+  .grid-2 > *, .grid-main > * { margin-bottom: 0; }
+  .stack { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .stack > * { margin-bottom: 0; }
+
+  /* ── KPI ────────────────────────────────────────────────────────────── */
+  .kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr));
+             gap: 14px; margin-bottom: 14px; }
+  .kpi { background: var(--card); border-radius: var(--r-card); padding: 15px 18px;
+         box-shadow: var(--shadow); }
+  .kpi .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+  .kpi .value { font-size: 27px; font-weight: 400; letter-spacing: -.02em;
+                line-height: 1.2; color: var(--text); font-variant-numeric: tabular-nums; }
+  .kpi .sub { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+
+  /* ── 表格 ───────────────────────────────────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+  th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px;
+       padding: 9px 10px; border-bottom: 1px solid var(--outline-soft); white-space: nowrap; }
+  td { padding: 11px 10px; border-bottom: 1px solid var(--outline-soft);
+       vertical-align: top; overflow-wrap: anywhere; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: #F6F9FE; }
+  td.nw, th.nw { white-space: nowrap; overflow-wrap: normal; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .empty { text-align: center; color: var(--muted); padding: 36px 0; }
+
+  /* ── 按钮 ───────────────────────────────────────────────────────────── */
+  .btn, .controls button, button.btn {
+    /* all:unset 会把 box-sizing 重置成 content-box（它的优先级高于 * 选择器），
+       于是任何设了 width 的按钮都会多出左右 padding 的宽度而溢出容器。
+       登录页的整宽按钮就是这么撑出卡片的。 */
+    all: unset; box-sizing: border-box;
+    cursor: pointer; font-family: var(--sans); font-size: 13px;
+    padding: 8px 18px; border-radius: var(--r-pill); white-space: nowrap;
+    background: var(--nav-on); color: var(--nav-on-fg); font-weight: 500;
+    transition: background .15s;
+  }
+  .btn:hover { background: #C2D8FA; }
+  .btn:focus-visible { outline: 2px solid var(--g-blue); outline-offset: 2px; }
+  .btn.muted { background: var(--surface-hi); color: var(--text-2); font-weight: 400; }
+  .btn.muted:hover { background: var(--surface-press); }
+  .btn.danger { background: transparent; color: var(--fail); box-shadow: inset 0 0 0 1px var(--outline); }
+  .btn.danger:hover { background: var(--fail-bg); }
+  .btn[disabled] { opacity: .38; cursor: default; pointer-events: none; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .controls button { background: var(--surface-hi); color: var(--text-2);
+                     font-weight: 400; padding: 7px 15px; }
+  .controls button:hover { background: var(--surface-press); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  select, input[type=text], input[type=password], input[type=number], textarea {
+    font-family: var(--sans); font-size: 13px; color: var(--text);
+    background: var(--surface-hi); border: 1px solid transparent;
+    border-radius: 10px; padding: 8px 12px; outline: none; transition: border-color .15s;
+  }
+  textarea { width: 100%; font-family: var(--mono); font-size: 12px; resize: vertical; }
+  select { cursor: pointer; }
+  select:focus, input:focus, textarea:focus { border-color: var(--g-blue); background: var(--card); }
+
+  /* ── 徽标 ───────────────────────────────────────────────────────────── */
+  .badge { display: inline-block; padding: 3px 10px; border-radius: var(--r-pill);
+           font-size: 11.5px; line-height: 1.4; white-space: nowrap;
+           background: var(--surface-hi); color: var(--muted); }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); }
+  .badge.fail { background: var(--fail-bg); color: var(--fail); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.muted { background: var(--surface-hi); color: var(--muted); }
+
+  .pre { font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-all; }
+  .clamp2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+            overflow: hidden; }
+  code { font-family: var(--mono); font-size: 12px; background: var(--surface-hi);
+         padding: 1px 6px; border-radius: 5px; }
+  .muted { color: var(--muted); }
+  .truncate { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hint, .desc { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+  /* 卡片抬头下面那句说明，统一走这个类，不再每处写一遍 inline style */
+  .lede { color: var(--muted); font-size: 12.5px; line-height: 1.65; margin-bottom: 12px; }
+  /* 只读的键值表：没有表头，左列窄且不换行 */
+  table.kv td { padding: 9px 0; font-size: 12.5px; }
+  table.kv td:first-child { width: 92px; color: var(--muted); white-space: nowrap;
+                            padding-right: 12px; }
+  .err { color: var(--fail); font-size: 13px; margin-top: 10px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .field { margin-bottom: 14px; }
+  .field .label { display: block; margin-bottom: 6px; font-size: 13px; }
+  /* 折叠说明：Gemini 的界面不堆长段落，细节收进来 */
+  details.note { margin-bottom: 12px; }
+  details.note > summary { cursor: pointer; color: var(--nav-on-fg); font-size: 12.5px;
+                           list-style: none; display: inline-flex; align-items: center; gap: 4px; }
+  details.note > summary::-webkit-details-marker { display: none; }
+  details.note > summary::after { content: "▾"; font-size: 10px; }
+  details.note[open] > summary::after { content: "▴"; }
+  details.note .body { color: var(--muted); font-size: 12.5px; line-height: 1.65;
+                       margin-top: 8px; padding: 12px 14px; background: var(--bg);
+                       border-radius: 12px; }
+
+  /* ── 运行时配置表单 ─────────────────────────────────────────────────
+     原来一项一整行（标签 | 输入 | 提示），12 项就是 12 行、右边三分之二空着，
+     整页拉到 2200px。改成按语义分组、组内自适应多列，标签压在输入框上方。 */
+  .cfg-group { margin-bottom: 22px; }
+  .cfg-group:last-of-type { margin-bottom: 0; }
+  .cfg-group > h3 { font-size: 12px; font-weight: 500; color: var(--muted);
+                    margin-bottom: 12px; padding-bottom: 7px;
+                    border-bottom: 1px solid var(--outline-soft); }
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(186px, 1fr));
+              gap: 16px 18px; }
+  .cfg-item { min-width: 0; }
+  .cfg-item > label { display: block; font-size: 12.5px; color: var(--text-2); margin-bottom: 6px; }
+  .cfg-item input[type=text], .cfg-item input[type=number], .cfg-item select { width: 100%; }
+  .cfg-item.wide { grid-column: 1 / -1; }
+  .cfg-item.check { display: flex; align-items: center; gap: 10px;
+                  margin-top: 25px; }  /* 25px = 标签行高 + 下边距，对齐同行输入框 */
+  .cfg-item.check > label { margin: 0; }
+  .cfg-item input[type=checkbox] { width: 18px; height: 18px; flex: none;
+                                   accent-color: var(--nav-on-fg); }
+  .rthint { color: var(--muted); font-size: 11.5px; line-height: 1.45; margin-top: 5px; }
+  .cfg-item.check .rthint { margin: 0; }
+  .cfg-actions { display: flex; gap: 8px; align-items: center; margin-top: 20px;
+                 padding-top: 16px; border-top: 1px solid var(--outline-soft); }
+
+  /* ── signature：距离封禁红线 ─────────────────────────────────────────
+     实测单出口打 80-180 次后被 Google 重定向到 sorry 页，轨道取下沿 80。
+     这个区间是本项目独有的知识，也是部署时唯一真正要盯的东西——所以它是
+     面板主角，放首屏右栏与趋势图齐平。三色渐变全站只用在这一条轨道上。 */
+  .slot { padding: 13px 0; border-bottom: 1px solid var(--outline-soft); }
+  .slot:first-of-type { padding-top: 2px; }
+  .slot:last-child { border-bottom: none; padding-bottom: 2px; }
+  .slot-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .slot-name { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .slot-count { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+                white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .slot-count b { color: var(--text); font-size: 15px; font-weight: 500; }
+  .track { position: relative; height: 6px; border-radius: var(--r-pill);
+           background: var(--surface-press); margin-top: 9px; overflow: hidden; }
+  .track .fill { position: absolute; inset: 0 auto 0 0; border-radius: var(--r-pill);
+                 background: var(--g-sweep); background-size: 300px 100%;
+                 transition: width .45s cubic-bezier(.2,0,0,1); }
+  .redline { position: absolute; top: -3px; bottom: -3px; width: 2px;
+             background: var(--fail); opacity: .9; }
+  .slot-note { margin-top: 7px; font-size: 11.5px; color: var(--muted); }
+  .slot-note.warn { color: var(--warn); }
+  .slot-note.danger { color: var(--fail); font-weight: 500; }
+  .slot-scroll { max-height: 262px; overflow-y: auto; }
+
+  /* ── 图表 ───────────────────────────────────────────────────────────── */
+  .chart-wrap { position: relative; height: 262px; width: 100%; }
+  .chart-wrap canvas { position: absolute; inset: 0; width: 100% !important; height: 100% !important; }
+
+  /* ── 定高列表：撑满视口，不被数据撑开 ───────────────────────────────── */
+  .page-fill { display: flex; flex-direction: column;
+               height: calc(100vh - var(--topbar-h) - 44px); margin-bottom: 0; }
+  .table-scroll { flex: 1; min-height: 0; overflow: auto; }
+  .table-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--card); }
+  .pager { display: flex; align-items: center; justify-content: space-between;
+           gap: 12px; padding-top: 14px; margin-top: 4px; flex-wrap: wrap;
+           font-size: 13px; border-top: 1px solid var(--outline-soft); }
+  .pager-btns { display: flex; align-items: center; gap: 6px; }
+
+  /* ── 登录 ───────────────────────────────────────────────────────────── */
+  /* align-self 不能省：#app 是 flex 容器，登录态下 .login-box 是唯一子项，
+     默认 align-items:stretch 会把它拉到容器满高（100vh 减上下 margin），
+     卡片底下就空出一大片。这里让它按内容高度，横向仍靠 auto margin 居中。 */
+  .login-box { align-self: flex-start; width: 372px; max-width: 92vw;
+               margin: 16vh auto; background: var(--card);
+               border-radius: 28px; padding: 34px 32px;
+               box-shadow: 0 1px 3px rgba(60,64,67,.16), 0 8px 28px rgba(60,64,67,.1); }
+  .login-box h1 { font-size: 19px; font-weight: 400; margin-bottom: 22px;
+                  display: flex; align-items: center; gap: 10px; }
+  .login-box input { width: 100%; margin-bottom: 14px; padding: 12px 15px; }
+  .login-box .btn { width: 100%; text-align: center; background: var(--nav-on-fg); color: #fff; }
+  .login-box .btn:hover { background: #0A4FBC; }
+
+  /* ── 弹窗 ───────────────────────────────────────────────────────────── */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(32,33,36,.45);
+                   display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--card); border-radius: 28px; padding: 26px 28px;
+           width: min(460px,92vw); box-shadow: 0 8px 32px rgba(60,64,67,.24); }
+  .modal h3 { font-size: 17px; font-weight: 400; margin-bottom: 8px; }
+  .modal-body { margin: 14px 0 18px; }
+  .modal-err { color: var(--fail); font-size: 12.5px; margin-bottom: 10px; }
+
+  /* ── 分段切换（导入 Cookie 的两种填法）────────────────────────────────
+     两种填法各有各的场景：逐项适合照着 DevTools 一条条抄，整串适合已经有
+     "k=v; k=v" 现成串的。做成 tab 而不是两个入口，是因为切换时数据要互相
+     带过去——否则填一半换个模式就白填了。 */
+  .segbar { display: inline-flex; background: var(--bg); border-radius: 999px;
+            padding: 3px; gap: 2px; margin-bottom: 14px; }
+  .segbar button { border: none; background: transparent; cursor: pointer;
+                   font: inherit; font-size: 12.5px; color: var(--muted);
+                   padding: 6px 14px; border-radius: 999px; transition: all .15s; }
+  .segbar button.on { background: var(--card); color: var(--fg);
+                      box-shadow: 0 1px 3px rgba(60,64,67,.16); }
+  .ck-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+             gap: 10px 12px; }
+  .ck-grid .field { margin-bottom: 0; }
+  .ck-grid .field.wide { grid-column: 1 / -1; }
+  .ck-grid label { display: block; font-size: 11.5px; color: var(--muted);
+                   margin-bottom: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .ck-grid label .req { color: var(--fail); }
+  .ck-grid input { width: 100%; font-family: var(--mono); font-size: 12px;
+                   text-overflow: ellipsis; }
+  .ck-extra { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.6; }
+  /* 逐项模式列了 7 个框，窄屏下别把弹窗撑爆 */
+  .modal.wide { width: min(620px, 94vw); }
+
+  @media (max-width: 1100px) { .grid-main { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) {
+    #app { flex-direction: column; }
+    .sidebar, .sidebar.collapsed { width: 100%; flex-basis: auto; height: auto;
+                                   position: static; padding: 8px 12px; }
+    .side-top { height: 48px; }
+    .sidebar nav { flex-direction: row; overflow-x: auto; margin-top: 2px; }
+    .sidebar.collapsed nav button { padding: 10px 16px; }
+    .sidebar.collapsed .nav-label { display: inline; }
+    .side-foot { display: none; }
+    .topbar { padding: 0 14px; }
+    main { padding: 4px 14px 28px; }
+    .grid-2 { grid-template-columns: 1fr; }
+    .chart-wrap { height: 210px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// 单出口能打多少次的实测区间是 80-180，取下沿当参考线。
+// 它不是一条硬线：能打多少主要看连接复用和出口质量，而平缓节奏几乎打不满。
+const BAN_LINE = 80;
+
+const api = async (path, opts = {}) => {
+  const r = await fetch(path, { credentials: 'include', ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  if (r.status === 401) { renderLogin(); throw new Error('unauthorized'); }
+  return r.json();
+};
+
+const fmt = {
+  ts: (sec) => new Date(sec * 1000).toLocaleString('zh-CN', { hour12: false }),
+  ms: (ms) => ms == null ? '-' : (ms < 1000 ? ms + 'ms' : (ms/1000).toFixed(2) + 's'),
+  num: (n) => (n || 0).toLocaleString(),
+  pct: (n) => (n * 100).toFixed(1) + '%',
+};
+
+let charts = {};
+const destroyChart = (key) => { if (charts[key]) { charts[key].destroy(); delete charts[key]; } };
+
+// ─── Pages ──────────────────────────────────────────────────────────────────
+
+const pages = {
+  dashboard: async () => {
+    const stats = await api('api/stats?hours=24');
+    const usage = await api('api/usage');
+    return `
+      <div class="kpi-row">
+        <div class="kpi"><div class="label">24 小时请求</div><div class="value">${fmt.num(stats.total_requests)}</div></div>
+        <div class="kpi"><div class="label">成功率</div><div class="value">${fmt.pct(stats.success_rate)}</div>
+          <div class="sub">${fmt.num(stats.success)} 成功 · ${fmt.num(stats.failures)} 失败</div></div>
+        <div class="kpi"><div class="label">平均延迟</div><div class="value">${fmt.ms(stats.avg_ms)}</div></div>
+        <div class="kpi"><div class="label">输入 Token</div><div class="value">${fmt.num(stats.prompt_tokens)}</div></div>
+        <div class="kpi"><div class="label">输出 Token</div><div class="value">${fmt.num(stats.output_tokens)}</div></div>
+      </div>
+
+      <div class="grid-main">
+        <div class="panel">
+          <h2>请求量与延迟
+            <span class="controls">
+              <select id="rangeSel">
+                <option value="24h">最近 24 小时</option>
+                <option value="7d">最近 7 天</option>
+                <option value="30d">最近 30 天</option>
+              </select>
+            </span>
+          </h2>
+          <div class="chart-wrap"><canvas id="chartReq"></canvas></div>
+        </div>
+
+        <div class="stack">
+        <div class="panel">
+          <h2>距离封禁红线
+            <span class="controls"><button onclick="refreshPage()">刷新</button></span>
+          </h2>
+          <div class="slot-scroll">
+            ${(usage.items || []).map(u => {
+              const rph = u.rph || 0;
+              const limit = u.limit_rph || 0;
+              const pct = Math.min(rph / BAN_LINE * 100, 100);
+              const limitPct = limit ? Math.min(limit / BAN_LINE * 100, 100) : null;
+              const left = Math.max(BAN_LINE - rph, 0);
+              let noteCls = '', note = `还能再打约 ${left} 次`;
+              if (rph >= BAN_LINE) { noteCls = 'danger'; note = '已越过红线，随时可能被拦'; }
+              else if (rph >= BAN_LINE * 0.75) { noteCls = 'warn'; note = `接近红线，只剩约 ${left} 次`; }
+              else if (rph === 0) { note = '本小时还没有请求'; }
+              return `<div class="slot">
+                <div class="slot-head">
+                  <span class="slot-name">${escapeHtml(u.name)}</span>
+                  <span class="slot-count"><b>${rph}</b> / ${BAN_LINE}</span>
+                </div>
+                <div class="track">
+                  <div class="fill" style="width:${pct}%"></div>
+                  ${limitPct !== null ? `<div class="redline" style="left:${limitPct}%"
+                    title="本地 RPH 限额 ${limit}"></div>` : ''}
+                </div>
+                <div class="slot-note ${noteCls}">${note} · 并发 ${u.inflight}/${u.limit_concurrent || '∞'}
+                  · RPM ${u.rpm}/${u.limit_rpm || '∞'}</div>
+              </div>`;
+            }).join('') || '<div class="empty">还没有任何请求经过</div>'}
+          </div>
+          <details class="note" style="margin:12px 0 0">
+            <summary>这条线是怎么来的</summary>
+            <div class="body">
+              实测单个出口打 <b>80-180 次</b>后会被 Google 重定向到 <code>sorry/index</code>，
+              轨道取的是这个区间的<b>下沿</b>。区间这么宽是因为它主要由连接策略和出口质量
+              决定：同样并发 10，复用连接池能打到 172/177，每次新建连接只有 106/109；
+              静态 IP 上到过 188。<br><br>
+              <b>它不是一条硬线。</b>节奏才是关键 —— 10 次/分钟平缓地打，连打 800 次、
+              跨 110 分钟一次没被拦。所以这条轨道是保守参考，不是"到了就会挂"。<br><br>
+              被拦之后是硬拦（封后 20 分钟内 60 次探测 0 成功），106-121 分钟自动恢复。
+              红竖线是本地 RPH 限额的位置，超了直接返回 429 而不去消耗 Google 配额。
+              要放大产能就在「代理池」加代理，每个代理是独立 slot。
+            </div>
+          </details>
+        </div>
+
+        <div class="panel">
+          <h2>连通性诊断
+            <span class="controls"><button class="btn" onclick="runTest()">测试一次</button></span>
+          </h2>
+          <select id="testProxy" style="width:100%">
+            <option value="">自动选择（按调度规则）</option>
+            <option value="0">直连主机 IP</option>
+          </select>
+          <p class="hint" style="margin-top:10px">
+            打一次真实请求看是否通。不消耗限流配额、不写入请求记录。
+            返回 302/429 就是出口进了黑名单，该换 IP。
+          </p>
+          <div id="testResult" style="display:none; margin-top:12px;"></div>
+        </div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h2>按模型分组</h2>
+          <table>
+            <colgroup><col style="width:38%"><col style="width:14%"><col style="width:14%"><col style="width:16%"><col style="width:18%"></colgroup>
+            <thead><tr><th>模型</th><th class="nw">请求</th><th class="nw">成功</th><th class="nw">平均</th><th class="nw">Token</th></tr></thead>
+            <tbody>${(stats.by_model || []).map(m => `
+              <tr><td class="truncate" title="${escapeHtml(m.model)}">${m.model}</td>
+                  <td class="num nw">${fmt.num(m.requests)}</td>
+                  <td class="num nw">${fmt.num(m.success)}</td>
+                  <td class="num nw">${fmt.ms(m.avg_ms)}</td>
+                  <td class="num nw">${fmt.num(m.prompt_tokens + m.output_tokens)}</td></tr>`).join('')
+              || '<tr><td colspan="5" class="empty">暂无数据</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h2>按出口分组</h2>
+          <table>
+            <colgroup><col style="width:46%"><col style="width:18%"><col style="width:18%"><col style="width:18%"></colgroup>
+            <thead><tr><th>出口</th><th class="nw">请求</th><th class="nw">成功</th><th class="nw">平均</th></tr></thead>
+            <tbody>${(stats.by_proxy || []).map(p => `
+              <tr><td class="truncate">${!p.proxy || p.proxy === '(direct)' ? '直连' : escapeHtml(p.proxy)}</td>
+                  <td class="num nw">${fmt.num(p.requests)}</td>
+                  <td class="num nw">${fmt.num(p.success)}</td>
+                  <td class="num nw">${fmt.ms(p.avg_ms)}</td></tr>`).join('')
+              || '<tr><td colspan="4" class="empty">暂无数据</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+          <h2>错误分类（近 ${stats.window_hours || 24}h）</h2>
+          <table>
+            <colgroup><col style="width:22%"><col style="width:10%"><col style="width:68%"></colgroup>
+            <thead><tr><th>类型</th><th class="nw">次数</th><th>含义 / 该怎么办</th></tr></thead>
+            <tbody>
+              ${(stats.error_breakdown || []).map(e => `<tr>
+                <td class="nw"><span class="badge ${ERR_BADGE[e.kind] || 'muted'}">${escapeHtml(e.kind)}</span></td>
+                <td class="num nw">${e.count}</td>
+                <td style="font-size:12.5px">${ERR_DESC[e.kind] || ''}
+                  <div class="pre" style="margin-top:5px;color:var(--muted)">${escapeHtml(e.sample || '')}</div></td>
+              </tr>`).join('') || '<tr><td colspan="3" class="empty">窗口内没有失败</td></tr>'}
+            </tbody>
+          </table>
+      </div>
+    `;
+  },
+
+  requests: async () => {
+    return `
+      <div class="panel page-fill">
+        <h2>请求记录
+          <span class="controls">
+            <select id="reqStatus">
+              <option value="">全部</option>
+              <option value="ok">成功</option>
+              <option value="fail">失败</option>
+            </select>
+            <select id="reqModel"><option value="">全部模型</option></select>
+            <select id="reqSize">
+              <option value="25">每页 25</option>
+              <option value="50" selected>每页 50</option>
+              <option value="100">每页 100</option>
+              <option value="200">每页 200</option>
+            </select>
+            <button onclick="loadReqs()">刷新</button>
+          </span>
+        </h2>
+        <div class="table-scroll">
+          <table id="reqTable">
+            <colgroup>
+              <col style="width:140px"><col style="width:150px"><col style="width:130px">
+              <col style="width:96px"><col style="width:70px"><col style="width:84px">
+              <col style="width:84px"><col style="width:110px"><col style="width:64px">
+              <col style="width:64px"><col>
+            </colgroup>
+            <thead><tr>
+              <th class="nw">时间</th><th class="nw">模型</th><th class="nw">实际模型</th>
+              <th class="nw">出口</th><th class="nw">账号</th><th class="nw">状态</th>
+              <th class="nw">首字</th><th class="nw">总用时</th>
+              <th class="nw">输入</th><th class="nw">输出</th><th>接口</th>
+            </tr></thead>
+            <tbody><tr><td colspan="11" class="empty">加载中...</td></tr></tbody>
+          </table>
+        </div>
+        <div class="pager" id="reqPager"></div>
+      </div>
+    `;
+  },
+
+  proxies: async () => {
+    const data = await api('api/proxies');
+    return `
+      <div class="panel page-fill">
+        <h2>代理池
+          <span class="controls"><button class="btn" onclick="addProxy()">+ 添加代理</button></span>
+        </h2>
+        <details class="note">
+          <summary>每个代理是一个独立 IP slot</summary>
+          <div class="body">
+            每个代理享有独立的并发 / RPM / RPH 配额，<b>配越多代理，总容量线性放大</b>。
+            请求会自动找有空位的代理，都满则返回 HTTP 429。失败 5 次自动熔断，
+            「重置」可手动恢复。<br><br>
+            注意：配了至少一个代理后<b>默认不会再退回直连</b>，避免代理满了把主机 IP 也打爆；
+            要可用性优先可以在「设置」页打开「无可用代理时退回直连」。熔断的代理默认歇
+            120 分钟自动放回池子（实测被拦的出口 106-121 分钟自恢复），也可以在这里手动重置。
+            实测单个出口打 80-180 次就会被 Google 拦，所以扩容只能靠加出口。
+          </div>
+        </details>
+        <div class="table-scroll">
+          <table>
+            <colgroup>
+              <col style="width:56px"><col style="width:150px"><col>
+              <col style="width:88px"><col style="width:80px"><col style="width:200px">
+              <col style="width:186px">
+            </colgroup>
+            <thead><tr>
+              <th class="nw">ID</th><th class="nw">名称</th><th>代理 URL</th><th class="nw">状态</th>
+              <th class="nw">失败</th><th class="nw">最近错误</th><th class="nw">操作</th>
+            </tr></thead>
+            <tbody>${(data.items || []).map(p => `
+              <tr>
+                <td class="num nw">${p.id}</td>
+                <td class="truncate" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</td>
+                <td class="pre truncate" title="${escapeHtml(p.url)}">${escapeHtml(p.url)}</td>
+                <td class="nw">${p.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge muted">已禁用</span>'}</td>
+                <td class="num nw">${p.fail_count > 0 ? '<span class="badge fail">' + p.fail_count + '</span>' : p.fail_count}</td>
+                <td class="pre truncate" title="${escapeHtml(p.last_error || '')}">${escapeHtml(p.last_error || '—')}</td>
+                <td class="nw">
+                  <span class="actions">
+                    <button class="btn muted" onclick="toggleProxy(${p.id})">${p.enabled ? '禁用' : '启用'}</button>
+                    <button class="btn muted" onclick="resetProxy(${p.id})">重置</button>
+                    <button class="btn danger" onclick="delProxy(${p.id})">删除</button>
+                  </span>
+                </td>
+              </tr>`).join('') || '<tr><td colspan="7" class="empty">还没有代理。点「+ 添加代理」加一个。</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  },
+
+  cookies: async () => {
+    const data = await api('api/cookies');
+    const items = data.items || [];
+    return `
+      <div class="panel page-fill">
+        <h2>Cookie 池
+          <span class="controls">
+            <span class="badge ${data.enabled > 0 ? 'ok' : 'muted'}" style="margin-right:8px">${data.enabled || 0} 启用 / ${data.total || 0} 共</span>
+            <button class="btn" onclick="addCookieAcct()">+ 导入 Cookie</button>
+          </span>
+        </h2>
+        <details class="note">
+          <summary>每行一个 Google 登录态账号</summary>
+          <div class="body">
+            粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID /
+            APISID / SAPISID / __Secure-1PSID）。请求时按<b>最久未用优先</b>自动轮转挑一个
+            启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
+            凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 /
+            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号无法长期续命，
+            会标黄提示。
+          </div>
+        </details>
+        <div class="table-scroll">
+          <table>
+            <colgroup>
+              <col style="width:48px"><col style="width:160px"><col style="width:80px">
+              <col style="width:150px"><col style="width:92px"><col style="width:64px">
+              <col style="width:150px"><col><col style="width:150px">
+            </colgroup>
+            <thead><tr>
+              <th class="nw">ID</th><th class="nw">标签</th><th class="nw">状态</th>
+              <th class="nw">关键 Cookie</th><th class="nw">SAPISID</th><th class="nw">失败</th>
+              <th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
+            </tr></thead>
+            <tbody>${items.map(a => `
+              <tr>
+                <td class="num nw">${a.id}</td>
+                <td class="truncate" title="${escapeHtml(a.label || '')}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}</td>
+                <td class="nw">${a.status === 'enabled' ? '<span class="badge ok">启用</span>' : '<span class="badge muted">禁用</span>'}</td>
+                <td class="nw" title="共 ${a.cookie_count} 个 cookie，关键项：${(a.key_cookies||[]).join(' / ')}">
+                  <span class="badge ${a.has_1psidts ? 'ok' : 'warn'}">${(a.key_cookies||[]).length}/7 项</span>
+                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，无法长期续命">缺 TS</span>'}
+                </td>
+                <td class="pre nw">${a.sapisid_tail ? '…' + escapeHtml(a.sapisid_tail) : '—'}</td>
+                <td class="num nw">${a.fail_count > 0 ? '<span class="badge fail">' + a.fail_count + '</span>' : 0}</td>
+                <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
+                <td class="pre truncate" title="${escapeHtml(a.last_error || '')}">${escapeHtml(a.last_error || '—')}</td>
+                <td class="nw">
+                  <span class="actions">
+                    <button class="btn muted" onclick="checkCookieAcct(${a.id}, this)">检测</button>
+                    <button class="btn muted" onclick="rotateCookieAcct(${a.id}, this)">保活</button>
+                    <button class="btn muted" onclick="toggleCookieAcct(${a.id})">${a.status === 'enabled' ? '禁用' : '启用'}</button>
+                    <button class="btn muted" onclick="editCookieAcct(${a.id}, ${JSON.stringify(a.label || '').replace(/"/g, '&quot;')}, ${JSON.stringify(a.note || '').replace(/"/g, '&quot;')})">编辑</button>
+                    <button class="btn danger" onclick="delCookieAcct(${a.id})">删除</button>
+                  </span>
+                </td>
+              </tr>`).join('') || '<tr><td colspan="9" class="empty">Cookie 池是空的。点「+ 导入 Cookie」加一个登录态账号。</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  },
+
+  // 浏览器登录：用 Chromium(VNC) 容器里独立 profile 登录 Google/Gemini，
+  // 登录态自动抓成 cookie 写入 cookie 池，每 10 分钟自动刷新。
+  browser: async () => {
+    const st = await api('api/browser/status');
+    if (!st.enabled) {
+      return `
+        <div class="panel page-fill">
+          <h2>浏览器登录</h2>
+          <div class="empty" style="padding:28px">
+            此功能未启用：需要配置 <code>BROWSER_CONTROLLER_URL</code>（例如
+            <code>http://chromium:9280</code>），让本服务能连到旁边 Chromium(VNC)
+            容器的 profile 控制器。配置后重启容器即可。<br><br>
+            <span class="muted">启用后：在这里添加「账号 profile」→ 容器会拉起一个
+            独立 Chromium 窗口并跳到 Gemini 登录页 → 点「在我的浏览器打开」在你自己浏览器里
+            完成 Google 登录 → 点「抓取」→ 登录态自动进 Cookie 池，每 10 分钟自动保活刷新。</span>
+          </div>
+        </div>`;
+    }
+    const ok = st.healthy;
+    const rows = (st.profiles || []);
+    const accessUrl = (function(){
+      try { const v = (localStorage.getItem('gw2aAccessUrl') || '').trim(); if (v) return v; } catch (e) {}
+      return (st.access_url || '').trim();
+    })();
+    const rowHtml = rows.map(a => `
+      <tr>
+        <td class="nw"><span class="badge ${a.running ? 'ok' : 'muted'}">${a.running ? '运行中' : '已停止'}</span></td>
+        <td class="truncate" title="${escapeHtml(a.name)}"><b>${escapeHtml(a.name)}</b>
+          ${a.account_id ? `<div class="muted" style="font-size:12px">cookie 池 #${a.account_id}</div>` : ''}
+        </td>
+        <td class="nw num">${a.port || '—'}</td>
+        <td class="nw">${a.account_id
+            ? (a.status === 'enabled' ? '<span class="badge ok">已入池</span>' : '<span class="badge muted">已停用</span>')
+            : '<span class="badge warn">未抓取</span>'}</td>
+        <td class="pre truncate" style="max-width:220px" title="${escapeHtml(a.label || a.name)}">${escapeHtml(a.label || a.name)}</td>
+        <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
+        <td class="nw">
+          <span class="actions">
+            <button class="btn muted" onclick="browserOpenLogin('${escapeHtml(a.name)}', this)">容器内打开</button>
+            ${accessUrl ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
+            <button class="btn muted" onclick="browserFetch('${escapeHtml(a.name)}', this)">抓取 cookie</button>
+            ${a.account_id ? `<button class="btn muted" onclick="browserAccountInPool(${a.account_id})">池中账号</button>` : ''}
+            <button class="btn danger" onclick="browserDel('${escapeHtml(a.name)}', this)">删除</button>
+          </span>
+        </td>
+      </tr>`).join('') || '<tr><td colspan="7" class="empty">还没有 profile。点「+ 添加账号」开始。</td></tr>';
+
+    return `
+      <div class="panel page-fill">
+        <h2>浏览器登录（独立 Chromium profile）
+          <span class="controls">
+            <span class="badge ${ok ? 'ok' : 'fail'}">${ok ? '控制器在线' : '控制器离线'}</span>
+            <button class="btn" onclick="browserAdd()">+ 添加账号</button>
+            <button class="btn" onclick="browserRefreshAll(this)">全部刷新</button>
+          </span>
+        </h2>
+        <details class="note">
+          <summary>用法：容器发起登录 → 授权页显示在你自己浏览器 → 自动进 Cookie 池 → 10 分钟自动保活</summary>
+          <div class="body">
+            每个「账号」= chromium 容器里一个<b>独立的 Chromium 窗口 + 独立登录态</b>（互相隔离）。
+            登录由容器发起（拉起窗口并导航到 Gemini），但授权页显示在<b>你自己电脑的浏览器</b>里 ——
+            通过容器桌面的网页（VNC Web）操作，无需在容器里输账号。
+            <br>① 点「+ 添加账号」填个名字 → 容器里的 Chromium 开一个专属窗口并跳到
+            <code>gemini.google.com</code> 登录页；
+            <br>② 点该行「在我的浏览器打开授权页」（首次会提示输入 VNC 账号
+            <code>user</code> / 密码），在桌面里点开该账号的 Chromium 窗口完成 Google 登录；
+            <br>③ 回到本页点「抓取 cookie」→ 登录态解析成 cookie 写进上方 Cookie 池；
+            <br>④ 之后每 10 分钟自动抓一次保持新鲜；登录态失效会自动删除。
+            <br><br><span class="muted">桌面网页地址（上方输入框）默认取自启动参数
+            <code>BROWSER_ACCESS_URL</code>；改完后点「保存」仅存在本浏览器，方便你在
+            <code>5666/chromium</code> 这类入口之间切换。</span>
+          </div>
+        </details>
+        <div class="row" style="margin-bottom:12px;gap:8px;align-items:center;flex-wrap:wrap">
+          <label class="muted" style="font-size:12px;white-space:nowrap">桌面网页地址：</label>
+          <input id="browserAccessUrl" type="text" value="${escapeHtml(accessUrl)}" spellcheck="false"
+                 placeholder="http://NAS_HOST:5666/chromium/  （可选，默认取 BROWSER_ACCESS_URL）"
+                 style="flex:1;min-width:220px;font-family:ui-monospace,monospace;font-size:12px" />
+          <button class="btn" onclick="openAccessUrl()">打开</button>
+          <button class="btn muted" onclick="saveAccessUrl()">保存</button>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <colgroup>
+              <col style="width:80px"><col><col style="width:70px">
+              <col style="width:90px"><col style="width:180px"><col style="width:130px"><col style="width:230px">
+            </colgroup>
+            <thead><tr>
+              <th class="nw">状态</th><th>Profile</th><th class="nw">CDP 端口</th>
+              <th class="nw">Cookie 池</th><th>标签 / 账号</th><th class="nw">最近成功</th><th class="nw">操作</th>
+            </tr></thead>
+            <tbody>${rowHtml}</tbody>
+          </table>
+        </div>
+        ${st.detail ? `<div class="muted" style="margin-top:8px;font-size:12px">${escapeHtml(st.detail)}</div>` : ''}
+      </div>
+    `;
+  },
+
+  settings: async () => {
+    const k = await api('api/apikey');
+    return `
+      <div class="grid-main">
+        <div class="panel">
+          <h2>运行时配置</h2>
+          <p class="lede">
+            改完点保存<b>立刻生效</b>，不用重启。存在数据库里，优先级高于
+            <code>config.json</code> 和命令行参数。
+          </p>
+          <div id="rtCfgForm"></div>
+          <div class="cfg-actions">
+            <button class="btn" onclick="saveRtCfg()">保存并生效</button>
+            <button class="btn muted" onclick="loadRtCfg()">放弃修改</button>
+            <span id="rtCfgMsg" style="font-size:12.5px;"></span>
+          </div>
+        </div>
+
+        <div class="stack">
+          <div class="card">
+            <h2>API Key</h2>
+            <p class="lede">
+              ${k.locked
+                ? '已被 <code>--api-key</code> / <code>API_KEY</code> 锁定，改部署配置才能换。'
+                : '给 <code>/v1/*</code> 接口鉴权，可随时轮换。'}
+            </p>
+            <div class="row" style="margin-bottom:10px;">
+              <input id="apiKeyView" type="password" value="${escapeHtml(k.key)}"
+                     style="flex:1; min-width:0; font-family:ui-monospace,monospace;" readonly />
+              <button class="btn muted" onclick="toggleKeyVis()">显示</button>
+              <button class="btn muted" onclick="copyKey()">复制</button>
+            </div>
+            ${k.locked ? '' : `
+              <div class="row" style="margin-bottom:10px;">
+                <button class="btn muted" onclick="rotateKey()">生成随机 Key</button>
+                <button class="btn muted" onclick="customKey()">自定义</button>
+              </div>`}
+            <details class="note">
+              <summary>调用示例</summary>
+              <div class="body">
+                <pre class="pre" style="margin:0; font-size:11.5px;">curl http://your-host/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-3.6-flash",
+       "messages":[{"role":"user","content":"你好"}]}'</pre>
+              </div>
+            </details>
+          </div>
+
+          <div class="card">
+            <h2>部署配置</h2>
+            <p class="lede">
+              改这些本来就要重启进程，所以放在 <code>docker-compose.yml</code> 里管，
+              不做成网页表单——凭证也不该经过浏览器。
+            </p>
+            <table id="deployTable" class="kv">
+              <tbody></tbody>
+            </table>
+            <p class="lede" style="margin:14px 0 0;">
+              gemini-web2api-go · 单二进制 · SQLite · Chrome 146 指纹 · tiktoken cl100k_base 计费
+            </p>
+          </div>
+        </div>
+      </div>
+    `;
+  },
+};
+
+// ─── Charts + handlers ──────────────────────────────────────────────────────
+
+async function loadChart(range = '24h') {
+  destroyChart('req');
+  const data = await api('api/timeseries?range=' + range);
+  const labels = (data.series || []).map(s => fmt.ts(s.bucket));
+  const reqs = (data.series || []).map(s => s.requests);
+  const p50 = (data.series || []).map(s => s.p50_ms);
+  const ctx = document.getElementById('chartReq');
+  if (!ctx) return;
+  const g = ctx.getContext('2d');
+  const areaBlue = g.createLinearGradient(0, 0, 0, 260);
+  areaBlue.addColorStop(0, 'rgba(66,133,244,.22)');
+  areaBlue.addColorStop(1, 'rgba(66,133,244,0)');
+  charts.req = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: '请求数', data: reqs, yAxisID: 'y',
+          borderColor: '#0B57D0', backgroundColor: areaBlue, fill: true,
+          tension: .35, borderWidth: 2, pointRadius: 0, pointHoverRadius: 4,
+          pointBackgroundColor: '#0B57D0' },
+        { label: 'P50 延迟', data: p50, yAxisID: 'y1',
+          borderColor: '#9B72CB', backgroundColor: 'transparent',
+          tension: .35, borderWidth: 2, borderDash: [5, 4],
+          pointRadius: 0, pointHoverRadius: 4, pointBackgroundColor: '#9B72CB' },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      layout: { padding: { top: 4 } },
+      plugins: {
+        legend: {
+          align: 'end',
+          labels: { color: '#5F6368', usePointStyle: true, pointStyle: 'circle',
+                    boxWidth: 8, boxHeight: 8, padding: 16,
+                    font: { size: 12, family: 'inherit' } },
+        },
+        tooltip: {
+          backgroundColor: '#1F1F1F', padding: 10, cornerRadius: 8,
+          titleFont: { size: 12, weight: '500' }, bodyFont: { size: 12 },
+          displayColors: true, usePointStyle: true, boxPadding: 4,
+        },
+      },
+      scales: {
+        x: { ticks: { color: '#5F6368', maxRotation: 0, autoSkipPadding: 24,
+                      font: { size: 11 } },
+             grid: { display: false }, border: { color: '#E8ECF1' } },
+        y: { type: 'linear', position: 'left', beginAtZero: true,
+             ticks: { color: '#5F6368', font: { size: 11 }, precision: 0, maxTicksLimit: 6 },
+             grid: { color: '#EDF1F7' }, border: { display: false } },
+        y1: { type: 'linear', position: 'right', beginAtZero: true,
+              ticks: { color: '#5F6368', font: { size: 11 }, maxTicksLimit: 6,
+                       callback: (v) => v + 'ms' },
+              grid: { drawOnChartArea: false }, border: { display: false } },
+      },
+    },
+  });
+}
+
+let reqOffset = 0;
+// 每页条数由「每页 N」下拉决定；页面还没渲染时退回 50
+function reqPageSize() {
+  const el = document.getElementById('reqSize');
+  return el ? parseInt(el.value, 10) : 50;
+}
+async function loadReqs() {
+  const status = document.getElementById('reqStatus')?.value || '';
+  const model = document.getElementById('reqModel')?.value || '';
+  const url = `api/requests?limit=${reqPageSize()}&offset=${reqOffset}` +
+              (status ? '&status=' + status : '') +
+              (model ? '&model=' + encodeURIComponent(model) : '');
+  const data = await api(url);
+  const tbody = document.querySelector('#reqTable tbody');
+  if (!tbody) return;
+  tbody.innerHTML = (data.items || []).map(r => `
+    <tr>
+      <td class="nw muted">${fmt.ts(r.ts)}</td>
+      <td class="truncate" title="${escapeHtml(r.model)}">${escapeHtml(r.model)}</td>
+      <td class="nw">${upstreamCell(r)}</td>
+      <td class="nw truncate">${r.proxy_name ? escapeHtml(r.proxy_name) : '<span class="badge muted">直连</span>'}</td>
+      <td class="nw truncate" title="${escapeHtml(r.account_label || '')}">${
+        r.account_id ? escapeHtml(r.account_label || ('#' + r.account_id))
+                     : '<span class="badge muted">匿名</span>'}</td>
+      <td class="nw">${r.status === 200 ? '<span class="badge ok">200</span>' : '<span class="badge fail">' + r.status + '</span>'}</td>
+      <td class="num nw">${fmt.ms(r.ttfb_ms)}</td>
+      <td class="num nw">${fmt.ms(r.total_ms)}</td>
+      <td class="num nw">${fmt.num(r.prompt_tokens)}</td>
+      <td class="num nw">${fmt.num(r.output_tokens)}</td>
+      <td><span class="pre">${escapeHtml(r.endpoint)}${r.stream ? ' <span class="badge muted">stream</span>' : ''}</span>
+        ${r.error ? '<div class="pre clamp2" style="color:var(--fail);margin-top:4px" title="'
+          + escapeHtml(r.error) + '"><b>错误：</b>' + escapeHtml(r.error) + '</div>' : ''}
+      </td>
+    </tr>`).join('') || '<tr><td colspan="11" class="empty">还没有请求记录</td></tr>';
+  const size = reqPageSize();
+  const total = data.total || 0;
+  const page = Math.floor(reqOffset / size) + 1;
+  const pages = Math.max(Math.ceil(total / size), 1);
+  const from = total ? reqOffset + 1 : 0;
+  const to = Math.min(reqOffset + size, total);
+  document.getElementById('reqPager').innerHTML = `
+    <span class="muted">${from}-${to} / 共 ${total} 条</span>
+    <span class="pager-btns">
+      <button class="btn muted" ${reqOffset === 0 ? 'disabled' : ''}
+        onclick="reqOffset=0;loadReqs()">最前</button>
+      <button class="btn muted" ${reqOffset === 0 ? 'disabled' : ''}
+        onclick="reqOffset=Math.max(0,reqOffset-${size});loadReqs()">上一页</button>
+      <span class="muted" style="min-width:80px;text-align:center">第 ${page} / ${pages} 页</span>
+      <button class="btn muted" ${to >= total ? 'disabled' : ''}
+        onclick="reqOffset+=${size};loadReqs()">下一页</button>
+      <button class="btn muted" ${to >= total ? 'disabled' : ''}
+        onclick="reqOffset=${(pages-1)*size};loadReqs()">最后</button>
+    </span>
+  `;
+  // populate model dropdown from current page (best-effort)
+  const sel = document.getElementById('reqModel');
+  if (sel && sel.options.length === 1) {
+    const seen = new Set();
+    (data.items || []).forEach(r => seen.add(r.model));
+    [...seen].forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m; opt.text = m; sel.appendChild(opt);
+    });
+  }
+}
+
+// ── 运行时配置 ───────────────────────────────────────────────────────────────
+// 字段定义跟后端 RuntimeConfig 一一对应；范围与后端 validateRuntimeConfig 一致，
+// 前端只做提示，真正的校验在后端（浏览器里的限制随便绕）。
+// 按语义分组，组内自适应多列。分组的依据是"改这一项时在想什么"：
+// 调产能 / 调容错 / 调怎么发请求 / 调留多少数据，而不是按字段类型堆在一起。
+const RT_GROUPS = [
+  {
+    title: '流量控制 · 每个 IP slot 独立计数',
+    fields: [
+      { k: 'per_ip_concurrent', label: '并发', type: 'int', min: 0, max: 1000,
+        hint: '同一时刻最多几个请求在飞，0=不限' },
+      { k: 'per_ip_rpm', label: 'RPM', type: 'int', min: 0, max: 10000,
+        hint: '滚动 60 秒窗口上限，0=不限' },
+      { k: 'per_ip_rph', label: 'RPH', type: 'int', min: 0, max: 100000,
+        hint: '滚动 1 小时上限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
+    ],
+  },
+  {
+    title: '重试与超时',
+    fields: [
+      { k: 'retry_attempts', label: '重试次数', type: 'int', min: 1, max: 10,
+        hint: '含首次；流式已吐字后不再重试' },
+      { k: 'retry_delay_sec', label: '重试间隔（秒）', type: 'int', min: 0, max: 60 },
+      { k: 'request_timeout_sec', label: '上游超时（秒）', type: 'int', min: 5, max: 600 },
+    ],
+  },
+  {
+    title: '请求行为',
+    fields: [
+      { k: 'default_model', label: '默认模型', type: 'select',
+        hint: '客户端没传 model 时用哪个' },
+      { k: 'max_prompt_bytes', label: 'Prompt 字节上限', type: 'int', min: 0, max: 10000000,
+        hint: '超了直接返回 400 context_length_exceeded。上游的墙实测在约 13 万 UTF-8 字节，按字节算跟语言无关（同字节数下中英文表现一致，而 token 数差 1.9 倍）。不拦的话上游从尾部静默截断，被吃掉的正是刚问的那句。0=不限' },
+      { k: 'impersonate', label: 'TLS 指纹', type: 'text',
+        hint: 'chrome_146 / chrome_144 / firefox_147 / safari_16_0 …' },
+      { k: 'gemini_bl', label: 'Gemini bl 版本', type: 'text',
+        hint: '上游前端版本号。请求大面积失败时先看这里是不是过期了' },
+      { k: 'gemini_bl_auto', label: '自动跟随 bl 版本', type: 'bool',
+        hint: '每 6 小时从 /app 页面抓一次最新版本号，抓到就用抓到的。抓不到或格式不对就继续用上面钉的值' },
+      { k: 'auto_delete_conversation', label: '自动删网页会话', type: 'bool',
+        hint: '出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录号里堆一堆。只登录态生效，异步 best-effort，删失败不影响响应' },
+    ],
+  },
+  {
+    title: '代理与 cookie 的降级行为',
+    fields: [
+      { k: 'proxy_cooldown_min', label: '熔断冷却（分钟）', type: 'int', min: 0, max: 10080,
+        hint: '代理连续失败 5 次后歇多久再放回池子。实测被拦的出口 106-121 分钟自恢复，默认 120；0=不恢复，要去代理池页面手动重置' },
+      { k: 'fallback_direct', label: '无可用代理时退回直连', type: 'bool',
+        hint: '关：直接返回 429，本机 IP 不会暴露给上游（默认）。开：可用性优先，但上游会看到本机真实出口' },
+      { k: 'fallback_anon', label: 'cookie 失效时降级匿名', type: 'bool',
+        hint: '关：直接报错，能立刻发现该换号了（默认）。开：继续跑，但 3.1 Pro 会被静默降级成 3.5 Flash-Lite、思考链消失，客户端看不出来' },
+    ],
+  },
+  {
+    title: '数据与日志',
+    fields: [
+      { k: 'retention_days', label: '明细保留（天）', type: 'int', min: 1, max: 3650,
+        hint: '过期只删明细，聚合数据永久保留' },
+      { k: 'log_requests', label: '打印请求日志', type: 'bool' },
+    ],
+  },
+];
+
+let rtCfgCache = null, rtModels = [];
+
+async function loadRtCfg() {
+  const data = await api('api/config');
+  if (!data) return;
+  rtCfgCache = data.config; rtModels = data.models || [];
+  document.getElementById('rtCfgForm').innerHTML = RT_GROUPS.map(g => `
+    <div class="cfg-group">
+      <h3>${escapeHtml(g.title)}</h3>
+      <div class="cfg-grid">
+        ${g.fields.map(f => {
+          const v = rtCfgCache[f.k];
+          let input;
+          if (f.type === 'bool') {
+            input = `<input type="checkbox" id="rt_${f.k}" ${v ? 'checked' : ''}>`;
+          } else if (f.type === 'select') {
+            input = `<select id="rt_${f.k}">` + rtModels.map(m =>
+              `<option value="${escapeHtml(m)}" ${m === v ? 'selected' : ''}>${escapeHtml(m)}</option>`
+            ).join('') + '</select>';
+          } else if (f.type === 'int') {
+            input = `<input type="number" id="rt_${f.k}" value="${v}" min="${f.min}" max="${f.max}">`;
+          } else {
+            input = `<input type="text" id="rt_${f.k}" value="${escapeHtml(String(v ?? ''))}">`;
+          }
+          // 复选框把标签放右边，跟输入框类字段的竖排区分开
+          if (f.type === 'bool') {
+            return `<div class="cfg-item check">
+              ${input}<label for="rt_${f.k}">${f.label}</label>
+              ${f.hint ? `<span class="rthint">${escapeHtml(f.hint)}</span>` : ''}
+            </div>`;
+          }
+          return `<div class="cfg-item${f.wide ? ' wide' : ''}">
+            <label for="rt_${f.k}">${f.label}</label>
+            ${input}
+            ${f.hint ? `<div class="rthint">${escapeHtml(f.hint)}</div>` : ''}
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`).join('');
+
+  // 三列（项/值/怎么改）挤在窄栏里读不动，第三列换成 title 悬浮
+  const d = data.deploy || {};
+  document.querySelector('#deployTable tbody').innerHTML = [
+    ['监听', `${escapeHtml(d.host || '')}:${d.port}`, 'compose 的 ports + --port'],
+    ['数据库', escapeHtml(d.db_path || ''), 'compose 的 volumes + --db'],
+    ['Cookie 播种文件', d.cookie_file ? escapeHtml(d.cookie_file) : '<span class="badge muted">未配置</span>',
+     '启动时把文件内容导入 Cookie 池；之后从「Cookie 池」页面管理'],
+    ['面板鉴权', d.admin_auth ? '<span class="badge ok">已开启</span>'
+                             : '<span class="badge fail">未设 token</span>', 'compose 的 ADMIN_TOKEN'],
+    ['API Key', d.api_key_locked ? '<span class="badge">部署锁定</span>'
+                                 : '<span class="badge ok">面板可轮换</span>', 'compose 的 API_KEY'],
+  ].map(r => `<tr><td title="${escapeHtml(r[2])}">${r[0]}</td>
+      <td class="pre" style="word-break:break-all;">${r[1]}</td></tr>`).join('');
+}
+
+async function saveRtCfg() {
+  const msg = document.getElementById('rtCfgMsg');
+  const body = {};
+  for (const f of RT_GROUPS.flatMap(g => g.fields)) {
+    const el = document.getElementById('rt_' + f.k);
+    if (!el) continue;
+    body[f.k] = f.type === 'bool' ? el.checked
+      : f.type === 'int' ? parseInt(el.value, 10)
+      : el.value.trim();
+  }
+  msg.textContent = '保存中…'; msg.style.color = 'var(--muted)';
+  const res = await fetch('api/config', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    msg.textContent = '保存失败：' + (data.error || res.status);
+    msg.style.color = 'var(--fail)';
+    return;
+  }
+  rtCfgCache = data.config;
+  msg.textContent = '已保存并生效';
+  msg.style.color = 'var(--ok)';
+  setTimeout(() => { msg.textContent = ''; }, 3000);
+}
+
+const ERR_BADGE = {
+  upstream_rejected: 'muted', rate_limited_local: 'muted', bad_request: 'muted',
+  blocked_sorry: 'fail', upstream_429: 'fail', upstream_http_error: 'fail', network: 'fail',
+};
+const ERR_DESC = {
+  upstream_rejected: '上游返回 200 但没有内容帧。实测是瞬时拒绝，隔几分钟自愈，跟频率/并发/累积次数都无关 —— 重试即可，不用调限流。',
+  rate_limited_local: '本地限流挡下的（slot 满）。要更高产能就在「代理池」加代理。',
+  blocked_sorry: '被 Google 重定向到 sorry/index，该出口 IP 进了黑名单。换代理，6-24 小时才恢复。',
+  upstream_429: '上游直接 429。同样是出口 IP 嫌疑，换代理。',
+  upstream_http_error: '上游返回非 200 的其它状态码，可能是协议变更或临时故障。',
+  network: '连不上代理 / DNS / TLS 握手失败。检查代理可用性 —— 实测代理服务商出口质量参差，劣质出口会连续失败。',
+  bad_request: '客户端请求本身有问题（模型名不存在、传了不支持的字段）。',
+};
+
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// 服务端会静默降级（例如请求 3.1 Pro 实际给的是 3.6 Flash），只看请求名发现不了。
+// upstream_model 取自响应帧里服务端自报的显示名；跟请求的对不上时标黄。
+//
+// 媒体模型例外：生图/音乐的后端名（Nano Banana / Lyria）跟请求名本来就不同，是预期
+// 映射不是降级——真失败会直接报错不落 200 记录，所以这里把它们当"一致"，不误标黄。
+const upstreamExpected = { image: 'nanobanana', music: 'lyria' };
+function upstreamCell(r) {
+  const up = r.upstream_model || '';
+  if (!up) return '<span class="badge muted">—</span>';
+  const norm = t => (t || '').toLowerCase().replace(/[\s._-]/g, '').replace(/^gemini/, '');
+  const nm = norm(r.model), nu = norm(up);
+  const same = nu.startsWith(nm.slice(0, 6)) ||
+               (upstreamExpected[nm] && nu.startsWith(upstreamExpected[nm]));
+  return same
+    ? escapeHtml(up)
+    : '<span class="badge warn" title="服务端实际使用的模型与请求的不一致">'
+      + escapeHtml(up) + '</span>';
+}
+
+async function addProxy() {
+  const data = await modalForm({
+    title: '添加代理',
+    desc: '一个代理 = 一个独立 IP slot，享有独立的并发/RPM/RPH 配额。',
+    fields: [
+      { name: 'name', label: '名称', placeholder: 'vps-uk-1', required: true,
+        hint: '随便起，admin 面板里用来区分' },
+      { name: 'url', label: '代理 URL', placeholder: 'http://user:pass@1.2.3.4:8080', required: true,
+        hint: '支持 http:// / https:// / socks5:// 协议' },
+    ],
+  });
+  if (!data) return;
+  const r = await fetch('api/proxies', {
+    method: 'POST', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: data.name, url: data.url, weight: 1 }),
+  });
+  const j = await r.json();
+  if (j.error) return flash('添加失败：' + j.error);
+  flash('代理已添加');
+  await refreshPage();
+}
+async function delProxy(id) {
+  const ok = await modalConfirm({
+    title: '删除代理',
+    desc: `确定删除代理 #${id}？此操作不可撤销。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
+  await api('api/proxies/' + id, { method: 'DELETE' });
+  flash('已删除');
+  await refreshPage();
+}
+async function toggleProxy(id) {
+  await api('api/proxies/' + id + '/toggle', { method: 'POST' });
+  await refreshPage();
+}
+async function resetProxy(id) {
+  await api('api/proxies/' + id + '/reset', { method: 'POST' });
+  flash('已重置失败计数');
+  await refreshPage();
+}
+// Cookie 池 ────────────────────────────────────────────────────────────────
+
+// 逐项模式列出的 cookie。顺序按"从 DevTools 里找的难易"排，不是字母序。
+// req 只标 SAPISID：后端也只强制这一项（要用它算 SAPISIDHASH 授权头），
+// 其余缺了不一定不能用，标成必填会把能用的号挡在外面。
+const COOKIE_KEYS = [
+  { k: '__Secure-1PSID', hint: '主会话' },
+  { k: 'SAPISID', req: true, hint: '算授权头用，缺了会被当匿名' },
+  { k: '__Secure-1PSIDTS', hint: '会话时间戳，随会话刷新而变' },
+  { k: 'SID' }, { k: 'HSID' }, { k: 'SSID' }, { k: 'APISID' },
+];
+
+// 把 "k=v; k=v" 拆成对象。值里可能含 '='（base64 补位），所以只在第一个等号处切。
+function parseCookieStr(s) {
+  const out = {};
+  (s || '').split(';').forEach(p => {
+    const t = p.trim();
+    const i = t.indexOf('=');
+    if (i > 0) out[t.slice(0, i)] = t.slice(i + 1);
+  });
+  return out;
+}
+
+function joinCookieObj(obj) {
+  return Object.entries(obj).filter(([, v]) => (v || '').trim())
+    .map(([k, v]) => `${k}=${String(v).trim()}`).join('; ');
+}
+
+async function addCookieAcct() {
+  // 两个模式共用这一份状态，切 tab 时互相带过去。extras 存的是不在
+  // COOKIE_KEYS 里的项——整串粘贴进来的 cookie 往往还带一堆别的，
+  // 切到逐项再切回去不能把它们弄丢。
+  let extras = {};
+
+  const data = await buildModal({
+    title: '导入 Cookie',
+    wide: true,
+    desc: '浏览器 F12 → Application → Cookies → 选 <code>https://gemini.google.com</code>。逐项抄或整串粘贴都行，两种填法可随时切换，已填的内容会带过去。',
+    bodyHTML: `
+      <div class="field">
+        <label>标签</label>
+        <input data-name="label" type="text" placeholder="例如账号邮箱，可留空" />
+        <div class="hint">仅用于面板里区分账号，不参与请求。</div>
+      </div>
+
+      <div class="segbar" data-role="seg">
+        <button type="button" data-mode="raw" class="on">整串粘贴（推荐）</button>
+        <button type="button" data-mode="fields">逐项填写</button>
+      </div>
+
+      <div data-pane="fields" style="display:none;">
+        <div class="ck-grid">
+          ${COOKIE_KEYS.map(c => `
+            <div class="field${c.k.length > 12 ? ' wide' : ''}">
+              <label>${escapeHtml(c.k)}${c.req ? ' <span class="req">*</span>' : ''}</label>
+              <input data-ck="${escapeHtml(c.k)}" type="text" autocomplete="off" spellcheck="false"
+                     placeholder="${escapeHtml(c.hint || '')}" />
+            </div>`).join('')}
+        </div>
+        <div class="ck-extra" data-role="extras"></div>
+        <div class="ck-extra">前三项是同类项目实践里的最小可用集合，下面四项补齐更稳。
+        抓包实测浏览器每次实际会发 <b>20 多个</b> cookie，而我们把整串原样转发
+        （代码里只解析 SAPISID 用来算授权头），所以
+        <b>整串粘贴比逐项填更接近真实浏览器</b>；逐项模式适合手头只有零散几项时用。</div>
+      </div>
+
+      <div data-pane="raw">
+        <div class="field">
+          <textarea data-name="cookie" rows="6" spellcheck="false"
+            placeholder="SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=..."></textarea>
+          <div class="hint">整行粘贴，分号分隔。至少要含 SAPISID。DevTools 里全选复制即可，
+          多余的项会一并保留 —— 发得越全越像真实浏览器。</div>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:14px;">
+        <label>备注</label>
+        <input data-name="note" type="text" placeholder="可留空" />
+      </div>`,
+    submitText: '导入',
+    onReady: (overlay) => {
+      const $ = (s) => overlay.querySelector(s);
+      const inputs = () => [...overlay.querySelectorAll('[data-ck]')];
+      const ta = $('[data-name=cookie]');
+
+      const fieldsToRaw = () => {
+        const obj = {};
+        inputs().forEach(el => { if (el.value.trim()) obj[el.dataset.ck] = el.value.trim(); });
+        ta.value = joinCookieObj({ ...obj, ...extras });
+      };
+      const rawToFields = () => {
+        const obj = parseCookieStr(ta.value);
+        const known = new Set(COOKIE_KEYS.map(c => c.k));
+        extras = {};
+        Object.entries(obj).forEach(([k, v]) => { if (!known.has(k)) extras[k] = v; });
+        inputs().forEach(el => { el.value = obj[el.dataset.ck] || ''; });
+        const n = Object.keys(extras).length;
+        $('[data-role=extras]').textContent = n
+          ? `另有 ${n} 项未在上面列出（${Object.keys(extras).slice(0, 4).join(', ')}${n > 4 ? ' …' : ''}），会一并保留。`
+          : '';
+      };
+
+      overlay.querySelectorAll('[data-role=seg] button').forEach(btn => {
+        btn.onclick = () => {
+          const mode = btn.dataset.mode;
+          if (mode === 'raw') fieldsToRaw(); else rawToFields();
+          overlay.querySelectorAll('[data-role=seg] button')
+            .forEach(b => b.classList.toggle('on', b === btn));
+          $('[data-pane=fields]').style.display = mode === 'fields' ? '' : 'none';
+          $('[data-pane=raw]').style.display = mode === 'raw' ? '' : 'none';
+        };
+      });
+      // 在逐项模式里直接粘贴一整串时自动拆开，省得用户先去切 tab
+      inputs().forEach(el => el.addEventListener('paste', (ev) => {
+        const txt = (ev.clipboardData || window.clipboardData).getData('text') || '';
+        if (!txt.includes(';') || !txt.includes('=')) return;
+        ev.preventDefault();
+        ta.value = txt.trim();
+        rawToFields();
+      }));
+    },
+    onSubmit: (overlay) => {
+      const label = (overlay.querySelector('[data-name=label]').value || '').trim();
+      const note = (overlay.querySelector('[data-name=note]').value || '').trim();
+      const isRaw = overlay.querySelector('[data-role=seg] button.on').dataset.mode === 'raw';
+      let cookie;
+      if (isRaw) {
+        cookie = (overlay.querySelector('[data-name=cookie]').value || '').trim();
+      } else {
+        const obj = {};
+        overlay.querySelectorAll('[data-ck]').forEach(el => {
+          if (el.value.trim()) obj[el.dataset.ck] = el.value.trim();
+        });
+        cookie = joinCookieObj(obj);
+      }
+      if (!cookie) return { error: 'Cookie 不能为空' };
+      if (!cookie.includes('SAPISID')) return { error: 'cookie 里没有 SAPISID，多半没复制全' };
+      return { label, cookie, note };
+    },
+  });
+  if (!data) return;
+  const r = await fetch('api/cookies', {
+    method: 'POST', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  const j = await r.json();
+  if (j.error) return flash('导入失败：' + j.error);
+  flash('Cookie 已导入 #' + j.id);
+  await refreshPage();
+}
+
+async function editCookieAcct(id, label, note) {
+  const data = await modalForm({
+    title: '编辑 Cookie #' + id,
+    desc: '只改标签和备注，不动 cookie 本身。要换 cookie 请删掉重新导入。',
+    fields: [
+      { name: 'label', label: '标签', value: label || '', placeholder: '账号邮箱' },
+      { name: 'note', label: '备注', value: note || '', placeholder: '可留空' },
+    ],
+  });
+  if (!data) return;
+  const j = await api('api/cookies/' + id, {
+    method: 'PATCH', body: JSON.stringify({ label: data.label, note: data.note }),
+  });
+  if (j.error) return flash('保存失败：' + j.error);
+  flash('已保存');
+  await refreshPage();
+}
+
+// 检测 cookie 还有没有登录态。判据是 /app 页面里有没有 SNlM0e——cookie 失效时
+// Gemini 不报错、只是把你当匿名，纯文本请求照样 200，所以不能拿"请求成功"当判据。
+async function checkCookieAcct(id, btn) {
+  const old = btn.textContent;
+  btn.textContent = '检测中…'; btn.disabled = true;
+  try {
+    const r = await fetch('api/cookies/' + id + '/check',
+      { method: 'POST', credentials: 'include' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { flash('检测失败：' + (d.error || r.status)); return; }
+    const via = d.proxy_name ? `，出口 ${d.proxy_name}` : '';
+    flash((d.ok ? '✓ #' + id + ' ' : '✗ #' + id + ' ') + (d.detail || '') +
+          `${via}，${d.took_ms}ms`);
+    await refreshPage();
+  } finally {
+    btn.textContent = old; btn.disabled = false;
+  }
+}
+
+// 手动触发一次会话保活。后台每 10 分钟自动跑一次，这个按钮用来当场验证。
+async function rotateCookieAcct(id, btn) {
+  const old = btn.textContent;
+  btn.textContent = '…'; btn.disabled = true;
+  try {
+    const r = await fetch('api/cookies/' + id + '/rotate',
+      { method: 'POST', credentials: 'include' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { flash('保活失败：' + (d.error || r.status)); return; }
+    flash((d.ok ? '✓ #' + id + ' ' : '✗ #' + id + ' ') + (d.detail || '') +
+          (d.next_sec ? `，服务端建议 ${d.next_sec}s 后再来` : ''));
+    await refreshPage();
+  } finally { btn.textContent = old; btn.disabled = false; }
+}
+
+async function toggleCookieAcct(id) {
+  await api('api/cookies/' + id + '/toggle', { method: 'POST' });
+  await refreshPage();
+}
+
+async function delCookieAcct(id) {
+  const ok = await modalConfirm({
+    title: '删除 Cookie',
+    desc: `确定删除账号 #${id}？此操作不可撤销，删除后请求不再用它。`,
+    confirmText: '删除', danger: true,
+  });
+  if (!ok) return;
+  await api('api/cookies/' + id, { method: 'DELETE' });
+  flash('已删除');
+  await refreshPage();
+}
+
+// 浏览器登录（Chromium profile）动作 ──────────────────────────────────────────
+async function browserAdd() {
+  const data = await modalForm({
+    title: '添加浏览器账号（独立 profile）',
+    desc: '给这个账号起个名字。它会在 Chromium(VNC) 容器里开一个独立窗口，登录态与其它账号互不影响。',
+    fields: [
+      { name: 'name', label: 'Profile 名', required: true, placeholder: '例如 acct1 / gemini-a', hint: '只允许字母数字 . _ -，将作为该账号的隔离标识' },
+      { name: 'label', label: '标签（可选）', placeholder: '例如 test@gmail.com', hint: '入池后显示在 Cookie 池里的名字' },
+    ],
+    submitText: '创建并打开',
+  });
+  if (!data) return;
+  const r = await fetch('api/browser/profiles', {
+    method: 'POST', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (j.error) return flash('创建失败：' + j.error);
+  flash('profile 已就绪。请点该行的「在我的浏览器打开授权页」登录 Google，然后点「抓取 cookie」。');
+  await refreshPage();
+}
+
+// 打开/聚焦该 profile 的 gemini 登录页
+async function browserOpenLogin(name, btn) {
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '打开中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name) + '/open',
+      { method: 'POST', credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) return flash('打开失败：' + (j.error || r.status));
+    flash(j.detail || '已在容器内打开 gemini.google.com（桌面窗口可见），可在自己浏览器里操作');
+    await refreshPage();
+  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
+}
+
+// 在用户自己的浏览器里打开容器 Chromium 桌面（VNC Web），显示该账号的 Gemini 授权页。
+function browserOpenInUser(url, btn) {
+  if (!url) return flash('未配置桌面网页地址：请在上方输入并保存，或在 compose 里设 BROWSER_ACCESS_URL');
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '打开中…'; btn.disabled = true; }
+  try { window.open(url, '_blank'); } catch (e) {}
+  if (btn) { btn.textContent = old; btn.disabled = false; }
+  flash('已在新标签打开容器桌面（VNC）。请点开该账号的 Chromium 窗口完成 Google 登录。');
+}
+
+function getAccessUrlInput() {
+  const el = document.getElementById('browserAccessUrl');
+  return el ? el.value.trim() : '';
+}
+function currentAccessUrl() {
+  const el = document.getElementById('browserAccessUrl');
+  return el ? (el.value.trim() || (el.placeholder || '')) : '';
+}
+function openAccessUrl() {
+  const u = currentAccessUrl();
+  if (!u) return flash('先填写桌面网页地址');
+  window.open(u, '_blank');
+}
+function saveAccessUrl() {
+  const el = document.getElementById('browserAccessUrl');
+  if (!el) return;
+  const v = el.value.trim();
+  try {
+    if (v) localStorage.setItem('gw2aAccessUrl', v);
+    else localStorage.removeItem('gw2aAccessUrl');
+  } catch (e) {}
+  flash(v ? '已保存桌面网页地址（仅本浏览器生效）' : '已清除自定义地址，恢复默认');
+  refreshPage();
+}
+
+// 抓取 cookie 入池
+async function browserFetch(name, btn) {
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '抓取中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name) + '/fetch',
+      { method: 'POST', credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) return flash('抓取失败：' + (j.error || r.status));
+    flash((j.ok ? '✓ ' : '✗ ') + (j.detail || ''));
+    await refreshPage();
+  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
+}
+
+// 删除 profile（停实例 + 删池记录）
+async function browserDel(name, btn) {
+  const okc = await modalConfirm({
+    title: '删除浏览器账号',
+    desc: `删除 profile「${name}」？将关闭对应 Chromium 窗口，并删除它在 Cookie 池里的账号记录。此操作不可撤销。`,
+    confirmText: '删除', danger: true,
+  });
+  if (!okc) return;
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '删除中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name),
+      { method: 'DELETE', credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) return flash('删除失败：' + (j.error || r.status));
+    flash('已删除');
+    await refreshPage();
+  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
+}
+
+// 全部刷新（手动触发一次所有 browser 账号的 cookie 刷新）
+async function browserRefreshAll(btn) {
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '刷新中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('api/browser/refresh', { method: 'POST', credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) return flash('刷新失败：' + (j.error || r.status));
+    flash(j.detail || '刷新完成');
+    await refreshPage();
+  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
+}
+
+// 跳到 Cookie 池页查看对应账号
+function browserAccountInPool(id) {
+  // 高亮不太好做，先简单切到 Cookie 池页
+  switchPage('cookies');
+}
+
+async function doLogout() {
+  const ok = await modalConfirm({
+    title: '退出登录',
+    desc: '退出后需要重新输入管理员 token 才能进来。服务本身不受影响，API 照常提供。',
+    confirmText: '退出',
+    danger: true,
+  });
+  if (!ok) return;
+  await api('api/logout', { method: 'POST' });
+  currentPage = null;
+  renderLogin();
+}
+
+// 连通性诊断 ──────────────────────────────────────────────────────────────
+
+async function populateTestProxies() {
+  const sel = document.getElementById('testProxy');
+  if (!sel) return;
+  // 清掉旧的代理选项（保留前两个固定项）
+  while (sel.options.length > 2) sel.remove(2);
+  try {
+    const data = await api('api/proxies');
+    (data.items || []).filter(p => p.enabled).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.text = '代理: ' + p.name;
+      sel.appendChild(opt);
+    });
+  } catch (e) { /* ignore — login redirect handled in api() */ }
+}
+
+async function runTest() {
+  const sel = document.getElementById('testProxy');
+  const proxy = sel.value;
+  const box = document.getElementById('testResult');
+  box.style.display = 'block';
+  box.innerHTML = '<div class="empty">正在测试…（最多等 30 秒）</div>';
+  try {
+    const url = 'api/test' + (proxy !== '' ? '?proxy_id=' + proxy : '');
+    const r = await api(url);
+    const statusBadge = {
+      success: '<span class="badge ok">成功</span>',
+      blocked_sorry: '<span class="badge fail">被风控（302）</span>',
+      rate_limited: '<span class="badge fail">被限流（429）</span>',
+      upstream_error: '<span class="badge fail">上游错误</span>',
+      network_error: '<span class="badge fail">网络层错误</span>',
+    }[r.status] || `<span class="badge muted">${r.status}</span>`;
+    box.innerHTML = `
+      <div style="display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; font-size: 13px;">
+        <div style="color: var(--muted)">结果</div><div>${statusBadge}</div>
+        <div style="color: var(--muted)">HTTP code</div><div><code>${r.http_code || '-'}</code></div>
+        <div style="color: var(--muted)">总用时</div><div><code>${r.total_ms} ms</code></div>
+        <div style="color: var(--muted)">使用的 IP slot</div><div>${r.proxy_name || '-'}${r.use_direct ? '' : (r.proxy_id ? ' (代理 #' + r.proxy_id + ')' : '')}</div>
+        <div style="color: var(--muted)">指纹</div><div><code>${r.impersonate}</code></div>
+        ${r.response_text ? `<div style="color: var(--muted)">回复内容</div><div class="pre">${escapeHtml(r.response_text)}</div>` : ''}
+        <div style="color: var(--muted)">诊断说明</div><div style="line-height: 1.6;">${escapeHtml(r.diagnostic)}</div>
+        ${r.upstream_snip && !r.ok ? `<div style="color: var(--muted)">上游响应片段</div>
+          <div class="pre" style="max-height: 120px; overflow: auto; background: var(--bg); padding: 8px; border-radius: 4px;">${escapeHtml(r.upstream_snip)}</div>` : ''}
+      </div>
+    `;
+  } catch (e) {
+    box.innerHTML = `<div class="err">测试请求失败：${e.message}</div>`;
+  }
+}
+
+// API key actions ──────────────────────────────────────────────────────────
+
+function toggleKeyVis() {
+  const el = document.getElementById('apiKeyView');
+  const btn = el.parentElement.querySelector('button');
+  el.type = el.type === 'password' ? 'text' : 'password';
+  if (btn) btn.textContent = el.type === 'password' ? '显示' : '隐藏';
+}
+
+async function copyKey() {
+  const el = document.getElementById('apiKeyView');
+  try {
+    await navigator.clipboard.writeText(el.value);
+    flash('已复制到剪贴板');
+  } catch (e) {
+    el.type = 'text'; el.select(); document.execCommand('copy');
+    flash('已复制（兼容模式）');
+  }
+}
+
+async function rotateKey() {
+  const ok = await modalConfirm({
+    title: '生成新 Key',
+    desc: '现有客户端在重新配置前将无法访问。确定继续？',
+    confirmText: '生成新 Key',
+    danger: true,
+  });
+  if (!ok) return;
+  await api('api/apikey', { method: 'POST' });
+  flash('已生成新 Key');
+  await refreshPage();
+  const el = document.getElementById('apiKeyView');
+  if (el) { el.type = 'text'; }
+}
+
+async function customKey() {
+  const k = await modalPrompt({
+    title: '设置自定义 API Key',
+    desc: '至少 20 字符。设置后所有客户端要更换为新 Key。',
+    label: '新 Key',
+    placeholder: 'sk-gemini-...',
+    password: true,
+  });
+  if (!k) return;
+  if (k.length < 20) return flash('Key 至少 20 字符');
+  const r = await fetch('api/apikey', {
+    method: 'PATCH', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: k }),
+  });
+  const j = await r.json();
+  if (j.ok) { flash('Key 已更新'); await refreshPage(); }
+  else flash('错误：' + (j.error || '未知错误'));
+}
+
+function flash(msg) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = 'position:fixed;bottom:24px;right:24px;background:#1F1F1F;color:#fff;'
+    + 'padding:12px 20px;border-radius:12px;font-size:13px;z-index:9999;'
+    + 'box-shadow:0 4px 16px rgba(60,64,67,.3);';
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 1800);
+}
+
+// 自定义弹窗 ──────────────────────────────────────────────────────────────
+//   modalConfirm({ title, desc, confirmText, danger })       -> bool
+//   modalPrompt({ title, desc, label, placeholder, value })   -> string|null
+//   modalForm({ title, desc, fields: [{name,label,...}], submitText })
+//                                                            -> obj|null
+
+function buildModal({ title, desc, bodyHTML, submitText, danger, wide, allowEnter, onReady, onSubmit }) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal${wide ? ' wide' : ''}" role="dialog" aria-modal="true">
+        ${title ? `<h3>${escapeHtml(title)}</h3>` : ''}
+        ${desc ? `<div class="desc">${desc}</div>` : ''}
+        <div class="modal-err" style="display:none;"></div>
+        <div class="modal-body">${bodyHTML || ''}</div>
+        <div class="actions">
+          <button class="btn muted" data-act="cancel">取消</button>
+          <button class="btn ${danger ? 'danger' : ''}" data-act="ok">${escapeHtml(submitText || '确定')}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    // 弹窗挂上 DOM 之后再交给调用方接事件——内容是 innerHTML 灌进去的，
+    // 早于这一步拿不到里面的节点。
+    if (onReady) onReady(overlay);
+
+    const finish = (val) => {
+      overlay.remove();
+      document.removeEventListener('keydown', keyHandler);
+      resolve(val);
+    };
+    const showErr = (msg) => {
+      const e = overlay.querySelector('.modal-err');
+      e.textContent = msg;
+      e.style.display = msg ? 'block' : 'none';
+      e.className = 'modal-err err';
+    };
+
+    overlay.querySelector('[data-act=cancel]').onclick = () => finish(null);
+    overlay.querySelector('[data-act=ok]').onclick = async () => {
+      const result = onSubmit ? await onSubmit(overlay) : true;
+      if (result === false) return; // validation failed
+      if (result && typeof result === 'object' && result.error) { showErr(result.error); return; }
+      finish(result === true ? true : result);
+    };
+    overlay.onclick = (e) => { if (e.target === overlay) finish(null); };
+
+    const keyHandler = (e) => {
+      if (e.key === 'Escape') finish(null);
+      if (e.key === 'Enter' && allowEnter && document.activeElement.tagName !== 'TEXTAREA') {
+        overlay.querySelector('[data-act=ok]').click();
+      }
+    };
+    document.addEventListener('keydown', keyHandler);
+
+    // 自动 focus 第一个 input
+    setTimeout(() => {
+      const first = overlay.querySelector('input,textarea');
+      if (first) first.focus();
+    }, 50);
+  });
+}
+
+function modalConfirm({ title, desc, confirmText = '确定', danger = false }) {
+  return buildModal({
+    title, desc, bodyHTML: '', submitText: confirmText, danger, allowEnter: true,
+    onSubmit: () => true,
+  });
+}
+
+function modalPrompt({ title, desc, label, placeholder = '', value = '', hint, password = false }) {
+  return buildModal({
+    title, desc, allowEnter: true,
+    bodyHTML: `<div class="field">
+      ${label ? `<label>${escapeHtml(label)}</label>` : ''}
+      <input type="${password ? 'password' : 'text'}" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}" />
+      ${hint ? `<div class="hint">${hint}</div>` : ''}
+    </div>`,
+    submitText: '确定',
+    onSubmit: (overlay) => {
+      const v = overlay.querySelector('input').value;
+      if (!v) return { error: '不能为空' };
+      return v;
+    },
+  });
+}
+
+// fields: [{ name, label, placeholder, hint, value, required, password }]
+function modalForm({ title, desc, fields, submitText = '提交' }) {
+  const html = fields.map(f => `
+    <div class="field">
+      <label>${escapeHtml(f.label)}${f.required ? ' *' : ''}</label>
+      <input data-name="${escapeHtml(f.name)}" type="${f.password ? 'password' : 'text'}"
+             placeholder="${escapeHtml(f.placeholder || '')}"
+             value="${escapeHtml(f.value || '')}" />
+      ${f.hint ? `<div class="hint">${f.hint}</div>` : ''}
+    </div>`).join('');
+  return buildModal({
+    title, desc, bodyHTML: html, submitText, allowEnter: true,
+    onSubmit: (overlay) => {
+      const out = {};
+      for (const f of fields) {
+        const el = overlay.querySelector(`[data-name="${f.name}"]`);
+        const v = (el.value || '').trim();
+        if (f.required && !v) return { error: `「${f.label}」不能为空` };
+        if (f.minLength && v.length < f.minLength) return { error: `「${f.label}」至少 ${f.minLength} 字符` };
+        out[f.name] = v;
+      }
+      return out;
+    },
+  });
+}
+
+// ─── Routing / shell ────────────────────────────────────────────────────────
+
+let currentPage = null;
+let pageSeq = 0;
+
+// 点已经选中的导航项直接忽略：重新拉一遍数据、整块内容闪一下再画回原样，
+// 用户看到的只是抖动。要重新取数有「刷新」按钮，走 refreshPage()。
+async function switchPage(name, force = false) {
+  if (!force && name === currentPage) return;
+  const seq = ++pageSeq;
+  currentPage = name;
+
+  document.querySelectorAll('nav button').forEach(b =>
+    b.classList.toggle('active', b.dataset.page === name));
+  const titleEl = document.getElementById('pageTitle');
+  if (titleEl) titleEl.textContent = PAGE_TITLES[name] || name;
+  const main = document.getElementById('main');
+
+  // 旧内容先留着，超过 200ms 还没好才显示占位——快的时候完全不闪
+  const slow = setTimeout(() => {
+    if (seq === pageSeq) main.innerHTML = '<div class="empty">加载中…</div>';
+  }, 200);
+  let html;
+  try {
+    html = await pages[name]();
+  } catch (e) {
+    clearTimeout(slow);
+    if (seq === pageSeq) main.innerHTML = '<div class="empty">' + e.message + '</div>';
+    return;
+  }
+  clearTimeout(slow);
+  if (seq !== pageSeq) return;   // 期间又点了别的页，丢弃这次结果
+  main.innerHTML = html;
+
+  if (name === 'dashboard') {
+    await loadChart('24h');
+    document.getElementById('rangeSel').onchange = (e) => loadChart(e.target.value);
+    await populateTestProxies();
+  }
+  if (name === 'requests') {
+    reqOffset = 0;
+    document.getElementById('reqStatus').onchange = () => { reqOffset = 0; loadReqs(); };
+    document.getElementById('reqModel').onchange = () => { reqOffset = 0; loadReqs(); };
+    document.getElementById('reqSize').onchange = () => { reqOffset = 0; loadReqs(); };
+    await loadReqs();
+  }
+  if (name === 'settings') {
+    await loadRtCfg();
+  }
+}
+
+// 主动重新拉当前页的数据（「刷新」按钮、增删改之后回填）
+function refreshPage() { return switchPage(currentPage, true); }
+
+// 侧栏图标（Material Symbols 风格的简化路径，内联避免外部依赖）
+const ICONS = {
+  dashboard: '<path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/>',
+  requests: '<path d="M7 5h14v2H7V5zm0 6h14v2H7v-2zm0 6h14v2H7v-2zM3 4.5a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zm0 6a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0zm0 6a1.5 1.5 0 113 0 1.5 1.5 0 01-3 0z"/>',
+  proxies: '<path d="M12 2a2.5 2.5 0 011 4.79V9h4a2 2 0 012 2v1.21a2.5 2.5 0 11-2 0V11h-4v1.21a2.5 2.5 0 11-2 0V11H7v1.21a2.5 2.5 0 11-2 0V11a2 2 0 012-2h4V6.79A2.5 2.5 0 0112 2z"/>',
+  settings: '<path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/>',
+  cookies: '<path d="M12 2a10 10 0 100 20 10 10 0 000-20zm-1 4a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm7 3a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zM8 13a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm6 4a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z"/>',
+  browser: '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>',
+  menu: '<path d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"/>',
+  logout: '<path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4a2 2 0 00-2 2v14a2 2 0 002 2h8v-2H4V5z"/>',
+};
+const NAV = [
+  ['dashboard', '概览'],
+  ['requests', '请求记录'],
+  ['proxies', '代理池'],
+  ['cookies', 'Cookie 池'],
+  ['browser', '浏览器登录'],
+  ['settings', '设置'],
+];
+const PAGE_TITLES = {
+  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Cookie 池',
+browser: '浏览器登录', settings: '设置',
+};
+
+function toggleSidebar() {
+  const el = document.querySelector('.sidebar');
+  el.classList.toggle('collapsed');
+  try { localStorage.setItem('sbCollapsed', el.classList.contains('collapsed') ? '1' : ''); } catch (e) {}
+}
+
+function renderShell() {
+  const collapsed = (() => { try { return localStorage.getItem('sbCollapsed') === '1'; } catch (e) { return false; } })();
+  document.getElementById('app').innerHTML = `
+    <aside class="sidebar${collapsed ? ' collapsed' : ''}">
+      <div class="side-top">
+        <button class="icon-btn" onclick="toggleSidebar()" title="收起 / 展开" aria-label="收起或展开侧边栏">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">${ICONS.menu}</svg>
+        </button>
+        <span class="brand-text"><span class="spark"></span>gemini-web2api</span>
+      </div>
+      <nav>
+        ${NAV.map(([k, label]) => `
+          <button data-page="${k}" onclick="switchPage('${k}')" title="${label}">
+            <svg viewBox="0 0 24 24">${ICONS[k]}</svg>
+            <span class="nav-label">${label}</span>
+          </button>`).join('')}
+      </nav>
+      <div class="side-foot">
+        <div id="sideStat"></div>
+        <div class="sf-sep"></div>
+        <button class="logout-btn" onclick="doLogout()" title="退出登录">
+          <svg viewBox="0 0 24 24">${ICONS.logout}</svg>
+          <span class="nav-label">退出登录</span>
+        </button>
+      </div>
+    </aside>
+    <div class="content">
+      <div class="topbar">
+        <h1 class="page-title" id="pageTitle">概览</h1>
+        <div class="topbar-right">
+          <button class="btn" id="langBtn" onclick="toggleLang()" style="padding:5px 10px;font-size:12px" title="切换语言 / Switch language">EN</button>
+          <span class="dot" id="healthDot"></span>
+          <span class="muted" id="healthText">运行中</span>
+        </div>
+      </div>
+      <main id="main"></main>
+    </div>
+  `;
+  switchPage('dashboard');
+  loadSideStat();
+}
+
+// 侧栏底部放真正有用的服务状态，而不是一个占位破折号
+async function loadSideStat() {
+  const box = document.getElementById('sideStat');
+  if (!box) return;
+  try {
+    const [root, ck, usage] = await Promise.all([
+      fetch('../').then(r => r.json()).catch(() => null),
+      api('api/cookies').catch(() => null),
+      api('api/usage').catch(() => null),
+    ]);
+    const dot = document.getElementById('healthDot');
+    const ht = document.getElementById('healthText');
+    if (dot) dot.classList.toggle('bad', !root);
+    if (ht) ht.textContent = root ? '运行中' : '无法连接';
+    box.innerHTML = [
+      ['版本', root ? 'v' + root.version : '—'],
+      ['模型', root ? root.models.length + ' 个' : '—'],
+      ['Cookie', ck && ck.items && ck.items.length ? ck.items.length + ' 个' : '匿名'],
+      ['IP slot', usage ? (usage.items || []).length + ' 个' : '—'],
+    ].map(([k, v]) => `<div class="sf-row"><span>${k}</span><b>${v}</b></div>`).join('');
+  } catch (e) { box.innerHTML = ''; }
+}
+
+function renderLogin() {
+  document.getElementById('app').innerHTML = `
+    <div class="login-box">
+      <h1><span class="spark" style="width:20px;height:20px;background:var(--g-sweep);
+        border-radius:4px;display:inline-block;
+        clip-path:polygon(50% 0,61% 39%,100% 50%,61% 61%,50% 100%,39% 61%,0 50%,39% 39%)"></span>
+        gemini-web2api</h1>
+      <input id="tokenInput" type="password" placeholder="管理员 Token" />
+      <button class="btn" onclick="doLogin()">登录</button>
+      <div id="loginErr" class="err"></div>
+    </div>`;
+  document.getElementById('tokenInput').focus();
+  document.getElementById('tokenInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+  });
+}
+
+async function doLogin() {
+  const tok = document.getElementById('tokenInput').value;
+  const r = await fetch('api/login', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: tok }) });
+  if (r.ok) renderShell();
+  else document.getElementById('loginErr').textContent = 'Token 错误';
+}
+
+// ── i18n（中 ⇄ 英）───────────────────────────────────────────────────────
+// 机制：一个 MutationObserver 盯 #app，内容一变就按整段文本节点/属性精确匹配
+// I18N_EN 词典替换成英文；切回中文时从 ZH_ORIG 里恢复原文。渲染逻辑一行不用改，
+// 只在最外面套一层翻译。插值文案（带数字/名字的）不精确匹配、保持中文，属可接受。
+const I18N_EN = {
+  'gemini-web2api 管理面板': 'gemini-web2api Admin Panel',
+  '概览': 'Overview',
+  '请求记录': 'Requests',
+  '代理池': 'Proxy Pool',
+  'Cookie 池': 'Cookie Pool',
+  '浏览器登录': 'Browser Login',
+  '设置': 'Settings',
+  '运行中': 'Running',
+  '已停止': 'Stopped',
+  '已入池': 'In Pool',
+  '未抓取': 'Not fetched',
+  '控制器在线': 'Controller Online',
+  '控制器离线': 'Controller Offline',
+  '全部刷新': 'Refresh All',
+  '抓取 cookie': 'Fetch Cookies',
+  '打开登录页': 'Open Login',
+  '删除': 'Delete',
+  'Profile': 'Profile',
+  'CDP 端口': 'CDP Port',
+  '控制器健康': 'Controller Health',
+  '标签 / 账号': 'Label / Account',
+  '最近成功': 'Last Success',
+  '操作': 'Actions',
+  '无法连接': 'Disconnected',
+  '收起 / 展开': 'Collapse / Expand',
+  '收起或展开侧边栏': 'Collapse or expand sidebar',
+  '退出登录': 'Log out',
+  '版本': 'Version',
+  '模型': 'Model',
+  '匿名': 'Anonymous',
+  '直连': 'Direct',
+  '管理员 Token': 'Admin Token',
+  '登录': 'Log in',
+  'Token 错误': 'Wrong token',
+  '24 小时请求': '24h Requests',
+  '成功率': 'Success rate',
+  '平均延迟': 'Avg latency',
+  '输入 Token': 'Input Tokens',
+  '输出 Token': 'Output Tokens',
+  '请求量与延迟': 'Requests & latency',
+  '最近 24 小时': 'Last 24 hours',
+  '最近 7 天': 'Last 7 days',
+  '最近 30 天': 'Last 30 days',
+  '距离封禁红线': 'Distance to ban threshold',
+  '刷新': 'Refresh',
+  '还没有任何请求经过': 'No requests have passed through yet',
+  '这条线是怎么来的': 'Where this line comes from',
+  '连通性诊断': 'Connectivity test',
+  '测试一次': 'Test once',
+  '自动选择（按调度规则）': 'Auto-select (by scheduling rules)',
+  '直连主机 IP': 'Direct (host IP)',
+  '打一次真实请求看是否通。不消耗限流配额、不写入请求记录。返回 302/429 就是出口进了黑名单，该换 IP。':
+    'Fire one real request to see if it goes through. Consumes no rate-limit quota and writes no request record. A 302/429 means the egress is blacklisted — time to switch IP.',
+  '正在测试…（最多等 30 秒）': 'Testing... (up to 30s)',
+  '结果': 'Result',
+  '被风控（302）': 'Blocked (302)',
+  '被限流（429）': 'Rate-limited (429)',
+  '上游错误': 'Upstream error',
+  '网络层错误': 'Network-layer error',
+  '使用的 IP slot': 'IP slot used',
+  '指纹': 'Fingerprint',
+  '回复内容': 'Response',
+  '诊断说明': 'Diagnostic',
+  '上游响应片段': 'Upstream response snippet',
+  '按模型分组': 'By model',
+  '按出口分组': 'By egress',
+  '请求': 'Requests',
+  '成功': 'Success',
+  '平均': 'Avg',
+  '出口': 'Egress',
+  '暂无数据': 'No data',
+  '类型': 'Type',
+  '次数': 'Count',
+  '含义 / 该怎么办': 'Meaning / What to do',
+  '窗口内没有失败': 'No failures in this window',
+  '上游返回 200 但没有内容帧。实测是瞬时拒绝，隔几分钟自愈，跟频率/并发/累积次数都无关 —— 重试即可，不用调限流。':
+    'Upstream returned 200 but no content frames. Measured as a transient rejection that self-heals in a few minutes, unrelated to rate / concurrency / cumulative count — just retry, no need to adjust rate limits.',
+  '本地限流挡下的（slot 满）。要更高产能就在「代理池」加代理。':
+    'Blocked by local rate limiting (slots full). For more throughput, add proxies on the Proxy Pool page.',
+  '被 Google 重定向到 sorry/index，该出口 IP 进了黑名单。换代理，6-24 小时才恢复。':
+    'Redirected by Google to sorry/index; this egress IP is blacklisted. Switch proxies — recovery takes 6-24 hours.',
+  '上游直接 429。同样是出口 IP 嫌疑，换代理。':
+    'Upstream returned 429 directly. Again an egress-IP suspicion — switch proxies.',
+  '上游返回非 200 的其它状态码，可能是协议变更或临时故障。':
+    'Upstream returned a non-200 status code, possibly a protocol change or a temporary fault.',
+  '连不上代理 / DNS / TLS 握手失败。检查代理可用性 —— 实测代理服务商出口质量参差，劣质出口会连续失败。':
+    'Could not reach the proxy / DNS / TLS handshake failed. Check proxy availability — proxy provider egress quality varies, and bad egresses fail repeatedly.',
+  '客户端请求本身有问题（模型名不存在、传了不支持的字段）。':
+    'The client request itself is malformed (nonexistent model name, or an unsupported field was passed).',
+  '全部': 'All',
+  '失败': 'Failed',
+  '全部模型': 'All models',
+  '每页 25': '25 / page',
+  '每页 50': '50 / page',
+  '每页 100': '100 / page',
+  '每页 200': '200 / page',
+  '时间': 'Time',
+  '实际模型': 'Actual model',
+  '账号': 'Account',
+  '状态': 'Status',
+  '首字': 'TTFB',
+  '总用时': 'Total',
+  '输入': 'Input',
+  '输出': 'Output',
+  '接口': 'Endpoint',
+  '加载中...': 'Loading...',
+  '加载中…': 'Loading...',
+  '还没有请求记录': 'No request records yet',
+  '错误：': 'Error: ',
+  '最前': 'First',
+  '上一页': 'Previous',
+  '下一页': 'Next',
+  '最后': 'Last',
+  '服务端实际使用的模型与请求的不一致': 'The model actually used by the server differs from the one requested',
+  '+ 添加代理': '+ Add proxy',
+  '每个代理是一个独立 IP slot': 'Each proxy is an independent IP slot',
+  '名称': 'Name',
+  '代理 URL': 'Proxy URL',
+  '最近错误': 'Last error',
+  '操作': 'Actions',
+  '已启用': 'Enabled',
+  '已禁用': 'Disabled',
+  '禁用': 'Disable',
+  '启用': 'Enable',
+  '重置': 'Reset',
+  '删除': 'Delete',
+  '还没有代理。点「+ 添加代理」加一个。': 'No proxies yet. Click "+ Add proxy" to add one.',
+  '+ 导入 Cookie': '+ Import Cookie',
+  '每行一个 Google 登录态账号': 'One logged-in Google account per row',
+  '标签': 'Label',
+  '关键 Cookie': 'Key Cookies',
+  '最近成功': 'Last success',
+  '未命名': 'Unnamed',
+  '缺 TS': 'Missing TS',
+  '缺 __Secure-1PSIDTS，无法长期续命': 'Missing __Secure-1PSIDTS; cannot be kept alive long-term',
+  '检测': 'Check',
+  '保活': 'Keep-alive',
+  '编辑': 'Edit',
+  'Cookie 池是空的。点「+ 导入 Cookie」加一个登录态账号。': 'The Cookie pool is empty. Click "+ Import Cookie" to add a logged-in account.',
+  '检测中…': 'Checking...',
+  '运行时配置': 'Runtime config',
+  '保存并生效': 'Save & apply',
+  '放弃修改': 'Discard changes',
+  '保存中…': 'Saving...',
+  '已保存并生效': 'Saved & applied',
+  '流量控制 · 每个 IP slot 独立计数': 'Rate limiting · counted per IP slot',
+  '重试与超时': 'Retry & timeout',
+  '请求行为': 'Request behavior',
+  '代理与 cookie 的降级行为': 'Proxy & cookie fallback behavior',
+  '数据与日志': 'Data & logs',
+  '并发': 'Concurrency',
+  '重试次数': 'Retry attempts',
+  '重试间隔（秒）': 'Retry interval (s)',
+  '上游超时（秒）': 'Upstream timeout (s)',
+  '默认模型': 'Default model',
+  'Prompt 字节上限': 'Prompt byte limit',
+  'TLS 指纹': 'TLS fingerprint',
+  'Gemini bl 版本': 'Gemini bl version',
+  '自动跟随 bl 版本': 'Auto-follow bl version',
+  '熔断冷却（分钟）': 'Circuit-breaker cooldown (min)',
+  '无可用代理时退回直连': 'Fall back to direct when no proxy is available',
+  'cookie 失效时降级匿名': 'Downgrade to anonymous when cookie fails',
+  '明细保留（天）': 'Detail retention (days)',
+  '打印请求日志': 'Log requests',
+  '同一时刻最多几个请求在飞，0=不限': 'Max requests in flight at once. 0 = unlimited',
+  '滚动 60 秒窗口上限，0=不限': 'Rolling 60-second window cap. 0 = unlimited',
+  '滚动 1 小时上限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过':
+    'Rolling 1-hour cap. A single egress was measured to get blocked at 80-180 requests, so the default takes the lower bound of 80. Running at a low rate can go much higher — 800 requests at 10/minute never got blocked.',
+  '含首次；流式已吐字后不再重试': 'Includes the first attempt; no retry once streaming has begun emitting',
+  '客户端没传 model 时用哪个': 'Which model to use when the client sends no model',
+  '超了直接返回 400 context_length_exceeded。上游的墙实测在约 13 万 UTF-8 字节，按字节算跟语言无关（同字节数下中英文表现一致，而 token 数差 1.9 倍）。不拦的话上游从尾部静默截断，被吃掉的正是刚问的那句。0=不限':
+    'Over the limit returns 400 context_length_exceeded directly. The upstream wall is measured at about 130,000 UTF-8 bytes; counted by bytes it is language-independent (Chinese and English behave identically at equal byte counts, though token counts differ by 1.9x). Without this cap the upstream silently truncates from the tail, and what gets eaten is exactly the message just asked. 0 = unlimited',
+  '上游前端版本号。请求大面积失败时先看这里是不是过期了': 'Upstream frontend version number. When requests fail en masse, check here first for staleness',
+  '每 6 小时从 /app 页面抓一次最新版本号，抓到就用抓到的。抓不到或格式不对就继续用上面钉的值':
+    'Fetches the latest version number from the /app page every 6 hours and uses it if found. If nothing is fetched or the format is wrong, keeps using the pinned value above',
+  '代理连续失败 5 次后歇多久再放回池子。实测被拦的出口 106-121 分钟自恢复，默认 120；0=不恢复，要去代理池页面手动重置':
+    'How long a proxy rests before returning to the pool after 5 consecutive failures. Blocked egresses were measured to self-recover in 106-121 minutes, so the default is 120. 0 = no auto-recovery, reset manually on the Proxy Pool page',
+  '关：直接返回 429，本机 IP 不会暴露给上游（默认）。开：可用性优先，但上游会看到本机真实出口':
+    'Off: return 429 directly, the host IP is never exposed to upstream (default). On: availability first, but upstream sees the host real egress',
+  '关：直接报错，能立刻发现该换号了（默认）。开：继续跑，但 3.1 Pro 会被静默降级成 3.5 Flash-Lite、思考链消失，客户端看不出来':
+    'Off: error out directly so you immediately notice it is time to swap accounts (default). On: keep running, but 3.1 Pro gets silently downgraded to 3.5 Flash-Lite and the thinking chain vanishes, invisible to the client',
+  '过期只删明细，聚合数据永久保留': 'Expiry deletes only detail rows; aggregate data is kept forever',
+  '显示': 'Show',
+  '隐藏': 'Hide',
+  '复制': 'Copy',
+  '生成随机 Key': 'Generate random key',
+  '自定义': 'Custom',
+  '调用示例': 'Example request',
+  '部署配置': 'Deployment config',
+  '监听': 'Listen',
+  '数据库': 'Database',
+  'Cookie 播种文件': 'Cookie seed file',
+  '面板鉴权': 'Panel auth',
+  '未配置': 'Not configured',
+  '已开启': 'On',
+  '未设 token': 'No token set',
+  '部署锁定': 'Deploy-locked',
+  '面板可轮换': 'Panel-rotatable',
+  'compose 的 ports + --port': 'compose ports + --port',
+  'compose 的 volumes + --db': 'compose volumes + --db',
+  '启动时把文件内容导入 Cookie 池；之后从「Cookie 池」页面管理': 'Imports the file contents into the Cookie pool at startup; managed afterward from the "Cookie Pool" page',
+  'compose 的 ADMIN_TOKEN': 'compose ADMIN_TOKEN',
+  'compose 的 API_KEY': 'compose API_KEY',
+  'gemini-web2api-go · 单二进制 · SQLite · Chrome 146 指纹 · tiktoken cl100k_base 计费':
+    'gemini-web2api-go · single binary · SQLite · Chrome 146 fingerprint · tiktoken cl100k_base billing',
+  '取消': 'Cancel',
+  '确定': 'OK',
+  '提交': 'Submit',
+  '添加代理': 'Add proxy',
+  '一个代理 = 一个独立 IP slot，享有独立的并发/RPM/RPH 配额。': 'One proxy = one independent IP slot with its own concurrency / RPM / RPH quota.',
+  '随便起，admin 面板里用来区分': 'Any name, just to tell them apart in the admin panel',
+  '支持 http:// / https:// / socks5:// 协议': 'Supports http:// / https:// / socks5:// protocols',
+  '删除代理': 'Delete proxy',
+  '导入 Cookie': 'Import Cookie',
+  '仅用于面板里区分账号，不参与请求。': 'Only used to tell accounts apart in the panel; not sent with requests.',
+  '整串粘贴（推荐）': 'Paste full string (recommended)',
+  '逐项填写': 'Fill in individually',
+  '整行粘贴，分号分隔。至少要含 SAPISID。DevTools 里全选复制即可，多余的项会一并保留 —— 发得越全越像真实浏览器。':
+    'Paste the whole line, semicolon-separated. Must contain at least SAPISID. Select-all and copy in DevTools; extra items are kept too — the more complete, the more it looks like a real browser.',
+  '备注': 'Note',
+  'Cookie 不能为空': 'Cookie cannot be empty',
+  'cookie 里没有 SAPISID，多半没复制全': 'No SAPISID in the cookie — you probably did not copy it all',
+  '导入': 'Import',
+  '只改标签和备注，不动 cookie 本身。要换 cookie 请删掉重新导入。': 'Edits only the label and note, not the cookie itself. To replace the cookie, delete and re-import.',
+  '账号邮箱': 'Account email',
+  '可留空': 'Optional',
+  '例如账号邮箱，可留空': 'e.g. account email, optional',
+  '删除 Cookie': 'Delete Cookie',
+  '退出后需要重新输入管理员 token 才能进来。服务本身不受影响，API 照常提供。': 'After logging out you must re-enter the admin token to get back in. The service itself is unaffected and the API keeps serving.',
+  '退出': 'Log out',
+  '生成新 Key': 'Generate new key',
+  '现有客户端在重新配置前将无法访问。确定继续？': 'Existing clients will be unable to access until reconfigured. Continue?',
+  '设置自定义 API Key': 'Set custom API Key',
+  '至少 20 字符。设置后所有客户端要更换为新 Key。': 'At least 20 characters. All clients must switch to the new key once set.',
+  '新 Key': 'New key',
+  '不能为空': 'Cannot be empty',
+  '代理已添加': 'Proxy added',
+  '已删除': 'Deleted',
+  '已重置失败计数': 'Failure count reset',
+  '已保存': 'Saved',
+  '已复制到剪贴板': 'Copied to clipboard',
+  '已复制（兼容模式）': 'Copied (fallback mode)',
+  '已生成新 Key': 'New key generated',
+  'Key 至少 20 字符': 'Key must be at least 20 characters',
+  'Key 已更新': 'Key updated',
+};
+let LANG = (() => { try { return localStorage.getItem('lang') === 'en' ? 'en' : 'zh'; } catch (e) { return 'zh'; } })();
+const ZH_ORIG = new WeakMap();
+const I18N_ATTRS = ['title', 'placeholder', 'aria-label'];
+
+function translateTree(root, toEN) {
+  // 规整：trim + 把内部换行/缩进折成单空格，好跟词典 key 精确对上（源码里跨行的句子
+  // 在 DOM 里是一个含换行+缩进的文本节点）。命中就整段换成英文、原文存起来供切回。
+  const norm = s => s.trim().replace(/\s+/g, ' ');
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let n;
+  while ((n = w.nextNode())) {
+    const key = norm(n.nodeValue);
+    if (!key) continue;
+    if (toEN) {
+      const en = I18N_EN[key];
+      if (en) {
+        if (!ZH_ORIG.has(n)) ZH_ORIG.set(n, n.nodeValue);
+        n.nodeValue = en;
+      }
+    } else if (ZH_ORIG.has(n)) {
+      n.nodeValue = ZH_ORIG.get(n);
+      ZH_ORIG.delete(n);
+    }
+  }
+  const scope = root.querySelectorAll ? root.querySelectorAll('[title],[placeholder],[aria-label]') : [];
+  scope.forEach(el => {
+    I18N_ATTRS.forEach(attr => {
+      if (!el.hasAttribute(attr)) return;
+      const dz = 'data-zh-' + attr;
+      if (toEN) {
+        const en = I18N_EN[norm(el.getAttribute(attr))];
+        if (en && !el.hasAttribute(dz)) { el.setAttribute(dz, el.getAttribute(attr)); el.setAttribute(attr, en); }
+      } else if (el.hasAttribute(dz)) {
+        el.setAttribute(attr, el.getAttribute(dz)); el.removeAttribute(dz);
+      }
+    });
+  });
+}
+
+let i18nObserver = null;
+let i18nPending = false;
+function i18nApply() {
+  const app = document.getElementById('app');
+  if (!app) return;
+  if (i18nObserver) i18nObserver.disconnect();
+  translateTree(app, LANG === 'en');
+  if (i18nObserver) i18nObserver.observe(app, { childList: true, subtree: true, characterData: true });
+}
+function i18nSchedule() {
+  if (i18nPending || LANG !== 'en') return;
+  i18nPending = true;
+  requestAnimationFrame(() => { i18nPending = false; i18nApply(); });
+}
+function i18nInit() {
+  const app = document.getElementById('app');
+  if (!app) return;
+  i18nObserver = new MutationObserver(() => i18nSchedule());
+  i18nObserver.observe(app, { childList: true, subtree: true, characterData: true });
+  updateLangBtn();
+  if (LANG === 'en') i18nApply();
+}
+function updateLangBtn() {
+  const b = document.getElementById('langBtn');
+  if (b) b.textContent = LANG === 'en' ? '中' : 'EN';
+}
+function toggleLang() {
+  LANG = LANG === 'en' ? 'zh' : 'en';
+  try { localStorage.setItem('lang', LANG); } catch (e) {}
+  i18nApply();
+  updateLangBtn();
+}
+
+// boot — try fetching stats; if 401, login page
+(async () => {
+  const r = await fetch('api/stats?hours=1', { credentials: 'include' });
+  if (r.ok) renderShell();
+  else renderLogin();
+  i18nInit();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+services:
+  gemini-web2api:
+    # 默认拉现成镜像，不需要源码——把这个文件单独下下来就能跑。
+    # 想从源码构建（改了代码、或者要自己审一遍）就把下面 build 那两行的注释去掉。
+    image: ghcr.io/zexadev/gemini-web2api-go:latest
+    # build:
+    #   context: .
+    container_name: gemini-web2api
+    restart: unless-stopped
+
+    # ── 这里只放"改了必须重启进程"的东西 ──────────────────────────────────
+    # 调优参数（限流额度、重试、超时、默认模型、TLS 指纹、bl 版本、降级开关、
+    # 日志开关、保留天数）在管理面板「设置 → 运行时配置」里改，保存即生效。
+    # 凭证（API Key、Google Cookie）也在面板里管，存数据库。
+    # 下面的 API_KEY / cookie 挂载都是**可选的锁定开关**，给不希望运行时被改
+    # 的部署用；不设的话默认走面板。
+
+    ports:
+      - "127.0.0.1:8083:8083"
+    # 想暴露给同 docker network 的其他容器（不走公网），改用:
+    # expose:
+    #   - "8083"
+    # 然后让其他容器加入下面的 default network 或自定义 network。
+
+    volumes:
+      # 用具名卷而不是 ./data:/data —— 镜像以 nonroot(uid 65532) 运行，而 bind mount
+      # 会用宿主目录的属主盖掉镜像里 /data 的属主。宿主上目录不存在时 Docker 自动建、
+      # 属主是 root，容器就写不进去，报 `unable to open database file (14)`。
+      # 具名卷由 Docker 从镜像继承属主，不会踩这个坑。
+      - gw2a-data:/data                           # SQLite + 历史记录持久化
+      # 一定要用 bind mount 的话，先把属主改过来：sudo chown -R 65532:65532 ./data
+      # - ./data:/data
+      # - ./cookie.txt:/app/cookie.txt:ro         # 可选：启动时把这个文件导入 Cookie 池
+
+    environment:
+      # 面板登录 token。留空 = 面板不鉴权，只有在绑定 127.0.0.1 时才可接受。
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-change-me-in-production}"
+      # 可选：锁定 /v1/* 的 API key，设了之后面板改不了。
+      # 不设则首次启动自动生成，在面板里轮换。
+      # API_KEY: "sk-gemini-your-key"
+      TZ: "${TZ:-UTC}"
+
+    # 镜像自带 CMD ["--db","/data/gemini.db","--port","8083"]，一般不用改。
+    # 只有要加参数时才写 command，写了就会整个覆盖掉默认值，别漏 --db。
+    # command: ["--db", "/data/gemini.db", "--port", "8083", "--cookie-file", "/app/cookie.txt"]
+
+    healthcheck:
+      test: ["CMD", "/app/gemini-web2api", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  gw2a-data:

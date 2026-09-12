@@ -1,0 +1,21 @@
+[Unit]
+Description=gemini-web2api on-demand cookie refresh (launch browser, refresh page, grab cookies, exit)
+After=network-online.target gw2a-browser-controller.service
+Wants=network-online.target gw2a-browser-controller.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=GW2A_PROFILE=acct1
+Environment=GW2A_BROWSER_PROXY=http://127.0.0.1:7890
+Environment=GW2A_API=http://127.0.0.1:8083
+Environment=GW2A_ADMIN_TOKEN=CHANGE_ME_ADMIN_TOKEN
+Environment=GW2A_COOLDOWN_SEC=60
+Environment=GW2A_MAX_REFRESH=3
+Environment=GW2A_BUDGET_SEC=240
+Environment=GW2A_POLL_SEC=5
+Environment=GW2A_STATE_DIR=/var/lib/gw2a-cookie-sync
+ExecStart=/opt/gw2a-cookie-sync/venv/bin/python /opt/gw2a-cookie-sync/refresh.py acct1
+TimeoutStartSec=420
+StandardOutput=append:/var/log/gw2a-cookie-refresh.log
+StandardError=append:/var/log/gw2a-cookie-refresh.log

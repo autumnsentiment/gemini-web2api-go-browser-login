@@ -1,0 +1,13 @@
+[Unit]
+Description=Run gemini-web2api cookie sync watchdog every 5 minutes
+After=gw2a-cookie-watchdog.service
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=gw2a-cookie-watchdog.service
+
+[Install]
+WantedBy=timers.target

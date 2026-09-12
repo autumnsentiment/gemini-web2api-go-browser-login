@@ -1,0 +1,12 @@
+[Unit]
+Description=Run gemini-web2api cookie refresh every 30 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=gw2a-cookie-refresh.service
+
+[Install]
+WantedBy=timers.target

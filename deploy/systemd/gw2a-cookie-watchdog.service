@@ -1,0 +1,14 @@
+[Unit]
+Description=gemini-web2api cookie sync watchdog (keepalive + pool refresh)
+After=network-online.target gw2a-browser-controller.service
+Wants=network-online.target gw2a-browser-controller.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=GW2A_KEEPALIVE_MAX_SEC=900
+Environment=GW2A_SYNC_MAX_SEC=2100
+Environment=GW2A_PROFILE=acct1
+ExecStart=/opt/gw2a-cookie-sync/venv/bin/python /opt/gw2a-cookie-sync/watchdog.py
+StandardOutput=append:/var/log/gw2a-cookie-watchdog.log
+StandardError=append:/var/log/gw2a-cookie-watchdog.log

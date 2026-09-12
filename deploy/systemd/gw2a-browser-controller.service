@@ -1,0 +1,27 @@
+[Unit]
+Description=gemini-web2api browser profile controller (Chromium CDP launcher)
+After=network-online.target gw2a-xkasmvnc.service
+Wants=network-online.target gw2a-xkasmvnc.service
+
+[Service]
+Type=simple
+User=root
+Environment=GW2A_CTRL_PORT=9280
+Environment=GW2A_PROFILE_BASE=/vol2/@appdata/gw2a-browser/profiles
+Environment=GW2A_CDP_BASE=9300
+Environment=GW2A_DISPLAY=:13
+Environment=GW2A_RUN_USER=fygo-browser
+Environment=GW2A_API=http://127.0.0.1:8083
+Environment=GW2A_ADMIN_TOKEN=CHANGE_ME_ADMIN_TOKEN
+Environment=GW2A_EXT_ID=ommhbjlpchdoohbeamepaddkoidokelc
+Environment=GW2A_SYNC_TOKEN=
+Environment=GW2A_BROWSER_PROXY=http://127.0.0.1:7890
+ExecStart=/usr/bin/node /opt/gw2a-browser-controller/controller.js
+Restart=always
+RestartSec=3
+KillMode=process
+StandardOutput=append:/var/log/gw2a-browser-controller.log
+StandardError=append:/var/log/gw2a-browser-controller.log
+
+[Install]
+WantedBy=multi-user.target

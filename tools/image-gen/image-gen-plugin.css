@@ -1,0 +1,64 @@
+#new-api-image-gen-launcher {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2147483000;
+  display: inline-flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 9px;
+  padding: 0 14px;
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.96);
+  color: #111827;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.16);
+  font: 600 14px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: 0;
+  text-decoration: none;
+  backdrop-filter: blur(12px);
+  transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+}
+
+#new-api-image-gen-launcher:hover {
+  background: #ffffff;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.22);
+  transform: translateY(-1px);
+}
+
+#new-api-image-gen-launcher:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 2px;
+}
+
+.image-gen-launcher-icon {
+  width: 18px;
+  height: 18px;
+  border: 2px solid currentColor;
+  border-radius: 4px;
+  background:
+    linear-gradient(135deg, transparent 48%, currentColor 49%, currentColor 55%, transparent 56%),
+    radial-gradient(circle at 70% 30%, currentColor 0 2px, transparent 2.5px);
+}
+
+@media (max-width: 640px) {
+  #new-api-image-gen-launcher {
+    right: 12px;
+    bottom: 12px;
+    min-height: 40px;
+    padding: 0 12px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  #new-api-image-gen-launcher {
+    border-color: rgba(255, 255, 255, 0.2);
+    background: rgba(17, 24, 39, 0.94);
+    color: #f9fafb;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.34);
+  }
+
+  #new-api-image-gen-launcher:hover {
+    background: #111827;
+  }
+}

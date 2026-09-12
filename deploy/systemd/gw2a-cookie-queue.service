@@ -1,0 +1,31 @@
+[Unit]
+Description=gemini-web2api cookie refresh queue (30min timer + 2x502 trigger, serial)
+After=network-online.target gw2a-browser-controller.service docker.service
+Wants=network-online.target gw2a-browser-controller.service
+
+[Service]
+Type=simple
+User=root
+Environment=GW2A_PROFILE=acct1
+Environment=GW2A_BROWSER_PROXY=http://127.0.0.1:7890
+Environment=GW2A_API=http://127.0.0.1:8083
+Environment=GW2A_ADMIN_TOKEN=CHANGE_ME_ADMIN_TOKEN
+Environment=GW2A_COOLDOWN_SEC=60
+Environment=GW2A_MIN_GAP_SEC=30
+Environment=GW2A_MAX_REFRESH=3
+Environment=GW2A_BUDGET_SEC=240
+Environment=GW2A_POLL_SEC=5
+Environment=GW2A_STATE_DIR=/var/lib/gw2a-cookie-sync
+Environment=GW2A_SCHED_SEC=1800
+Environment=GW2A_502_THRESHOLD=2
+Environment=GW2A_502_COOLDOWN_SEC=60
+Environment=GW2A_JOB_TIMEOUT=480
+Environment=GW2A_502_MODE=all
+ExecStart=/opt/gw2a-cookie-sync/venv/bin/python /opt/gw2a-cookie-sync/queue_daemon.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/gw2a-cookie-queue.log
+StandardError=append:/var/log/gw2a-cookie-queue.log
+
+[Install]
+WantedBy=multi-user.target
