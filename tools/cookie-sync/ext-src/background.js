@@ -14,7 +14,7 @@
  *   产生新会话，极易触发风控（会话被踢、出现 sorry 页）。现在改为：
  *     · 复用同一个 Gemini 标签页，用 chrome.tabs.reload() 的方式刷新，
  *       让服务端重新下发轮换 cookie；
- *     · 每次刷新后进入 refreshCooldownSec（默认 60 秒）冷却窗口，
+ *     · 每次刷新后进入 refreshCooldownSec（默认 120 秒）冷却窗口，
  *       窗口内只做 cookie 提取，绝不做任何导航；
  *     · 只有冷却结束、且仍未拿到可用 cookie 时，才允许再刷新一次。
  *
@@ -22,7 +22,7 @@
  *   controller         控制器地址，默认 http://127.0.0.1:9280
  *   profile            本 profile 在池中的标识，默认 browser1
  *   token              控制器共享密钥（可空）
- *   refreshCooldownSec 刷新冷却窗口（秒），默认 60
+ *   refreshCooldownSec 刷新冷却窗口（秒），默认 120
  *   autoKeepalive / keepalivePeriodMin / autoSyncMin / enabled
  */
 
@@ -36,7 +36,7 @@ const DEFAULTS = {
   autoKeepalive: true,
   keepalivePeriodMin: 10,
   autoSyncMin: 30,
-  refreshCooldownSec: 60,
+  refreshCooldownSec: 120,
   lastSyncAt: 0,
   lastSyncOk: false,
   lastSyncDetail: '',
@@ -113,7 +113,7 @@ function sleep(ms) {
 }
 
 function cooldownMs(c) {
-  const s = Number((c && c.refreshCooldownSec) || 0) || 60;
+  const s = Number((c && c.refreshCooldownSec) || 0) || 120;
   return Math.max(10, Math.min(3600, s)) * 1000;
 }
 
@@ -377,7 +377,7 @@ async function collectWithinCooldown(maxMs) {
 }
 
 /**
- * 保活：刷新 gemini 页面（受 60 秒冷却约束），并在页面里探活，
+ * 保活：刷新 gemini 页面（受 120 秒冷却约束），并在页面里探活，
  * 让服务端下发新的 __Secure-1PSIDTS/SIDCC（浏览器会自动写回 cookie store）。
  */
 async function keepalive(manual) {
@@ -385,7 +385,7 @@ async function keepalive(manual) {
   if (!c.enabled && !manual) return { ok: false, detail: '扩展已停用' };
   if (!acquireBusy()) return { ok: false, detail: '上一轮任务仍在进行' };
   try {
-    // 注意：即便手动触发也不绕过 60 秒冷却，否则连续点按会连环刷新页面
+    // 注意：即便手动触发也不绕过 120 秒冷却，否则连续点按会连环刷新页面
     const r = await refreshGeminiTab(false);
     const tab = r.tab || (await findGeminiTab());
     if (!tab) return { ok: false, detail: r.error || '没有可用的 gemini 标签页' };
@@ -473,7 +473,7 @@ async function forceRotateCookies() {
  * 把当前 cookie 推送到控制器（由控制器写入容器内 cookie 池）。
  *
  * 节奏（风控友好）：
- *   1) 距上次刷新 ≥ 60s → 刷新一次页面，然后在 60s 冷却窗口里轮询提取；
+ *   1) 距上次刷新 ≥ 120s → 刷新一次页面，然后在 120s 冷却窗口里轮询提取；
  *   2) 距上次刷新 < 60s → 完全不导航，直接提取当前 cookie；
  *   3) 提取不到登录 cookie 时，直接跳过入池（不反复刷新）。
  */
@@ -496,7 +496,7 @@ async function sync(reason, _internal) {
 
     if (!logged || since >= cd) {
       // 冷却已过（或当前读不到登录 cookie）：允许刷新一次
-      // 一律不 force：手动触发也受 60 秒冷却约束，防止连点造成连环刷新
+      // 一律不 force：手动触发也受 120 秒冷却约束，防止连点造成连环刷新
       const r = await refreshGeminiTab(false);
       refreshed = !!r.refreshed;   // 冷却未过时 r.refreshed=false，只提取不导航
       if (refreshed) {

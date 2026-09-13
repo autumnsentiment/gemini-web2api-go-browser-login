@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -413,11 +414,17 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 
 // markCookieByStatus 按上游返回回写 cookie 健康度。
 //
-// 只把明确的鉴权失败（401/403）算作 cookie 的错。网络错误、代理失败、302 → sorry
-// （IP 被 Google 拦）一律不计——实测住宅代理出口退化率高达 75%，把这些算进
-// fail_count 会让它变成代理噪音，好 cookie 会被误伤成"失败最多"。
+// 只把明确的鉴权失败（401/403）算作 cookie 的错并累加 fail_count。网络错误、
+// 代理失败、302 → sorry（IP 被 Google 拦）一律不计——实测住宅代理出口退化率
+// 高达 75%，把这些算进 fail_count 会让它变成代理噪音，好 cookie 会被误伤成
+// "失败最多"。
 //
 // statusCode 为 0 表示压根没拿到响应（网络层失败）。
+//
+// 但「不计入 fail_count」≠「什么都不写」：旧版 default 分支是彻底沉默，会话票
+// 过期（no SNlM0e）、上游 5xx、出口被拦时面板上的账号看着毫发无损，而实际每个
+// 请求都在失败 —— 排查时完全看不到线索。所以这里把 last_error 记下来（只描述
+// 现象，不动 fail_count / status），成功时 markAccountResult 会把它清掉。
 func markCookieByStatus(id int64, statusCode int, errStr string) {
 	switch {
 	case statusCode == 200:
@@ -425,7 +432,10 @@ func markCookieByStatus(id int64, statusCode int, errStr string) {
 	case statusCode == 401 || statusCode == 403:
 		markAccountResult(id, false, errStr)
 	default:
-		// 其余情况责任不在 cookie，不动它的健康度
+		if id > 0 && errStr != "" {
+			_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`,
+				truncate(errStr, 200), id)
+		}
 	}
 }
 
@@ -513,6 +523,7 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了
 	invalidateXSRF(a.Cookie)
 	_, err = getXSRF(a.Cookie, proxyURL)
+	needRelogin := false
 	// ★ 续票复检（2026-09-12 实测的真根因）★
 	//   __Secure-1PSIDTS 是有寿命的票（实测约 10~20 分钟）。票一旧，带着它打
 	//   /app 就只会拿到「匿名单页」（200 但没有 SNlM0e），看起来跟 cookie 真失效
@@ -540,7 +551,8 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 		// 实测这条路径可用（[browser] profile "acct1" cookie 已刷新）。
 		if a.Source == "browser" && a.Profile != "" {
 			logf("[browser] 账号 #%d 会话票已过期，尝试用浏览器刷新自愈", a.ID)
-			if ok2, _, berr := browserRefreshOne(a.Label, a.Profile); ok2 && berr == nil {
+			ok2, _, berr := browserRefreshOne(a.Label, a.Profile)
+			if ok2 && berr == nil {
 				if fresh := accountByID(a.ID); fresh != nil && fresh.Cookie != "" {
 					a.Cookie = fresh.Cookie
 					invalidateXSRF(fresh.Cookie)
@@ -553,6 +565,11 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 				}
 			} else if berr != nil {
 				logf("[browser] 账号 #%d 浏览器刷新未成功（忽略，不改健康度）：%v", a.ID, berr)
+				// 浏览器里 Google 正在要求重新验证密码：这不是续票能解决的了，
+				// 提示语别再说「续票后即可恢复」，把真正的恢复路径告诉运维。
+				if errors.Is(berr, errBrowserNeedRelogin) {
+					needRelogin = true
+				}
 			}
 		}
 	}
@@ -570,6 +587,12 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 			markAccountResult(a.ID, false, err.Error())
 		} else {
 			_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`, err.Error(), a.ID)
+		}
+		if needRelogin {
+			return CookieCheck{
+				Detail:    "浏览器里的 Google 会话被要求重新验证（密码/安全确认），续票救不回来；请到 Chromium VNC 桌面重新登录该账号，登录完成后点「检测」应即恢复",
+				ProxyName: name, TookMs: took,
+			}
 		}
 		return CookieCheck{Detail: explainCookieFailure(err), ProxyName: name, TookMs: took}
 	}

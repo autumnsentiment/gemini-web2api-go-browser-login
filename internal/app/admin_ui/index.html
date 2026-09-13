@@ -698,7 +698,7 @@ const pages = {
   },
 
   // 浏览器登录：用 Chromium(VNC) 容器里独立 profile 登录 Google/Gemini，
-  // 登录态自动抓成 cookie 写入 cookie 池，每 10 分钟自动刷新。
+  // 登录态自动抓成 cookie 写入 cookie 池，按「cookie 有效期 - 5 分钟」自动刷新（最长间隔 1 小时）。
   browser: async () => {
     const st = await api('api/browser/status');
     if (!st.enabled) {
@@ -711,7 +711,7 @@ const pages = {
             容器的 profile 控制器。配置后重启容器即可。<br><br>
             <span class="muted">启用后：在这里添加「账号 profile」→ 容器会拉起一个
             独立 Chromium 窗口并跳到 Gemini 登录页 → 点「在我的浏览器打开」在你自己浏览器里
-            完成 Google 登录 → 点「抓取」→ 登录态自动进 Cookie 池，每 10 分钟自动保活刷新。</span>
+            完成 Google 登录 → 点「抓取」→ 登录态自动进 Cookie 池，按「有效期 - 5 分钟」自动保活刷新。</span>
           </div>
         </div>`;
     }
@@ -754,7 +754,7 @@ const pages = {
           </span>
         </h2>
         <details class="note">
-          <summary>用法：容器发起登录 → 授权页显示在你自己浏览器 → 自动进 Cookie 池 → 10 分钟自动保活</summary>
+          <summary>用法：容器发起登录 → 授权页显示在你自己浏览器 → 自动进 Cookie 池 → 按有效期自动保活</summary>
           <div class="body">
             每个「账号」= chromium 容器里一个<b>独立的 Chromium 窗口 + 独立登录态</b>（互相隔离）。
             登录由容器发起（拉起窗口并导航到 Gemini），但授权页显示在<b>你自己电脑的浏览器</b>里 ——
@@ -764,7 +764,7 @@ const pages = {
             <br>② 点该行「在我的浏览器打开授权页」（首次会提示输入 VNC 账号
             <code>user</code> / 密码），在桌面里点开该账号的 Chromium 窗口完成 Google 登录；
             <br>③ 回到本页点「抓取 cookie」→ 登录态解析成 cookie 写进上方 Cookie 池；
-            <br>④ 之后每 10 分钟自动抓一次保持新鲜；登录态失效会自动删除。
+            <br>④ 之后按「cookie 有效期 - 5 分钟」自动抓一次保持新鲜（最长间隔 1 小时）；同一 profile 两次抓取至少隔 2 分钟。
             <br><br><span class="muted">桌面网页地址（上方输入框）默认取自启动参数
             <code>BROWSER_ACCESS_URL</code>；改完后点「保存」仅存在本浏览器，方便你在
             <code>5666/chromium</code> 这类入口之间切换。</span>
@@ -1409,7 +1409,7 @@ async function checkCookieAcct(id, btn) {
   }
 }
 
-// 手动触发一次会话保活。后台每 10 分钟自动跑一次，这个按钮用来当场验证。
+// 手动触发一次会话保活。后台按「有效期 - 5 分钟」自动跑，这个按钮用来当场验证。
 async function rotateCookieAcct(id, btn) {
   const old = btn.textContent;
   btn.textContent = '…'; btn.disabled = true;

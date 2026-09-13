@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -59,6 +60,97 @@ var errBrowserPageUnreachable = errors.New("浏览器页面打不开（网络/�
 // errBrowserNotLoggedIn：页面正常打开，但确实没有登录态。
 var errBrowserNotLoggedIn = errors.New("profile 未登录 gemini（页面里没有 SNlM0e）")
 
+// errBrowserNeedRelogin：Google 在浏览器里弹出了重新验证（密码 challenge /
+// 两步验证 / 异常活动确认）。这跟「未登录」是两码事：会话被服务端挂起，等用户
+// 在 VNC 桌面里重新输一次密码就能恢复。2026-09-13 实测：账号被 Google 风控
+// 强制重验后，页面停在 accounts.google.com/v3/signin/challenge/pwd，此时 CDP
+// 抓到的 cookie 看着齐全（SAPISID / 1PSID 都在）但全是死的 —— 绝不能拿这种
+// cookie 入库，也不能按「登录态失效」把账号删了。
+var errBrowserNeedRelogin = errors.New("浏览器需要重新登录（Google 要求重新验证密码，请在 VNC 桌面完成）")
+
+// errBrowserRefreshCooldown：同一个 profile 两次「导航刷新 + 抓取」之间隔得太近。
+// 上层（自动刷新 / 检测自愈 / 手动抓取按钮）都会走到 browserRefreshOne，不加闸门
+// 的话一次会话过期就能在几分钟内触发好几次页面刷新 —— 节点加载本来就慢，多处
+// 刷新叠在一起正是触发 Google 风控的节奏。冷却内的调用一律拒绝，不做导航。
+var errBrowserRefreshCooldown = errors.New("浏览器刷新冷却中")
+
+// ── 抓取节奏（反风控核心参数）────────────────────────────────────────────────
+const (
+	// browserRefreshCooldownSec 是同一 profile 两次抓取尝试的最小间隔（含失败的
+	// 尝试：失败往往说明页面/风控正处在敏感状态，更不该接着刷）。2026-09-13
+	// 由 60s 提到 120s，与扩展 / refresh.py 的冷却窗口同步。
+	browserRefreshCooldownSec = 120
+
+	// browserRefreshSafetySec 抓取计划 = cookie 有效期 - 该安全余量。
+	browserRefreshSafetySec = 300
+
+	// browserRefreshMaxGapSec 是两次抓取的最大间隔。CDP 读到的 jar 有效期普遍
+	// 是一年上下（那不是 1PSIDTS 票据的真实寿命），不设上限的话「有效期-5分钟」
+	// 会排到一年以后。票据的日常续新由 POST /RotateCookies（rotate.go）在进程内
+	// 完成，不经过浏览器，所以浏览器抓取最长一小时一次足够兜底。
+	browserRefreshMaxGapSec = 3600
+)
+
+// kvKeyBrowserNextRefresh 按 profile 记下次该抓取的时刻（unix 秒）。
+// 放 kv 而不是内存：重启后调度不丢节奏。
+func kvKeyBrowserNextRefresh(profile string) string {
+	return "browser_next_refresh:" + profile
+}
+
+// browserNextRefreshAt 取某 profile 计划的下一次抓取时刻，没记录返回 0。
+func browserNextRefreshAt(profile string) int64 {
+	v := kvGet(kvKeyBrowserNextRefresh(profile))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// browserScheduleNextRefresh 抓取成功后按「关键 cookie 有效期 - 5 分钟」排下一次。
+//
+// 有效期取本轮抓到的轮换 cookie（*PSIDTS / SIDCC / *PSIDCC）里最早到期的那个；
+// 读不到有效期就退回 browserRefreshMinutes 的兜底间隔。结果钳制在
+// [冷却间隔, 最大间隔] 区间内：再急也不得小于冷却（反风控），再富余也不超过
+// 一小时（jar 有效期不等于票据寿命，不能真按一年排）。
+func browserScheduleNextRefresh(profile string, minExpiryUnix int64) {
+	now := time.Now().Unix()
+	candidate := now + int64(browserRefreshMinutes())*60
+	if minExpiryUnix > 0 {
+		candidate = minExpiryUnix - browserRefreshSafetySec
+	}
+	if lo := now + browserRefreshCooldownSec; candidate < lo {
+		candidate = lo
+	}
+	if hi := now + browserRefreshMaxGapSec; candidate > hi {
+		candidate = hi
+	}
+	_ = kvSet(kvKeyBrowserNextRefresh(profile), strconv.FormatInt(candidate, 10))
+}
+
+// browserRefreshGate 抓取入口的冷却闸门。返回 (是否放行, 剩余秒数)。
+// 同一 profile 并发调用也安全（锁内读改写）。
+func browserRefreshGate(profile string) (bool, int64) {
+	browserRefreshMu.Lock()
+	defer browserRefreshMu.Unlock()
+	now := time.Now().Unix()
+	if last, ok := browserLastRefreshAt[profile]; ok {
+		if remain := int64(browserRefreshCooldownSec) - (now - last); remain > 0 {
+			return false, remain
+		}
+	}
+	browserLastRefreshAt[profile] = now
+	return true, 0
+}
+
+var (
+	browserRefreshMu     sync.Mutex
+	browserLastRefreshAt = map[string]int64{} // profile -> 上次抓取尝试（含失败）的时刻
+)
+
 func browserEnabled() bool {
 	return strings.TrimSpace(cfg.BrowserControllerURL) != ""
 }
@@ -71,7 +163,11 @@ func browserControllerURL() string {
 // ── 轻量 HTTP 帮助 ──────────────────────────────────────────────────────────
 
 func browserHTTP(method, url string, body []byte, out interface{}) (int, error) {
-	client := &http.Client{Timeout: 20 * time.Second}
+	// 45s 而不是 20s：POST /profiles 在控制器里要 chown -R 整个 profile 目录、
+	// 再拉起 Chromium，profile 一大就是十几秒；20s 时实测反复撞
+	// "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"，
+	// 表面上是「控制器不可用」，其实控制器正在干活。
+	client := &http.Client{Timeout: 45 * time.Second}
 	var rd *strings.Reader
 	if body != nil {
 		rd = strings.NewReader(string(body))
@@ -281,7 +377,9 @@ func cdpRewriteWS(raw string, port int) string {
 	return raw
 }
 
-// cdpListPages 取 CDP 端口上的 page 目标，返回第一个 page 的（隧道）ws url。
+// cdpListPages 取 CDP 端口上的 page 目标，返回最合适的（隧道）ws url。
+// 优先选已停在 gemini.google.com 的 tab：多 tab 时第一个目标可能是 about:blank
+// 或设置页，在错误的 tab 上 evaluate 登录态判断恒为「未登录」。
 func cdpListPages(hostPort string) (string, error) {
 	port, err := cdpPortOfHostPort(hostPort)
 	if err != nil {
@@ -294,47 +392,83 @@ func cdpListPages(hostPort string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// 控制器隧道在 profile 重启换端口后回 404 JSON 对象（{"error":...}），不是数组。
+	// 直接 Unmarshal 到切片会报 "cannot unmarshal object into Go value of type []...",
+	// 完全看不出是端口过期，这里先把这种情形翻成人话。
 	var list []struct {
 		Type string `json:"type"`
 		URL  string `json:"url"`
 		WS   string `json:"webSocketDebuggerUrl"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return "", err
+	if err := json.Unmarshal(body, &list); err != nil {
+		return "", fmt.Errorf("CDP /json/list 响应异常（HTTP %d）: %s",
+			resp.StatusCode, truncate(strings.TrimSpace(string(body)), 160))
 	}
+	var fallback string
 	for _, t := range list {
-		if t.Type == "page" && t.WS != "" {
-			return cdpRewriteWS(t.WS, port), nil
+		if t.Type != "page" || t.WS == "" {
+			continue
 		}
+		ws := cdpRewriteWS(t.WS, port)
+		if strings.Contains(t.URL, "gemini.google.com") {
+			return ws, nil
+		}
+		if fallback == "" {
+			fallback = ws
+		}
+	}
+	if fallback != "" {
+		return fallback, nil
 	}
 	return "", fmt.Errorf("CDP 端口上没有 page 目标")
 }
 
 // cdpOpenTab 开一个新 tab 并导航，返回该 page 的（隧道）ws url。
 // 用 HTTP /json/new?url 接口（PUT）。
+//
+// Chromium 正在退出/重启时 /json/new 可能返回 200 + 一个错误 JSON（或整个非
+// JSON 体），旧代码只报「新建 tab 未返回 ws url」，完全看不出原因；而且没有任何
+// 重试 —— 但恰好此时另一个调用已经在拉起实例，1 秒后再试基本就好。所以这里
+// 读出响应体、失败带原因，并重试一次，仍失败再退回 /json/list 碰运气。
 func cdpOpenTab(hostPort, url string) (string, error) {
 	port, err := cdpPortOfHostPort(hostPort)
 	if err != nil {
 		return "", err
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
-	newURL := cdpTunnelBase(port) + "/json/new?" + urlQueryEscape(url)
-	req, _ := http.NewRequest(http.MethodPut, newURL, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+	var lastBody string
+	for retry := 0; retry < 2; retry++ {
+		if retry > 0 {
+			time.Sleep(time.Second)
+		}
+		newURL := cdpTunnelBase(port) + "/json/new?" + urlQueryEscape(url)
+		req, _ := http.NewRequest(http.MethodPut, newURL, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastBody = err.Error()
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var out struct {
+			WS string `json:"webSocketDebuggerUrl"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			lastBody = truncate(strings.TrimSpace(string(body)), 160)
+			continue
+		}
+		if out.WS == "" {
+			lastBody = truncate(strings.TrimSpace(string(body)), 160)
+			continue
+		}
+		return cdpRewriteWS(out.WS, port), nil
 	}
-	defer resp.Body.Close()
-	var out struct {
-		WS string `json:"webSocketDebuggerUrl"`
+	// 兜底：也许 tab 其实开出来了，只是 /json/new 的响应体没按规矩来
+	if ws, err := cdpListPages(hostPort); err == nil {
+		return ws, nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	if out.WS == "" {
-		return "", fmt.Errorf("新建 tab 未返回 ws url")
-	}
-	return cdpRewriteWS(out.WS, port), nil
+	return "", fmt.Errorf("新建 tab 失败: %s", lastBody)
 }
 
 func urlQueryEscape(s string) string {
@@ -367,16 +501,34 @@ func cdpNavigate(hostPort, url string) error {
 	return nil
 }
 
+// cdpCookieCapture 是一次 CDP 抓取的产出：cookie 串 + 关键轮换 cookie 的最早有效期。
+type cdpCookieCapture struct {
+	Cookie string
+	// MinExpiryUnix 是 *PSIDTS / SIDCC / *PSIDCC 这些「负责维持会话新鲜」的
+	// cookie 里最早到期的时刻（unix 秒）；0 = 没读到有效期。它是「按有效期-5
+	// 分钟排下一次抓取」的依据。注意 jar 有效期普遍长达一年，别当成 1PSIDTS
+	// 票据的服务端寿命 —— 票据续新靠 POST /RotateCookies，不靠这里。
+	MinExpiryUnix int64
+}
+
 // cdpGetCookies 通过 CDP 抓取 host 相关域的 cookie，拼成 "k=v; k=v" header 串。
 // 只保留登录态需要的域：gemini.google.com 及 .google.com 的会话 cookie。
 func cdpGetCookies(hostPort string) (string, error) {
-	ws, err := cdpListPages(hostPort)
+	cap, err := cdpCaptureCookies(hostPort)
 	if err != nil {
 		return "", err
 	}
+	return cap.Cookie, nil
+}
+
+func cdpCaptureCookies(hostPort string) (cdpCookieCapture, error) {
+	ws, err := cdpListPages(hostPort)
+	if err != nil {
+		return cdpCookieCapture{}, err
+	}
 	pg, err := cdpDial(ws, 15*time.Second)
 	if err != nil {
-		return "", err
+		return cdpCookieCapture{}, err
 	}
 	defer pg.Close()
 
@@ -384,18 +536,19 @@ func cdpGetCookies(hostPort string) (string, error) {
 	_, _ = pg.call("Network.enable", map[string]interface{}{})
 	res, err := pg.call("Network.getAllCookies", map[string]interface{}{})
 	if err != nil {
-		return "", err
+		return cdpCookieCapture{}, err
 	}
 	var data struct {
 		Cookies []struct {
-			Name   string `json:"name"`
-			Value  string `json:"value"`
-			Domain string `json:"domain"`
-			Path   string `json:"path"`
+			Name    string  `json:"name"`
+			Value   string  `json:"value"`
+			Domain  string  `json:"domain"`
+			Path    string  `json:"path"`
+			Expires float64 `json:"expires"`
 		} `json:"cookies"`
 	}
 	if err := json.Unmarshal(res, &data); err != nil {
-		return "", err
+		return cdpCookieCapture{}, err
 	}
 	// 同一名字可能出现在多个域（例如 SAPISID 同时挂在 .google.com 与
 	// gemini.google.com）。浏览器发给 gemini.google.com 的 Cookie 头每个名字
@@ -404,6 +557,7 @@ func cdpGetCookies(hostPort string) (string, error) {
 	type ckItem struct {
 		name, val, domain string
 		width             int
+		expiry            float64
 	}
 	var items []ckItem
 	for _, ck := range data.Cookies {
@@ -426,7 +580,7 @@ func cdpGetCookies(hostPort string) (string, error) {
 		default:
 			width = 0
 		}
-		items = append(items, ckItem{name: ck.Name, val: ck.Value, domain: d, width: width})
+		items = append(items, ckItem{name: ck.Name, val: ck.Value, domain: d, width: width, expiry: ck.Expires})
 	}
 	best := map[string]ckItem{}
 	for _, it := range items {
@@ -436,14 +590,25 @@ func cdpGetCookies(hostPort string) (string, error) {
 		}
 	}
 	var parts []string
-	for _, it := range best {
-		parts = append(parts, it.name+"="+it.val)
+	minExpiry := float64(0)
+	nowSec := float64(time.Now().Unix())
+	for name, it := range best {
+		parts = append(parts, name+"="+it.val)
+		// 只关心「会话保鲜组」的到期时刻：这些是每次访问都会被服务端轮换的
+		// 短周期 cookie，它们最早的那个到期时间决定了什么时候该再刷一次页面。
+		switch name {
+		case "__Secure-1PSIDTS", "__Secure-3PSIDTS", "SIDCC",
+			"__Secure-1PSIDCC", "__Secure-3PSIDCC":
+			if it.expiry > nowSec+60 && (minExpiry == 0 || it.expiry < minExpiry) {
+				minExpiry = it.expiry
+			}
+		}
 	}
 	if len(parts) == 0 {
-		return "", fmt.Errorf("CDP 未返回任何 google cookie")
+		return cdpCookieCapture{}, fmt.Errorf("CDP 未返回任何 google cookie")
 	}
 	// 按模板固定顺序排关键项，其余按名字排序，保证串稳定
-	return orderCookieString(parts), nil
+	return cdpCookieCapture{Cookie: orderCookieString(parts), MinExpiryUnix: int64(minExpiry)}, nil
 }
 
 // cdpEval 在页面里执行 JS，返回字符串结果（用于判登录态 / SNlM0e）。
@@ -519,16 +684,79 @@ func sortStrings(s []string) {
 
 // ── 高层：抓取并入库 ────────────────────────────────────────────────────────
 
-// browserRefreshOne 对一个 browser 来源的账号做一次抓取：
-//  1. 控制器确保 profile 实例在跑
-//  2. CDP 导航 gemini.google.com
-//  3. 判登录态（SNlM0e）
-//  4. 抓 cookie 拼串 → 更新池记录（或新增）
+// pageStateJS 在页面里取登录态判断需要的全部信息：
 //
-// 返回 (是否成功, 描述)。
+//	err    —— chrome 错误页（断网 / 代理挂 / DNS 失败）
+//	signin —— Google 把页面顶到了重新验证 / 登录流程（challenge 页）。此时就算
+//	          cookie 看着齐全也是死的，绝不能抓回去入库。
+//	token  —— 页面里有**非空**的 SNlM0e。注意必须是「值非空」：新版前端在匿名 /
+//	          challenge 页也会带上 `"SNlM0e":""` 这个**空**键，老代码只查
+//	          indexOf('SNlM0e') 会被它骗过去，反过来偶尔又因为 DOM 尚未水合漏报。
+const pageStateJS = `(function(){
+	var u = String(location.href || '');
+	var h = document.documentElement ? document.documentElement.outerHTML : '';
+	var w = '';
+	try { w = String((typeof WIZ_global_data !== 'undefined' && WIZ_global_data && WIZ_global_data.SNlM0e) || ''); } catch (e) {}
+	return JSON.stringify({
+		err: u.indexOf('chrome-error://') === 0 || h.indexOf('ERR_CONNECTION') !== -1 || h.indexOf('ERR_PROXY') !== -1 || h.indexOf('ERR_NAME_NOT_RESOLVED') !== -1 || h.indexOf('ERR_TUNNEL_CONNECTION_FAILED') !== -1 || h.indexOf('ERR_TIMED_OUT') !== -1 || h.indexOf('This site can') !== -1,
+		signin: u.indexOf('accounts.google.com') !== -1 && (u.indexOf('/signin') !== -1 || u.indexOf('ServiceLogin') !== -1 || u.indexOf('/challenge/') !== -1 || u.indexOf('/v3/signin') !== -1),
+		token: (/"SNlM0e":"[^"]{10,}"/).test(h) || w.length >= 10
+	});
+})()`
+
+// verifyByInPageFetch 兜底验证：直接在页面里 fetch('/app')（带浏览器自己的
+// cookie 和出口），看响应 HTML 里有没有非空 SNlM0e。
+//
+// 为什么要这一步：SPA 渲染慢时 DOM 里可能还没有 token，而旧的兜底是「cookie 里
+// 有 SAPISID + __Secure-1PSID 就当已登录」——这正是僵尸 cookie 的来源：Google
+// 强制重验 / 登出的页面上那两项照样在，照单全收就把死 cookie 写进了池子，还覆盖掉
+// 上一份好 cookie。改成页面内 fetch 验证后，只有**服务端真的认这份会话**才入库。
+func verifyByInPageFetch(hostPort string) bool {
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		out, err := cdpEval(hostPort, `(async function(){
+			try {
+				var r = await fetch('/app', {credentials:'include', redirect:'follow'});
+				var t = await r.text();
+				return JSON.stringify({status: r.status, token: (/"SNlM0e":"[^"]{10,}"/).test(t)});
+			} catch (e) {
+				return JSON.stringify({status: 0, token: false, error: String(e)});
+			}
+		})()`)
+		if err != nil {
+			continue
+		}
+		s := strings.TrimSpace(out)
+		s = strings.Trim(s, `"`)
+		s = strings.ReplaceAll(s, `\"`, `"`)
+		if strings.Contains(s, `"token":true`) {
+			return true
+		}
+	}
+	return false
+}
+
+// browserRefreshOne 对一个 browser 来源的账号做一次抓取：
+//
+//  1. 冷却闸门：距上次抓取尝试（含失败）不足 browserRefreshCooldownSec 直接拒绝，
+//     不导航 —— 自动刷新、检测自愈、手动按钮都可能同时想到达这里，多处刷新叠加
+//     正是触发 Google 风控的节奏
+//  2. 控制器确保 profile 实例在跑
+//  3. **先刷新**：CDP 导航 gemini.google.com（这一步就是「刷新」），再判登录态
+//  4. 只有登录态**验证通过**才抓 cookie 拼串入库（新增或更新）
+//  5. 抓完不再做任何刷新动作，按「关键 cookie 有效期 - 5 分钟」把下一次抓取
+//     写进 kv 排程，到点前 browserAutoRefresh 一律跳过
+//
+// 返回 (是否成功, 描述, 错误)。
 func browserRefreshOne(label, profile string) (bool, string, error) {
 	if !browserEnabled() {
 		return false, "", fmt.Errorf("浏览器登录未启用")
+	}
+	if ok, remain := browserRefreshGate(profile); !ok {
+		return false, "", fmt.Errorf("%w：profile %q 距上次抓取尝试不足 %d 秒，剩余约 %d 秒",
+			errBrowserRefreshCooldown, profile, browserRefreshCooldownSec, remain)
 	}
 	port, err := ensureBrowserProfile(profile)
 	if err != nil {
@@ -540,22 +768,16 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 	if err := cdpNavigate(hostPort, "https://gemini.google.com/"); err != nil {
 		return false, "", err
 	}
-	// 判登录态。必须把「网络不通/页面没加载出来」和「确实没登录」分开：
-	// 断网时页面是 chrome-error://chromewebdata/，HTML 里当然没有 SNlM0e，
-	// 若据此报「未登录」，上层 browserAutoRefresh 会把账号删掉，
-	// 表现为「浏览器登录缓存每次被清除」。所以先认错误页，再谈登录态。
+	// 必须把三种状态分开，它们的处置完全不同：
+	//   错误页（断网/代理挂）        -> 保留现状只记日志
+	//   Google 重新验证页           -> 保留账号、提示用户去 VNC 重新登录，绝不入库
+	//   匿名 / SPA 未渲染完          -> 页面内 fetch 兜底，仍不行才算未登录
 	loggedIn := false
 	sawErrorPage := false
+	sawSignin := false
 	evalFails := 0
 	for i := 0; i < 12; i++ {
-		has, err := cdpEval(hostPort, `(function(){
-			var u = String(location.href || '');
-			var h = document.documentElement ? document.documentElement.outerHTML : '';
-			return JSON.stringify({
-				err: u.indexOf('chrome-error://') === 0 || h.indexOf('ERR_CONNECTION') !== -1 || h.indexOf('ERR_PROXY') !== -1 || h.indexOf('ERR_NAME_NOT_RESOLVED') !== -1 || h.indexOf('ERR_TUNNEL_CONNECTION_FAILED') !== -1 || h.indexOf('ERR_TIMED_OUT') !== -1 || h.indexOf('This site can') !== -1,
-				token: h.indexOf('SNlM0e') !== -1
-			});
-		})()`)
+		has, err := cdpEval(hostPort, pageStateJS)
 		if err != nil {
 			evalFails++
 		} else {
@@ -564,6 +786,10 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 			s = strings.ReplaceAll(s, `\"`, `"`)
 			if strings.Contains(s, `"err":true`) {
 				sawErrorPage = true
+				break
+			}
+			if strings.Contains(s, `"signin":true`) {
+				sawSignin = true
 				break
 			}
 			if strings.Contains(s, `"token":true`) {
@@ -576,10 +802,14 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 	if sawErrorPage {
 		return false, "", errBrowserPageUnreachable
 	}
+	if sawSignin {
+		return false, "", errBrowserNeedRelogin
+	}
 	if !loggedIn {
-		// 页面能读但没有 SNlM0e：再看 cookie 是否仍带完整登录态。
-		// SPA 有时还没渲染完，cookie 其实已经是好的。
-		if ck, cerr := cdpGetCookies(hostPort); cerr == nil && extractSAPISID(ck) != "" && strings.Contains(ck, "__Secure-1PSID=") {
+		// 页面能读但没有非空 SNlM0e：SPA 有时还没渲染完，用页面内 fetch('/app')
+		// 再验证一次。验证不通过就老实报未登录 —— 宁可漏抓一次，也不把 Google
+		// 重验页上的死 cookie 当成登录态写进池子（2026-09-13 实测踩过）。
+		if verifyByInPageFetch(hostPort) {
 			loggedIn = true
 		}
 	}
@@ -591,18 +821,25 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 		return false, "未登录", errBrowserNotLoggedIn
 	}
 
-	cookie, err := cdpGetCookies(hostPort)
+	cap, err := cdpCaptureCookies(hostPort)
 	if err != nil {
 		return false, "", err
 	}
+	cookie := cap.Cookie
 	if extractSAPISID(cookie) == "" {
 		return false, "抓到 cookie 但缺 SAPISID", fmt.Errorf("抓到的 cookie 缺 SAPISID")
+	}
+	if !strings.Contains(cookie, "__Secure-1PSID=") {
+		return false, "抓到 cookie 但缺 __Secure-1PSID", fmt.Errorf("抓到的 cookie 缺 __Secure-1PSID")
 	}
 
 	// 入库：找到同 profile 的 browser 来源行就更新，否则新建
 	if err := browserStoreCookie(label, profile, cookie); err != nil {
 		return false, "", err
 	}
+	// 抓完即收工：把下一次抓取按「有效期 - 5 分钟」排进 kv，
+	// 在那之前不再碰浏览器（冷却 + 排程双闸门，见文件头节奏参数）。
+	browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
 	return true, "已抓取并入库", nil
 }
 
@@ -691,7 +928,13 @@ func browserAccounts() []BrowserAccount {
 }
 
 // browserAutoRefresh 后台定时任务：对每个 browser 来源的账号做保活/刷新。
-// 抓不到登录态就自动删除（用户要求：过期会话 cookie 自动删除）。
+//
+// 节奏由两层闸门控制（反风控）：
+//   - kv 里按 profile 排程的 next_refresh（抓取成功时按「有效期 - 5 分钟」写入），
+//     没到点直接跳过，不碰浏览器；
+//   - browserRefreshOne 入口的冷却闸门，兜住「排程之外被别的路径拉起来」的情形。
+//
+// 登录态真没了（且不是 Google 重验挂起）才自动删除。
 func browserAutoRefresh() {
 	if !browserEnabled() {
 		return
@@ -705,39 +948,66 @@ func browserAutoRefresh() {
 		logf("[browser] 控制器不可用，跳过自动刷新: %s", errStr)
 		return
 	}
+	now := time.Now().Unix()
+	// 失败后把排程往后推：抓取失败往往说明页面/风控正处在敏感状态，
+	// 每分钟重试一遍只会火上浇油。重验挂起（needRelogin）更要等用户先去
+	// VNC 里重新登录，推 10 分钟。
+	deferNext := func(profile string, sec int64) {
+		_ = kvSet(kvKeyBrowserNextRefresh(profile),
+			strconv.FormatInt(time.Now().Unix()+sec, 10))
+	}
 	for _, a := range accts {
 		if a.Status != "enabled" {
+			continue
+		}
+		if next := browserNextRefreshAt(a.Profile); next > now {
+			// 还没到「有效期 - 5 分钟」的排程点，不打扰浏览器
 			continue
 		}
 		_, _, err := browserRefreshOne(a.Label, a.Profile)
 		if err != nil {
 			// 页面不可达（断网/代理挂/CDP 异常）：只记日志，**不累加 fail_count、不删号**。
 			// 一断网就把好号清空，是「登录缓存每次被清除」的根源。
-			if errors.Is(err, errBrowserPageUnreachable) {
-				logf("[browser] 账号 #%d (profile %q) 页面不可达，保留账号等待恢复: %v", a.ID, a.Profile, err)
+			if errors.Is(err, errBrowserPageUnreachable) || errors.Is(err, errBrowserRefreshCooldown) {
+				if !errors.Is(err, errBrowserRefreshCooldown) {
+					logf("[browser] 账号 #%d (profile %q) 页面不可达，保留账号等待恢复: %v", a.ID, a.Profile, err)
+				}
+				deferNext(a.Profile, browserRefreshCooldownSec)
+				continue
+			}
+			// Google 在浏览器里弹重新验证（密码 challenge / 异常确认）：这**不是**
+			// 登录态自然过期，是风控挂起，用户在 VNC 桌面重新输一次密码就恢复。
+			// 此时不抓（挑战页上的 cookie 是死的）、不删号，把原因写到面板上。
+			// 2026-09-13 实测：删了的话用户重新登录后还得手动重建账号。
+			if errors.Is(err, errBrowserNeedRelogin) {
+				logf("[browser] 账号 #%d (profile %q) 需要重新登录（Google 要求重新验证），已保留，请在 VNC 桌面完成", a.ID, a.Profile)
+				_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`,
+					"浏览器需要重新登录（Google 要求重新验证密码），请在 VNC 桌面完成", a.ID)
+				deferNext(a.Profile, 600)
 				continue
 			}
 			// 只有确认「未登录/缺 SAPISID」才动账号。
-			if errors.Is(err, errBrowserNotLoggedIn) || strings.Contains(err.Error(), "缺 SAPISID") {
+			if errors.Is(err, errBrowserNotLoggedIn) || strings.Contains(err.Error(), "缺 SAPISID") || strings.Contains(err.Error(), "缺 __Secure-1PSID") {
 				logf("[browser] 账号 #%d (profile %q) 登录态已失效，自动删除", a.ID, a.Profile)
 				_ = accountDelete(a.ID)
 				continue
 			}
 			logf("[browser] 账号 #%d (profile %q) 自动刷新失败: %v", a.ID, a.Profile, err)
+			deferNext(a.Profile, browserRefreshCooldownSec)
 			continue
 		}
 		markAccountResult(a.ID, true, "")
 	}
 }
 
-// startBrowserAutoRefresh 在 scheduler 里挂一个每 10 分钟跑一次的定时器。
+// startBrowserAutoRefresh 挂一个每分钟跑一次的轻量循环。
+//
+// 真正的抓取节奏不在 ticker 周期里，而在 kv 的 next_refresh 排程
+// （按「cookie 有效期 - 5 分钟」动态计算，见 browserScheduleNextRefresh）：
+// ticker 只负责每分钟醒来看一眼到没到点。排程没到就跳过，什么都不做。
 func startBrowserAutoRefresh() {
 	go func() {
-		interval := time.Duration(browserRefreshMinutes()) * time.Minute
-		if interval <= 0 {
-			interval = 10 * time.Minute
-		}
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			browserAutoRefresh()
@@ -745,7 +1015,10 @@ func startBrowserAutoRefresh() {
 	}()
 }
 
-// browserRefreshMinutes 返回自动刷新间隔（分钟）。
+// browserRefreshMinutes 返回抓取的兜底间隔（分钟）。
+//
+// 只在「本轮抓到的 cookie 读不到有效期」时用于排下一次；读得到有效期时排程
+// 一律按「有效期 - 5 分钟」（钳制到 [冷却, 1 小时]）。面板运行时配置优先。
 func browserRefreshMinutes() int {
 	// 面板运行时配置优先
 	m := rtCfg().BrowserRefreshMinutes

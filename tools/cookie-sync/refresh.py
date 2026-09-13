@@ -10,8 +10,8 @@
        ② 被风控重定向后的 google.com/sorry 页面（它就是这个账号的 Gemini 页，
        旧逻辑认不出来才会去新建）；③ 浏览器启动时的 about:blank 等任意页面。
        只有在完全没有页面时才创建 1 个 target。
-    2. 刷新（Page.reload / Page.navigate）后进入 60 秒冷却窗口
-       （GW2A_COOLDOWN_SEC，默认 60），窗口内每 5 秒提取一次 cookie，绝不重复导航。
+    2. 刷新（Page.reload / Page.navigate）后进入 120 秒冷却窗口
+       （GW2A_COOLDOWN_SEC，默认 120），窗口内每 5 秒提取一次 cookie，绝不重复导航。
     3. 60 秒窗口结束仍未取到可用 cookie，才允许再刷新一次
        （最多 GW2A_MAX_REFRESH 次，默认 3 次），避免死循环刷页面。
     4. 整个流程最多占用 GW2A_BUDGET_SEC（默认 240 秒），超时直接放弃本轮。
@@ -21,7 +21,7 @@
 流程：
   1. 确保 profile 的 Chromium 在跑（不在就通过控制器拉起，等 CDP 就绪）
   2. 刷新（或首次导航）Gemini 页面，等加载完成
-  3. 在 60s 冷却窗口内轮询提取 cookie
+  3. 在 120s 冷却窗口内轮询提取 cookie
   4. 写池（pool.py upsert：更新同 profile 记录 + 删除同 profile 旧记录）
      并绑定出口代理（与浏览器同一出口，避免 IP 不一致被判可疑）
   5. 调容器 /check 校验；失败则记录（本地限流满时跳过，不算失败）
@@ -52,7 +52,7 @@ PROXY_ID = int(os.environ.get("GW2A_BROWSER_PROXY_ID", "0") or 0)
 GEMINI_URL = "https://gemini.google.com/app"
 PROFILE = "acct1"
 
-COOLDOWN_SEC = int(os.environ.get("GW2A_COOLDOWN_SEC", "60") or 60)   # 刷新后的冷却窗口
+COOLDOWN_SEC = int(os.environ.get("GW2A_COOLDOWN_SEC", "120") or 120)  # 刷新后的冷却窗口
 MAX_REFRESH = int(os.environ.get("GW2A_MAX_REFRESH", "3") or 3)       # 一轮最多刷新几次
 BUDGET_SEC = int(os.environ.get("GW2A_BUDGET_SEC", "240") or 240)     # 一轮总时长上限
 POLL_SEC = float(os.environ.get("GW2A_POLL_SEC", "5") or 5)

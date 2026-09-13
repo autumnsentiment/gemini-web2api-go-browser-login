@@ -54,7 +54,7 @@ type Config struct {
 	// 由 controller.js 管理独立 Chromium profile。留空 = 关闭该功能。
 	BrowserControllerURL  string `json:"browser_controller_url"`  // 例如 http://chromium:9280
 	BrowserCDPHost        string `json:"browser_cdp_host"`        // CDP 主机，默认取控制器主机
-	BrowserRefreshMinutes int    `json:"browser_refresh_minutes"` // 自动刷新间隔，0=用默认 10
+	BrowserRefreshMinutes int    `json:"browser_refresh_minutes"` // 兜底抓取间隔（分钟），0=用默认 10；读得到 cookie 有效期时按「有效期-5分钟」调度
 	BrowserAccessURL      string `json:"browser_access_url"`      // 用户在**自己浏览器**打开 Chromium 桌面的地址（VNC Web），如 http://NAS_HOST:5666/chromium/ 。留空 = 前端隐藏“在我的浏览器打开”按钮
 }
 
