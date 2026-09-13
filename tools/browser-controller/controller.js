@@ -21,6 +21,7 @@
  *   GW2A_PROFILE_BASE  默认 /vol2/@appdata/gw2a-browser/profiles
  *   GW2A_CDP_BASE      默认 9300
  *   GW2A_DISPLAY       默认 :13
+ *   GW2A_GPU_DISPLAY   默认空；设为 ':1' 后新 profile 默认用 GPU Xorg（virgl）
  *   GW2A_RUN_USER      默认 fygo-browser
  */
 'use strict';
@@ -35,6 +36,10 @@ const PORT = parseInt(process.env.GW2A_CTRL_PORT || '9280', 10);
 const PROFILE_BASE = process.env.GW2A_PROFILE_BASE || '/vol2/@appdata/gw2a-browser/profiles';
 const CDP_BASE = parseInt(process.env.GW2A_CDP_BASE || '9300', 10);
 const DISPLAY = process.env.GW2A_DISPLAY || ':13';
+// GPU 显示：设为 GW2A_GPU_DISPLAY（如 ':1'）后，新 profile 默认跑在该 Xorg 上
+//（modesetting+glamor+DRI3，virtio-gpu virgl 硬件 GL）。Xkasmvnc :13 无 DRI3，
+// 只能 llvmpipe 软渲染。按次覆盖：POST /profiles {"display": ":13"}。
+const GPU_DISPLAY = process.env.GW2A_GPU_DISPLAY || '';
 const RUN_USER = process.env.GW2A_RUN_USER || 'fygo-browser';
 
 const RT = '/vol2/@appcenter/fygo-browser/app/vendor/runtime';
@@ -49,7 +54,8 @@ const CHROME_FLAGS = [
   '--no-sandbox',
   '--test-type',
   '--disable-infobars',
-  '--disable-gpu',
+  '--ignore-gpu-blocklist',
+  '--disable-backgrounding-occluded-windows',
   '--password-store=basic',
   '--use-mock-keychain',
   '--disable-dev-shm-usage',
@@ -239,6 +245,17 @@ async function handleCookieSync(body, clientIp) {
   if (!cookie) return { error: 'cookie 为空' };
   if (!/SAPISID=/.test(cookie)) return { error: 'cookie 缺少 SAPISID，未登录或抓取不完整' };
 
+  // ★ 扩展 v1.1.0 起会上报真实登录态（以页面 SNlM0e 为准）。
+  // 会话被 Google 判匿名时，cookie 名字仍然齐、有效期还很长，但服务端不认；
+  // 这种废 cookie 一旦写进池子，gemini-web2api 拿到就 302（重定向登录页）→ 请求
+  // 502 → 触发重抓 → 又抓到同一份废 cookie，形成死循环。
+  // 所以这里直接拒收，让上游去看门狗/扩展去重登。
+  if (body && body.logged_in === false) {
+    const why = '会话已判匿名（扩展探针：' + (body.login_source || 'page') + '），拒绝入池';
+    syncLog('拒收 profile=' + profile + '：' + why);
+    return { ok: false, error: why, rejected: true, login_source: body.login_source || '' };
+  }
+
   const label = (body && body.label) || ('browser:' + profile);
   const note = (body && body.note) || ('auto by extension @ ' + new Date().toISOString() + ' (' + (body && body.reason || 'auto') + ')');
   const up = await runPool('upsert', {
@@ -278,6 +295,22 @@ async function handleCookieSync(body, clientIp) {
     }
   } catch (e) { syncLog('check 异常: ' + e.message); }
 
+  // 校验明确说「会话无效」（重定向登录页 / 页面无 SNlM0e）时，标记该账号需要重登。
+  // 这类失败不是抓取时机的问题，重复抓只会拿到同一份废 cookie —— 写进 state 让
+  // 看门狗/重登脚本接手，比一遍遍重抓有意义。
+  let needsRelogin = false;
+  if (check && !check.ok) {
+    const d = String(check.detail || '');
+    if (/重定向到登录页|no SNlM0e|没有登录态/.test(d)) {
+      needsRelogin = true;
+      syncLog('⚠ profile=' + profile + ' 会话无效（' + d + '）→ 标记需要重新登录');
+      try {
+        require('fs').writeFileSync('/var/lib/gw2a-cookie-sync/needs-relogin-' + profile + '.json',
+          JSON.stringify({ at: Date.now(), profile: profile, detail: d, account_id: up.id }, null, 1));
+      } catch (e) {}
+    }
+  }
+
   const removed = (up && up.removed) || 0;
   const detail = (up.action === 'inserted' ? '新增入池' : '刷新入池') + ' #' + up.id +
     ' profile=' + profile + ' cookie=' + up.cookie_len + 'B' +
@@ -288,7 +321,7 @@ async function handleCookieSync(body, clientIp) {
   syncLog(detail);
   return { ok: true, id: up.id, action: up.action, detail: detail,
            check: check, cookie_len: up.cookie_len, ts: up.ts,
-           proxy_id: boundProxyId, removed: removed };
+           proxy_id: boundProxyId, removed: removed, needs_relogin: needsRelogin };
 }
 
 const HELPER_PAGE = `<!DOCTYPE html>
@@ -407,7 +440,7 @@ function adoptRunning() {
   } catch (e) { /* ignore */ }
 }
 
-function launchProfile(name) {
+function launchProfile(name, opts) {
   const sname = safeName(name);
   if (!sname) return { error: 'profile 名非法' };
   const existing = state.profiles.get(sname);
@@ -442,7 +475,7 @@ function launchProfile(name) {
   const env = {
     PATH: RT + '/usr/bin:' + RT + '/usr/sbin:' + RT + '/bin:/usr/bin:/bin',
     HOME: BROWSER_HOME,
-    DISPLAY: DISPLAY,
+    DISPLAY: (opts && opts.display) || GPU_DISPLAY || DISPLAY,
     XDG_RUNTIME_DIR: BROWSER_RUN,
     LD_LIBRARY_PATH: LD_LIB,
     LANG: 'en_US.UTF-8',
@@ -641,7 +674,7 @@ const server = http.createServer(async (req, res) => {
       const name = body.name;
       if (!name) return send(res, 400, { error: '缺少 name' });
       if (state.profiles.size >= MAX_PROFILES) return send(res, 400, { error: 'profile 数量超限' });
-      const rec = launchProfile(name);
+      const rec = launchProfile(name, { display: body.display });
       if (rec.error) return send(res, 400, rec);
       return send(res, 200, rec);
     }
