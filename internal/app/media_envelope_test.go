@@ -82,3 +82,54 @@ func TestMP4BoxLen(t *testing.T) {
 		t.Error("非 mp4 数据被误认")
 	}
 }
+
+// TestExtractVideoEnvelopeDeepField1 覆盖第二个线上样本：资源子消息出现在
+// 顶层第二个 field1（不是 field2），且 mime/mp4 再包一层 field3。
+func TestExtractVideoEnvelopeDeepField1(t *testing.T) {
+	lenPrefix := func(b []byte) []byte {
+		var out []byte
+		n := len(b)
+		for {
+			x := byte(n & 0x7f)
+			n >>= 7
+			if n != 0 {
+				x |= 0x80
+			}
+			out = append(out, x)
+			if n == 0 {
+				break
+			}
+		}
+		return append(out, b...)
+	}
+	var mp4 []byte
+	mp4 = append(mp4, 0x00, 0x00, 0x00, 0x20)
+	mp4 = append(mp4, []byte("ftypisom")...)
+	mp4 = append(mp4, make([]byte, 256)...)
+
+	res := append([]byte{0x0a}, lenPrefix([]byte("video/mp4"))...) // field1: mime
+	res = append(res, append([]byte{0x12}, lenPrefix(mp4)...)...)  // field2: mp4
+	sub := append([]byte{0x1a}, lenPrefix(res)...)                 // field3: {res}
+	innerMeta := append([]byte{0x12}, lenPrefix([]byte("To satisfy ..."))...)
+	big := append([]byte{0x0a}, lenPrefix(innerMeta)...)          // field1: 文本
+	big = append(big, append([]byte{0x0a}, lenPrefix(sub)...)...) // 第二个 field1: 资源!
+	big = append(big, append([]byte{0x12}, lenPrefix([]byte("model"))...)...)
+
+	meta := append([]byte{0x0a}, lenPrefix([]byte("a red balloon"))...)
+	out := append([]byte{0x0a}, lenPrefix(meta)...)
+	out = append(out, append([]byte{0x0a}, lenPrefix(big)...)...) // 顶层第二个 field1
+
+	got, mime := extractVideoFromEnvelope(out)
+	if got == nil {
+		t.Fatal("深嵌套信封没剥出 mp4")
+	}
+	if mime != "video/mp4" {
+		t.Errorf("mime = %q", mime)
+	}
+	if !looksLikeMP4(got) {
+		t.Error("剥出的不是 ftyp 开头")
+	}
+	if bytes.Contains(got, []byte("model")) {
+		t.Error("混入了非 mp4 尾部")
+	}
+}

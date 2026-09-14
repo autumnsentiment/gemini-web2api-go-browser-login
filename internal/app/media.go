@@ -342,7 +342,9 @@ func protobufSkip(d []byte, i int, wire int) (int, error) {
 //	            0a <len3> <MP4 字节> }                （field2 内还有一层包裹）
 //	1a .. "Current time is …"                 尾部 trailer
 //
-// 剥离按结构走：在顶层找资源子消息，再在其内找 mime 字符串与 ftyp 开头的 MP4。
+// 剥离按结构走：顶层逐字段尝试，字段号不作依据 —— 2026-09-15 两个线上样本里
+// 资源子消息一次在 field2、一次在第二个 field1，唯一稳定的判据是内容
+// （mime 字符串 + ftyp 开头的 MP4）。
 func extractVideoFromEnvelope(data []byte) ([]byte, string) {
 	i := 0
 	for i < len(data) {
@@ -350,7 +352,6 @@ func extractVideoFromEnvelope(data []byte) ([]byte, string) {
 		if err != nil {
 			return nil, ""
 		}
-		field := int(tag >> 3)
 		wire := int(tag & 7)
 		if wire != 2 {
 			k, err := protobufSkip(data, j, wire)
@@ -365,11 +366,6 @@ func extractVideoFromEnvelope(data []byte) ([]byte, string) {
 			return nil, ""
 		}
 		payload := data[s : s+int(n)]
-		if field == 1 {
-			// 元数据子消息，跳过
-			i = s + int(n)
-			continue
-		}
 		if mp4, mime := extractVideoFromResource(payload); mp4 != nil {
 			return mp4, mime
 		}
