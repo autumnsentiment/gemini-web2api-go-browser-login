@@ -213,6 +213,12 @@ func recordRequest(endpoint, model, prompt, response string, res *StreamResult, 
 		r.AccountLabel = res.AccountLabel
 	}
 	go insertRequest(r)
+	// 模型一致性检测：请求的是登录态专属模型、上游却自报匿名档（3.5 Flash-Lite）
+	// = 会话被当匿名处理的最早信号，触发对应账号重抓 cookie。异步、带防抖，
+	// 不影响本请求的响应。
+	if res != nil {
+		go modelGuardCheck(model, res.UpstreamModel, res.AccountID, status)
+	}
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
