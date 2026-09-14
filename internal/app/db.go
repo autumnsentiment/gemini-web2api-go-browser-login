@@ -102,22 +102,21 @@ CREATE TABLE IF NOT EXISTS kv (
 
 -- Cookie 池：每行一个 Google 登录态账号（一整串 gemini.google.com cookie）。
 -- 请求时按 last_used_at 最久优先挑一个 enabled 的，天然轮转 + 分散单 IP 上限。
-CREATE TABLE IF NOT EXISTS accounts (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    label         TEXT NOT NULL DEFAULT '',      -- 用户可命名（一般填邮箱）
-    cookie        TEXT NOT NULL,                 -- 完整 cookie 串 "k=v; k=v"
-    status        TEXT NOT NULL DEFAULT 'enabled', -- enabled | disabled
-    note          TEXT NOT NULL DEFAULT '',
-    created_at    INTEGER NOT NULL,
-    last_used_at  INTEGER NOT NULL DEFAULT 0,     -- 上次被挑中发请求的时刻
-    last_ok_at    INTEGER NOT NULL DEFAULT 0,     -- 上次请求成功的时刻
-    last_error    TEXT NOT NULL DEFAULT '',
-    fail_count    INTEGER NOT NULL DEFAULT 0,     -- 连续失败次数（成功归零）
-    proxy_id      INTEGER NOT NULL DEFAULT 0,     -- 绑定的出口，0 = 还没绑
-    source        TEXT NOT NULL DEFAULT 'manual', -- manual 手动导入 | browser 浏览器登录
-    profile       TEXT NOT NULL DEFAULT ''        -- browser 来源对应的 Chromium profile 名
-);
-
+	CREATE TABLE IF NOT EXISTS accounts (
+	    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	    label         TEXT NOT NULL DEFAULT '',      -- 用户可命名（一般填邮箱）
+	    cookie        TEXT NOT NULL,                 -- 完整 cookie 串 "k=v; k=v"
+	    status        TEXT NOT NULL DEFAULT 'enabled', -- enabled | disabled
+	    note          TEXT NOT NULL DEFAULT '',
+	    created_at    INTEGER NOT NULL,
+	    last_used_at  INTEGER NOT NULL DEFAULT 0,     -- 上次被挑中发请求的时刻
+	    last_ok_at    INTEGER NOT NULL DEFAULT 0,     -- 上次请求成功的时刻
+	    last_error    TEXT NOT NULL DEFAULT '',
+	    fail_count    INTEGER NOT NULL DEFAULT 0,     -- 连续失败次数（成功归零）
+	    proxy_id      INTEGER NOT NULL DEFAULT 0,     -- 绑定的出口，0 = 还没绑
+	    source        TEXT NOT NULL DEFAULT 'manual', -- manual | browser（浏览器登录导入）
+	    profile       TEXT NOT NULL DEFAULT ''        -- browser 来源对应的 Chromium profile 名
+	);
 CREATE INDEX IF NOT EXISTS idx_accounts_pick ON accounts(status, last_used_at);
 `
 
@@ -170,6 +169,7 @@ func getDB() *dbx {
 			_, _ = conn.Exec(`ALTER TABLE requests ADD COLUMN account_id INTEGER`)
 			_, _ = conn.Exec(`ALTER TABLE requests ADD COLUMN account_label TEXT`)
 			_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN proxy_id INTEGER NOT NULL DEFAULT 0`)
+			// 浏览器登录来源（本地增强）：manual | browser + 对应的 Chromium profile
 			_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`)
 			_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN profile TEXT NOT NULL DEFAULT ''`)
 			_, _ = conn.Exec(`ALTER TABLE requests DROP COLUMN prompt_preview`)

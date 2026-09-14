@@ -34,10 +34,27 @@ func cookieAcctView(a CookieAccount) map[string]interface{} {
 	if s := extractSAPISID(a.Cookie); len(s) >= 4 {
 		tail = s[len(s)-4:]
 	}
+	// health 是给面板标红用的派生健康度（#18）。判据用 fail_count：markAccountResult
+	// 成功会把它清零、失败才 +1，而且只有 401/403 才算失败（见 markCookieByStatus），
+	// 所以 fail_count>0 就是「当前鉴权在失败」= 多半 cookie 过期了，直接标红提示重导。
+	//   dead     鉴权失败中（红）—— 不管启用还是被自动停用，只要 fail_count>0
+	//   disabled 用户手动停用且没有失败记录（灰）
+	//   unknown  还没成功用过/检测过（待检测）
+	//   ok       在用、没失败（绿）
+	health := "ok"
+	switch {
+	case a.FailCount > 0:
+		health = "dead"
+	case a.Status != "enabled":
+		health = "disabled"
+	case a.LastOkAt == 0:
+		health = "unknown"
+	}
 	return map[string]interface{}{
 		"id":           a.ID,
 		"label":        a.Label,
 		"status":       a.Status,
+		"health":       health,
 		"note":         a.Note,
 		"created_at":   a.CreatedAt,
 		"last_used_at": a.LastUsedAt,
@@ -50,8 +67,6 @@ func cookieAcctView(a CookieAccount) map[string]interface{} {
 		"has_1psidts":  nameSet["__Secure-1PSIDTS"],
 		"proxy_id":     a.ProxyID,
 		"proxy_name":   proxyNameByID(a.ProxyID),
-		"source":       a.Source,
-		"profile":      a.Profile,
 	}
 }
 
@@ -125,13 +140,17 @@ func handleAdminCookieItem(w http.ResponseWriter, r *http.Request) {
 		if action == "rotate" {
 			for _, a := range accountList() {
 				if a.ID == id {
-					iv, err := rotateAccount(a)
+					iv, names, err := rotateAccount(a)
 					if err != nil {
 						writeJSON(w, 200, map[string]interface{}{"ok": false, "detail": err.Error()})
 						return
 					}
+					detail := "保活成功"
+					if len(names) > 0 {
+						detail = "保活成功，刷新了 " + strings.Join(names, ", ")
+					}
 					writeJSON(w, 200, map[string]interface{}{
-						"ok": true, "detail": "保活成功", "next_sec": int(iv.Seconds())})
+						"ok": true, "detail": detail, "refreshed": names, "next_sec": int(iv.Seconds())})
 					return
 				}
 			}

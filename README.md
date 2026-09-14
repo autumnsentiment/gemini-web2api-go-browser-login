@@ -1,552 +1,645 @@
-<div align="center">
+# gemini-web2api-go
 
-# gemini-web2api-go · 浏览器登录增强版
-
-**把 Google Gemini 网页端反代成 OpenAI 兼容 API —— 带全自动 Cookie 供给链路**
+<img src="docs/banner.svg" alt="gemini-web2api-go" width="100%">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.26-00ADD8.svg)](https://go.dev)
-[![Upstream](https://img.shields.io/badge/upstream-zexadev%2Fgemini--web2api--go-181717.svg)](https://github.com/zexadev/gemini-web2api-go)
+[![Go Version](https://img.shields.io/badge/go-1.21%2B-00ADD8.svg)](https://golang.org)
+[![Docker](https://img.shields.io/badge/docker-distroless-blue)](Dockerfile)
 
-</div>
+中文 | [English](README_EN.md)
 
----
-
-## 源项目声明（必读）
-
-本项目是 **[zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go)**（MIT License）的**派生增强版**。
-
-| | |
-|---|---|
-| **上游项目** | <https://github.com/zexadev/gemini-web2api-go> |
-| **上游版本基线** | `v4.17.0`（`internal/app/server.go` 中 `Version = "4.17.0"`） |
-| **上游许可证** | MIT License, Copyright (c) 2026 gemini-web2api-go contributors |
-| **本仓库** | 在上游基础上增加了「浏览器登录态自动抓取链路」「OpenAI 图像 API 端点」「图片生成前端插件」三块自研扩展，并修复若干 Cookie 池健壮性问题 |
-
-上游的完整文档、更新日志已随仓库保留，见：
-
-- [`docs/UPSTREAM_README.md`](docs/UPSTREAM_README.md) —— 上游完整中文文档（模型清单、接口矩阵、指纹说明、面板用法等）
-- [`docs/UPSTREAM_README_EN.md`](docs/UPSTREAM_README_EN.md) —— 上游英文文档
-- [`docs/UPSTREAM_CHANGELOG.md`](docs/UPSTREAM_CHANGELOG.md) —— 上游更新日志
-
-**上游项目是主体，本项目只做增量。** 如果你只需要基础的 Gemini → OpenAI 反代，直接用上游即可；本仓库的价值在于把「登录态获取」这件事做成无人值守的闭环。
+把 Google Gemini 网页端反代成 OpenAI 兼容 API。**单二进制**，**零账号**（匿名可跑），**Chrome 146 真指纹**，**SQLite 持久化**，自带**中文管理面板**。
 
 ---
 
-## 本项目相对上游新增了什么
+## 这是什么
 
-### 1. 全自动 Cookie 供给链路（核心）
-
-上游需要你**手动**把 Google 的 cookie 粘进管理面板。cookie 会过期（`__Secure-1PSIDTS` 通常几十分钟到几小时轮换一次），过期后所有请求 502，必须人工重新粘贴 —— 这是无人值守场景最大的痛点。
-
-本项目在服务器自带的 Chromium 上常驻一个已登录的 Google 会话，用**扩展**读取真实会话 cookie，自动写入 gemini-web2api 的 cookie 池：
-
+把这种调用：
 ```
-┌─────────────────────────── 宿主机（systemd）───────────────────────────┐
-│                                                                       │
-│  gw2a-xkasmvnc.service     Xkasmvnc 虚拟桌面 :13（VNC Web :16100）     │
-│           │                                                           │
-│  gw2a-browser-controller   拉起 Chromium（CDP 9300+），提供 :9280     │
-│           │                 /profiles /cookie-sync /cdp/<port>/*      │
-│           │                                                           │
-│      Chromium（profile: acct1，已登录 Google）                        │
-│           │                                                           │
-│      ext-src 扩展「Gemini Cookie Sync」                               │
-│           │  刷新页面 → 冷却窗口内读 cookie → POST /cookie-sync       │
-│           ▼                                                           │
-│  gw2a-cookie-queue.service  队列守护：30min 定时 + 2×502 触发重抓     │
-│           │                 串行执行、浏览器保活、502 后重新计时      │
-│           ▼                                                           │
-│  refresh.py → pool.py → 直接写 SQLite（WAL 安全）                     │
-└───────────────────────────────────┬───────────────────────────────────┘
-                                    ▼
-                    gemini-web2api 容器的 cookie 池
+[OpenAI SDK / Cherry Studio / Cursor / dify / newapi / ...]
+    ↓ http://localhost:8083/v1/chat/completions
+[gemini-web2api-go]
+    ↓ 逆向 gemini.google.com 网页协议
+[Google Gemini 网页端]
 ```
 
-关键设计：
+不是 Google 官方 API（[generativelanguage.googleapis.com](https://generativelanguage.googleapis.com)）的二次封装——**直接反代浏览器协议**，所以**不需要 Google API Key、不需要付费配额**。
 
-- **不新开页面，只刷新已有页面** —— 早期实现每次新建 Gemini 会话，很快被风控。现在改为刷新现有标签页。
-- **60 秒冷却窗口** —— 刷新页面后 60s 内提取 cookie；窗口内提取失败才再刷新，避免高频操作。
-- **队列串行 + 重新计时** —— 定时任务与 502 触发的重抓不会并发；502 触发后定时器重新计时。
-- **2×502 立即重抓** —— 轮询 `requests` 表，出现两个 502 立刻触发一次 cookie 刷新。
-- **按有效期保活** —— 按「cookie 有效期 - 5 分钟」刷新页面维持会话活跃（最长间隔 1 小时、两次抓取至少隔 2 分钟），降低刷新频率以避免触发 Google 风控。
-- **出口绑定** —— 账号 `proxy_id` 自动绑定为浏览器所用出口。若账号走直连而浏览器走代理，出口 IP 不一致，Google 会立刻判会话可疑并失效。
+## 功能
 
-### 2. OpenAI 图像 API 端点
+**接口**
+- OpenAI 兼容：`/v1/chat/completions`、`/v1/models`、`/v1/responses`
+- `/v1/videos`：OpenAI(Sora) 形状的异步视频生成——`POST` 建任务、`GET /v1/videos/{id}` 轮询、`GET /v1/videos/{id}/content` 下 MP4（要登录态 Pro 号）
+- 普通对话真流式：上游每出一帧就转发增量（带 `tools` 的请求和 `/v1/responses` 是收完再发）
+- Bearer token / `x-api-key` 鉴权，key 可在面板轮换
+- `usage` 用 tiktoken 算，`reasoning_tokens` 单列不计入 `completion_tokens`
 
-上游只认 chat 端点发图。很多客户端（new-api / Cherry Studio / LobeChat 的画图页）只用 OpenAI 图像 API，导致 `gemini-image` 在它们那里根本选不到。
+**模型**
+- `gemini-3.6-flash`、`gemini-3.5-flash-lite` 匿名可用，含联网搜索
+- `gemini-3.1-pro` 挂 cookie 后可用，每次回答带思考链（`reasoning_content`）
+- 三个模型都有 `-thinking` 版（扩展思考），挂 cookie 后可用
+- 响应里记录服务端**实际**用了哪个模型，被静默降级一眼可见
 
-新增 `internal/app/images.go`：
+**不被拦 / 跑得久**
+- utls 模拟 Chrome 146 真 TLS 指纹，不是 SDK 默认握手
+- 每个出口 IP 独立限流：并发 / RPM / RPH 三档
+- 代理池：运行时增删改、失败熔断、轮转调度，每个代理是独立限流槽
+- Cookie 池：多个 Google 账号按最久未用优先轮转，自动续期 + 保活，每个账号粘住自己的出口
 
-| 端点 | 说明 |
-|---|---|
-| `POST /v1/images/generations` | JSON；带 `image`（data URL / http 链接）即为图生图。结果 `data[].b64_json` |
-| `POST /v1/images/edits` | multipart：`image`（可重复）/ `mask` / `prompt` / `model` / `n` / `size` / `response_format` |
+**运维**
+- 单二进制，交叉编译 6 平台；容器镜像基于 distroless
+- SQLite 持久化：30 天请求明细 + 永久聚合统计（可选 MySQL / PostgreSQL，设 `SQL_DSN` 即可）
+- 中文管理面板：概览 / 请求记录 / 代理池 / Cookie 池 / 设置，配置改完即时生效
+- **prompt 和回复内容永不入库**，只存元数据（长度、耗时、模型、状态）
 
-两者都收敛到同一条 `gemini-image` 链路（上游 `StreamGenerate` + `inner[49]=14`），产物由 `hNvQHb` 取回原始字节后转成 OpenAI images 形状。
+## 快速开始
 
-还包含**回声检测**（`isEchoArtifacts`）：图生图时上游偶尔丢掉生图标记、把输入图原样送回，此时按近似像素比对识别并丢弃重打，避免客户端拿到一张和原图一模一样的「修改后」图片。
+### 下载二进制（最省事）
 
-### 3. 图片生成前端插件
+[Releases](https://github.com/zexadev/gemini-web2api-go/releases) 里挑对应平台的下载，
+不用 Go、不用 Docker，单个文件就是全部：
 
-`tools/image-gen/` 是一个独立的生图工作台页面（`image-gen.html`）+ nginx 反代，把 `/v1/images/edits` 请求转换到 `/v1/chat/completions`，并支持本地图库（IndexedDB）。图库参考图入队前会在浏览器侧压缩，避免大图触发网关 413。
-
-### 4. Cookie 池健壮性修复
-
-| 文件 | 修复 |
-|---|---|
-| `internal/app/gemini.go` | `markCookieByStatus(acct.ID, xsrfAuthStatus(err), ...)` —— 不再把所有错误硬编码成 401 |
-| `internal/app/xsrf.go` | 新增 `xsrfAuthStatus()`，把错误分类成 401/403/5xx/网络错误 |
-| `internal/app/browser_cdp.go` | 新增 `errBrowserPageUnreachable` / `errBrowserNotLoggedIn` 哨兵错误，网络不可达不再误删账号 |
-| `internal/app/cookie_pool.go` | 检测路径不再把网络错误计入 `fail_count`，避免好 cookie 被代理故障误伤成「失败最多」 |
-
-上游行为：代理一挂，所有请求报错 → cookie 被标 401 → `fail_count` 累加 → 账号被自动停用 → 代理恢复后还得手动启用。修复后网络错误不计入健康度，只有确凿的 401/403 才降级。
-
-### 4b. 会话票过期（__Secure-1PSIDTS）自愈
-
-**这是「web 明明登录着，抓到的 cookie 却报 502 / 重定向登录页」的真根因**，
-2026-09-12 用对照实验钉死。
-
-Google 的登录态里有一张**有寿命的票** `__Secure-1PSIDTS`（`__Secure-3PSIDTS` 同值）。
-它约 **10~20 分钟**就会过期。过期后拿它去请求 `https://gemini.google.com/app`：
-
-| 实验（同一份 cookie，只换 `__Secure-1PSIDTS` 一项） | 结果 |
-|---|---|
-| 刚换到的新票 | HTTP 200 + 页面含 `SNlM0e`（**已登录**）|
-| 16 分钟前的票 | HTTP 200 但**无 `SNlM0e`**（**匿名单页**）|
-| 21 分钟前的票 | 匿名单页 |
-| 71 分钟前的票 | 匿名单页 |
-| 把该项删掉 / 改成垃圾值 | 匿名单页（3/3 复现）|
-
-关键点：**这种情况下 `SID` / `SAPISID` / `__Secure-1PSID` 全都完好、有效期到 2027**，
-所以只按 cookie 名字判断会说「已登录」，而服务端其实把请求当匿名处理。
-原代码把它翻译成「cookie 无效 → 累加 `fail_count` → 3 次自动停用账号」，
-于是好号被判死、客户端一路 502。
-
-**修复**（都在 `internal/app/`）：
-
-1. `rotate.go` 新增 `renewBoundCookies()`：主动 `POST accounts.google.com/RotateCookies`
-   换新票（实测 200 + `Set-Cookie: __Secure-1PSIDTS=...`），换完同一份 cookie
-   立刻恢复。429 视为「换太勤」而非失败，不报错、不改健康度。
-2. `cookie_pool.go` 的 `checkAccountCookie()`：出现「匿名单页」症状时先自动续票复检；
-   票已彻底过期（RotateCookies 回 401）则回落到**浏览器刷新**这条自愈路径
-   （Chromium 里那份 cookie 永远是新鲜的）。**且该症状不再累加 `fail_count`**。
-3. `scheduler.go`：保活间隔从服务端建议的 600s 收紧到 `min(建议值, 300s)`
-   （`maxRotateInterval`）。服务端提示的 600s 恰好压在票据过期边界上，
-   按 600s 走会周期性踩进「票已过期、下一轮还没到」的窗口。
-4. `xsrf.go` 的 `xsrfAuthStatus()`：`no SNlM0e` 不再算 401（原因同上）。
-
-实测验证（故障注入 → 自愈）：
-
-```
-[renew]   账号 #63 续票失败（忽略，不改健康度）：取轮转页返回 HTTP 401
-[browser] 账号 #63 会话票已过期，尝试用浏览器刷新自愈
-[browser] profile "acct1" cookie 已刷新 -> 账号 #63
-[cookie]  账号 #63 浏览器刷新后恢复可用
+```bash
+chmod +x gemini-web2api-go_*
+./gemini-web2api-go_* --port 8083 --admin-token your-admin-token
 ```
 
-故障注入期间 `fail_count` 保持 0、账号未被停用；连续 25 次 chat 请求 25/25 成功。
+数据默认落在 `./data/gemini.db`，换位置加 `--db /your/path.db`。
 
-### 5. 生图会话删除独立开关
+想用 MySQL / PostgreSQL，设 `SQL_DSN` 环境变量即可（不设就是 SQLite，无需改动）：
 
-上游只有一个「自动删网页会话」开关，对对话和生图一视同仁。但两者的诉求正好相反：
-
-- **对话**会话是「过程」，留着只会在账号里堆垃圾 → 倾向删
-- **生图**会话是「资产」，用户常想回网页端复看或二次编辑 → 倾向留
-
-所以本项目把它拆成两个独立开关：
-
-| 面板选项 | JSON 字段 | 作用范围 |
-|---|---|---|
-| 自动删网页会话（对话） | `auto_delete_conversation` | 对话 / 音乐 / 视频 / 画布 |
-| 自动删网页会话（生图） | `auto_delete_image_conversation` | 仅 `gemini-image` |
-
-两者完全独立，互不影响。实现在 `internal/app/gemini.go`：
-
-```go
-// autoDeleteForTool 决定某个模型类型出完结果后要不要自动删网页会话。
-func autoDeleteForTool(tool int) bool {
-	rt := rtCfg()
-	if tool == toolImage {
-		return rt.AutoDeleteImageConversation
-	}
-	return rt.AutoDeleteConversation
-}
+```bash
+# MySQL（也接受 go-sql-driver 原生 user:pass@tcp(host:3306)/dbname）
+SQL_DSN="mysql://user:pass@host:3306/dbname"
+# PostgreSQL
+SQL_DSN="postgres://user:pass@host:5432/dbname?sslmode=disable"
 ```
 
-两个开关默认都是 `false`（与「不删会话」的上游默认行为一致）。
+建表自动完成，三种库共用同一套 schema。单机就用默认 SQLite 最省事，多实例共享一个池子才需要 MySQL/PG。
 
-由于 `/v1/images/*` 与 `/v1/chat/completions` 最终都收敛到 `callGemini`，删除点只有一处，
-按 `mc.Tool` 分流即可，不会出现两条路径判断不一致的情况。
+### Docker（不用源码）
 
-实测验证矩阵（真实打上游：每个 case 单独配置后发请求，按时间戳统计 `[autodel]` 日志行）：
-
-| 请求类型 | 对话开关 | 生图开关 | 实际删除 | 预期 |
-|---|---|---|---|---|
-| 生图 | 关 | 关 | 0 | 0 ✅ |
-| 生图 | 关 | **开** | 1 | ≥1 ✅ |
-| 生图 | **开** | 关 | 0 | 0 ✅（对话开关未泄漏到生图）|
-| 对话 | **开** | 关 | 1 | ≥1 ✅ |
-| 对话 | 关 | **开** | 0 | 0 ✅（生图开关未泄漏到对话）|
-| 对话 | 关 | 关 | 0 | 0 ✅ |
-
-6/6 全部通过。
-
----
-
-## 目录结构
-
-```
-.
-├── main.go                     # 上游入口（未改动）
-├── internal/app/               # 上游 Go 源码 + 本项目新增/修改
-│   ├── browser_cdp.go          # [新增] CDP 浏览器登录态获取
-│   ├── admin_browser.go        # [新增] 浏览器相关管理接口
-│   ├── images.go               # [新增] /v1/images/* OpenAI 图像 API
-│   ├── xsrf.go                 # [修改] xsrfAuthStatus() 错误分类
-│   ├── gemini.go               # [修改] 错误分类回写
-│   └── cookie_pool.go          # [修改] 网络错误不计入 fail_count
-│
-├── tools/
-│   ├── browser-controller/     # Chromium profile 控制器（Node.js）
-│   │   ├── controller.js       #   拉起 Chromium、CDP 隧道、/cookie-sync 接口
-│   │   └── vnc-proxy.js        #   VNC 路径反代
-│   ├── cookie-sync/            # Cookie 抓取工具链（Python 3）
-│   │   ├── refresh.py          #   页面刷新式抓取 + 60s 冷却窗口（核心）
-│   │   ├── queue_daemon.py     #   30min 定时 + 2×502 触发、队列串行
-│   │   ├── pool.py             #   直接写容器共享 SQLite（WAL 安全）
-│   │   ├── watchdog.py         #   每 5 分钟兜底
-│   │   ├── gw2a-sync.py        #   命令行：state/status/keepalive/sync/pool/open
-│   │   ├── install_ext.py      #   打包并安装扩展
-│   │   └── ext-src/            #   扩展源码（MV3）
-│   └── image-gen/              # 图片生成前端插件 + nginx 反代
-│
-├── deploy/
-│   ├── docker-compose.yml      # 生产用 compose（含浏览器登录环境变量）
-│   ├── build/                  # 本地构建镜像的 Dockerfile + build.sh
-│   └── systemd/                # 全部 systemd 单元（8 个）
-│
-└── docs/                       # 上游原始文档（保留出处）
+```bash
+docker run -d --name gemini-web2api \
+  -p 127.0.0.1:8083:8083 \
+  -v "$PWD/data:/data" \
+  -e ADMIN_TOKEN=your-admin-token \
+  ghcr.io/zexadev/gemini-web2api-go:latest
 ```
 
----
+用 compose 的话把 `docker-compose.yml` 单独下下来就行，也不用 clone：
 
-## 使用方法
+```bash
+curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
+ADMIN_TOKEN=your-admin-token docker compose up -d
+```
 
-### 基础用法（与上游一致）
+### 从源码跑
 
-启动后，把任意 OpenAI 客户端指向 `http://<host>:8083/v1`：
+装了 Go 就不必绕 Docker：
+
+```bash
+git clone https://github.com/zexadev/gemini-web2api-go
+cd gemini-web2api-go
+go build -o gemini-web2api-go .
+./gemini-web2api-go --port 8083 --admin-token your-admin-token
+```
+
+改了代码想用容器跑，把 `docker-compose.yml` 里 `build:` 那两行的注释去掉，再 `docker compose up -d --build`。
+
+启动后会看到 banner：
+
+```
+gemini-web2api-go v4.0.0
+  Listening:   http://0.0.0.0:8083
+  Base URL:    http://localhost:8083/v1
+  API key:     sk-gemini-XX...XXXX  (mutable in admin UI)
+  Admin UI:    http://localhost:8083/admin  (token auth)
+  DB:          ./data/gemini.db
+  Models:      [gemini-3.5-flash-lite gemini-3.6-flash]
+  Cookie:      none (anonymous)
+  Proxy:       none
+  Impersonate: chrome_146
+  Tokenizer:   tiktoken cl100k_base
+  Per-IP 限流: 并发=5 / RPM=30 / RPH=80
+  Retry:       3x / 2s
+```
+
+首次启动会自动生成 API key（banner 里是打码的，完整值在管理面板「设置」页）。
+
+### 调用
 
 ```bash
 curl http://localhost:8083/v1/chat/completions \
-  -H "Authorization: Bearer <你的 API Key>" \
+  -H "Authorization: Bearer sk-gemini-..." \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"你好"}]}'
+  -d '{
+    "model": "gemini-3.6-flash",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-常用模型（完整清单见上游文档）：
+OpenAI Python SDK 也直接能用：
 
-| 模型 | 说明 |
+```python
+from openai import OpenAI
+client = OpenAI(
+    base_url="http://localhost:8083/v1",
+    api_key="sk-gemini-..."  # admin 面板里看
+)
+resp = client.chat.completions.create(
+    model="gemini-3.6-flash",
+    messages=[{"role": "user", "content": "解释量子纠缠"}]
+)
+print(resp.choices[0].message.content)
+```
+
+Windows PowerShell 下 `curl` 是 `Invoke-WebRequest` 的别名，会把 JSON 引号重新解释，要用
+`curl.exe` 加 `--%`：
+
+```powershell
+curl.exe --% http://127.0.0.1:8083/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer sk-gemini-..." -d "{\"model\":\"gemini-3.6-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"
+```
+
+## 客户端接入
+
+任何 OpenAI 兼容客户端（Cherry Studio / ChatBox / Open WebUI / dify / Cursor / …）都是同一套填法：
+
+| 字段 | 值 |
 |---|---|
-| `gemini-3.6-flash` | 匿名可用 |
-| `gemini-3.5-flash-lite` | 匿名可用 |
-| `gemini-3.6-flash-thinking` | **需要 cookie** |
-| `gemini-3.1-pro-thinking` | **需要 cookie** |
-| `gemini-image` | 生图（Nano Banana），**需要 cookie** |
-| `gemini-music` | 音乐（Lyria），**需要 cookie** |
+| Base URL / API 地址 | `http://localhost:8083/v1`（部分客户端只要 `http://localhost:8083`，会自己拼 `/v1`） |
+| API Key | 管理面板「设置」页里的那个 `sk-gemini-…` |
+| 模型 | `gemini-3.6-flash` |
 
-管理面板：`http://<host>:8083/`（用 `ADMIN_TOKEN` 登录）。
+**newapi / one-api 建渠道**：类型选 OpenAI，Base URL 填 `http://localhost:8083`（跟 newapi 同在
+docker 里就写 `http://host.docker.internal:8083` 或容器名），密钥填 API key，模型填
+`gemini-3.6-flash,gemini-3.5-flash-lite`。
 
-### 生图（本项目扩展）
+**Codex CLI** 走 `/v1/responses`，把 base url 指到 `http://localhost:8083/v1` 即可（该端点已实现，
+但不是增量流式，见下面的协议覆盖表）。
 
-```bash
-# 文生图
-curl http://localhost:8083/v1/images/generations \
-  -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
-  -d '{"model":"gemini-image","prompt":"一只在月球上喝咖啡的猫"}'
+**Gemini CLI 接不了**：它要的是 Google 原生的 `/v1beta/models/{model}:generateContent`，本项目只暴露
+OpenAI 形状的接口，没做 `/v1beta`。
 
-# 图生图（multipart）
-curl http://localhost:8083/v1/images/edits \
-  -H "Authorization: Bearer <key>" \
-  -F "model=gemini-image" -F "prompt=把背景换成雪山" \
-  -F "image=@input.png"
+另有一个不鉴权的健康检查 `GET /`，返回 `{"status":"ok","version":…,"models":[…]}`，给探活用。
+
+## MCP（web_search 工具）
+
+除了 OpenAI 接口，同一个进程、同一个端口还挂了一个 **MCP server**，在 `/mcp` 上，
+把 Gemini 网页端的**联网搜索**暴露成一个 `web_search` 工具。让 Claude Desktop /
+Claude Code / Cursor 这类 MCP 客户端能「用 Gemini 去搜网」，返回**合成答案 + 来源链接**。
+
+不用单独起进程、不用额外部署——起了后端就有。传输是 HTTP（Streamable HTTP），
+所以远程客户端连 URL 就能用，复用后端的账号池 / 代理池 / 限流。匿名即可搜，不必挂 cookie。
+
+**客户端配置**（以 Claude Desktop 的 `claude_desktop_config.json` 为例）：
+
+```json
+{
+  "mcpServers": {
+    "gemini-search": {
+      "url": "http://你的服务器:8083/mcp",
+      "headers": { "Authorization": "Bearer sk-gemini-你的key" }
+    }
+  }
+}
 ```
 
-### 接入 new-api
+- `url` 指向后端的 `/mcp`；本机跑就是 `http://localhost:8083/mcp`。
+- `Authorization` 填 OpenAI 接口那把同样的 API key（面板「设置」页里看）。
+- Claude Code：`claude mcp add --transport http gemini-search http://localhost:8083/mcp --header "Authorization: Bearer sk-gemini-你的key"`。
 
-在 new-api 里新建渠道，类型选 **OpenAI**，Base URL 填 `http://<gemini-web2api 地址>:8083`，填入 API Key。之后 new-api 的 `/v1/images/edits` 会被本项目转换成 chat 请求发往 Gemini 网页端，生成的图片以 `b64_json` 回传到下游。
+工具 `web_search(query)`：传一个查询/问题，返回 Gemini 联网查证后的答案，末尾附
+`Sources:` 来源清单。当前只有这一个工具（读取指定 URL 的 `url_context` 暂未做）。
 
----
+## 管理面板
 
-## 部署方法
+`http://localhost:8083/admin`，用 `--admin-token` 登录。
 
-### 前置条件
+- **概览** — 24h KPI + 请求量/P50 延迟双轴趋势图 + 模型/代理分组统计 + IP 限流用量 + 一键连通性诊断
+- **请求记录** — 明细列表（仅元数据，无 prompt/response 内容），状态/模型筛选 + 分页
+- **代理池** — 运行时增删改 + 启用/禁用 + 失败次数熔断（每代理是独立 IP slot）
+- **Cookie 池** — 导入多个 Google 登录态账号，请求按**最久未用优先**自动轮转。每个账号一键「检测」是否仍是登录态，**失效的账号标红提示重导**；自动换发 `__Secure-1PSIDTS` + 每 10 分钟保活；每个账号粘住自己的出口。列表只显示脱敏摘要（cookie 数 / 关键项 / SAPISID 末 4 位 / 失败次数）
+- **设置** — 运行时配置表单（保存即生效）+ API Key 轮换 + 部署期配置只读展示
 
-| 组件 | 版本 | 说明 |
-|---|---|---|
-| Go | 1.26+ | 仅源码构建需要 |
-| Node.js | 18+ | 浏览器控制器 |
-| Python | 3.11+ | cookie-sync 工具链 |
-| Chromium | 任意较新版本 | 需能跑在有 GUI（或 Xkasmvnc）的环境 |
-| 出口代理 | 可选但**强烈建议** | 见下方「网络」说明 |
+面板前端是单个 HTML，Chart.js 随二进制 embed，**不走 CDN**——内网/离线部署也能开。
 
-> 本项目在 **fnOS** 上开发和验证，Chromium 用的是 fnOS 自带 `fygo-browser` 的运行时。其他系统请把 `controller.js` 里的 `RT` / `CHROMIUM` / `BROWSER_HOME` 等路径改成你自己的。
+**反代到子路径不用额外配置**：面板里的地址全是相对的，把 `https://example.com/gemini/`
+转发到本服务的 `/` 就能用 `https://example.com/gemini/admin` 打开。（访问不带尾斜杠的
+`/admin` 会 301 到 `admin/`——相对地址按文档 URL 的目录解析，两种形式差一层，统一一下
+才不会解析错。）
 
-### 方式一：Docker（推荐）
+## 模型
 
-```bash
-# 1) 构建镜像
-cd deploy/build
-#   先按需修改 build.sh 里的挂载路径
-./build.sh
-docker build -t gemini-web2api:local-browser -f Dockerfile .
+Gemini 网页端服务端只认三个模型（清单来自 `batchexecute?rpcids=otAQ7b`）：
 
-# 2) 启动
-cd ..
-export ADMIN_TOKEN='你的面板 token'
-docker compose up -d
-```
-
-`deploy/docker-compose.yml` 已经带上了浏览器登录相关环境变量：
-
-```yaml
-environment:
-  ADMIN_TOKEN: "${ADMIN_TOKEN:-change-me-in-production}"
-  BROWSER_CONTROLLER_URL: "http://172.21.0.1:9280"   # 宿主机网关 + 控制器端口
-  BROWSER_CDP_HOST: "172.21.0.1"
-  BROWSER_ACCESS_URL: "http://<你的NAS地址>:16100/"   # VNC 桌面入口
-```
-
-> `172.21.0.1` 是 compose 网络 `gemini-web2api-go_default` 的宿主网关，**不是固定值**，请用
-> `docker network inspect gemini-web2api-go_default -f '{{(index .IPAM.Config 0).Gateway}}'` 查出来再填。
-
-不用浏览器登录链路的话，把上面三个 `BROWSER_*` 删掉即可，行为与上游一致。
-
-### 方式二：单二进制
-
-```bash
-go build -trimpath -ldflags="-s -w" -o gemini-web2api .
-./gemini-web2api --db ./data/gemini.db --port 8083 \
-                 --admin-token <token> \
-                 --browser-controller-url http://127.0.0.1:9280 \
-                 --browser-cdp-host 127.0.0.1 \
-                 --browser-access-url http://<你的NAS地址>:16100/
-```
-
-### 部署 Cookie 自动供给链路
-
-以下假设部署到 `/opt/gw2a-cookie-sync` 与 `/opt/gw2a-browser-controller`（systemd 单元里写死了这两个路径，换路径需同步改）。
-
-**1) 拷贝工具链**
-
-```bash
-sudo mkdir -p /opt/gw2a-cookie-sync /opt/gw2a-browser-controller
-sudo cp -r tools/cookie-sync/*        /opt/gw2a-cookie-sync/
-sudo cp    tools/browser-controller/* /opt/gw2a-browser-controller/
-sudo chmod +x /opt/gw2a-browser-controller/controller.js
-```
-
-**2) 装 Python 依赖**
-
-```bash
-python3 -m venv /opt/gw2a-cookie-sync/venv
-/opt/gw2a-cookie-sync/venv/bin/pip install websocket-client
-```
-
-**3) 建状态目录**
-
-```bash
-sudo mkdir -p /var/lib/gw2a-cookie-sync
-```
-
-**4) 改 systemd 单元里的占位符**
-
-`deploy/systemd/*.service` 里有三处必须改：
-
-| 占位符 | 改成 |
+| 模型 | 描述 |
 |---|---|
-| `CHANGE_ME_ADMIN_TOKEN` | 与 gemini-web2api 的 `ADMIN_TOKEN` 一致 |
-| `http://127.0.0.1:7890` | 你的出口代理地址（不用代理就删掉这行） |
-| `/vol2/@appdata/gw2a-browser/profiles` | 你存放 Chromium profile 的目录 |
+| `gemini-3.6-flash` | 全方位，默认 |
+| `gemini-3.5-flash-lite` | 极速、轻量 |
+| `gemini-3.1-pro` | 最强，**要配 cookie**；每次回答都带思考链 |
+| `gemini-3.8-flash` | 新款 Flash，**要付费 Gemini 账号的 cookie**（免费号降级成 3.5 Flash-Lite）。`gemini-3.7-flash` 是它的别名——Google 把 3.7 那个 hex 原地升成了 3.8 |
+| `gemini-3.6-flash-thinking` | 3.6 Flash 开扩展思考，**要配 cookie** |
+| `gemini-3.5-flash-lite-thinking` | 3.5 Flash-Lite 开扩展思考，**要配 cookie** |
+| `gemini-3.1-pro-thinking` | 3.1 Pro 开扩展思考，**要配 cookie** |
+| `gemini-3.8-flash-thinking` | 3.8 Flash 开扩展思考，**要付费号 cookie**（`gemini-3.7-flash-thinking` 为别名）|
+| `gemini-image` | 生图（Nano Banana），产物 base64，**要配 cookie** |
+| `gemini-music` | 音乐（Lyria，约 30 秒），产物 base64，**要配 cookie** |
+| `gemini-canvas` | 画布，生成交互 HTML 文档（内联返回 ```html 块），**要配 cookie** |
+| `gemini-video` | 生视频（异步，几十秒~几分钟），产物 base64 MP4，**要 Pro/付费号**；免费号被上游内容政策拒 |
 
-`gw2a-xkasmvnc.service` 与 `gw2a-vnc-proxy.service` 只在用「VNC 桌面人工登录」时才需要，且里面的 Chromium 路径要按你的系统改。
+没配 cookie 时 `/v1/models` 只返回前两个，选 `gemini-3.1-pro` 会直接报错并说明
+原因。因为匿名请求它必然被静默降级成 3.5 Flash-Lite——与其让客户端拿到一个
+"成功但其实不是 Pro"的回复，不如在选型时就失败。
 
-**5) 安装并启动**
+配了有效 cookie 时它是**真的 Pro**：连打 6 次服务端回报的都是 `3.1 Pro` 本身。
 
-```bash
-sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
-sudo systemctl daemon-reload
+三个 `-thinking` 是网页 UI 上「扩展思考」的开关，跟模型正交——三个模型都能开，
+不是三个额外的模型。服务端回报的名字会带 `Extended`（如 `3.6 Flash Extended`），
+思考链明显变长（实测 2467 / 1059 / 583 字符，对应普通版 0 / 0 / 268）。
+**只在登录态生效**：匿名请求带上这个开关会被服务端静默忽略，所以没 cookie 时不暴露。
 
-sudo systemctl enable --now gw2a-xkasmvnc            # VNC 桌面（如需人工登录）
-sudo systemctl enable --now gw2a-browser-controller  # Chromium 控制器
-sudo systemctl enable --now gw2a-cookie-queue        # 队列守护（30min 定时 + 502 触发）
-sudo systemctl enable --now gw2a-cookie-watchdog.timer
+只暴露这三个基础模型。旧的 `gemini-3.5-flash`、`gemini-3.5-flash-thinking`、
+`gemini-3.5-flash-thinking-lite`、`gemini-auto`、`gemini-flash-lite` **已移除**
+（传了会返回 400）——它们在服务端没有对应条目，留着只会让人以为有五种不同
+的模型可选。
+
+> **`@think=N` 已废弃。** 该后缀写进请求的 `inner[17]`，一直被当作"思考深度"，
+> 但抓包证明它是**会话内的轮次索引**（首轮 `[[0]]`，带会话 id 的第二轮 `[[1]]`，
+> 逐轮递增），跟思考深度无关。我们每次都开新会话，该值恒为 0，所以这个参数
+> 从来没有生效过。后缀仍被接受但直接忽略，不影响路由。
+
+### 思考链（reasoning_content）
+
+`gemini-3.1-pro` 每次回答前会先输出一段自己的推理过程，本项目把它按事实标准的
+`reasoning_content` 字段暴露出来，newapi、Cherry Studio、ChatBox 等客户端会渲染成
+可折叠的「思考过程」。另外两个模型不产出思考链，此时不会出现这个字段。
+
+非流式：
+
+```json
+{"choices":[{"message":{
+  "role":"assistant",
+  "content":"The core rule of this classic puzzle is...",
+  "reasoning_content":"**Defining the Constraints**
+
+I've successfully defined..."
+}}],
+ "usage":{"prompt_tokens":26,"completion_tokens":337,"reasoning_tokens":77,"total_tokens":363}}
 ```
 
-`gw2a-cookie-refresh.timer` 是独立的 30 分钟兜底定时器。队列守护已在做同样的事，**二者留一个即可**，避免重复抓取：
+流式按 `delta.reasoning_content` 推，且**思考块全部推完才开始推正文**（上游就是这个
+顺序），客户端观感跟网页端一致。
+
+`reasoning_tokens` **单独计数、不含在 `completion_tokens` 里**：思考链默认被客户端
+折叠不展示，算进去等于让用户为看不见的输出买单（下游 newapi 按 `completion_tokens`
+计费）。要计费的自己把两者相加。
+
+### 已知的能力边界
+
+匿名调用（不挂 cookie）只能拿到上面两个文本模型 + Gemini 自带的联网搜索。
+`gemini-3.1-pro` 匿名时被静默降级成 3.5 Flash-Lite，所以干脆不暴露。
+
+挂上 cookie 额外解锁：`gemini-3.1-pro`、**三个模型的扩展思考版**、**读图 / 读视频**、
+**更长的上下文**（超长对话自动转成文本附件发，见下文），以及 **生图（`gemini-image`）**、
+**音乐（`gemini-music`）**、**画布（`gemini-canvas`）**、**生视频（`gemini-video`，要 Pro 号）**。
+
+深度研究仍**未实现**（多步异步流程）。管理面板的「实际模型」列会把服务端实际用了哪个
+模型标出来，降级一眼可见。
+
+### 生图 / 音乐
+
+`gemini-image`（Nano Banana）和 `gemini-music`（Lyria，约 30 秒）跟普通对话一样走
+`/v1/chat/completions`，user 消息里写要画什么 / 要什么曲子。产物字节以 **base64
+data URL** 放进返回的 `content`：图片是 `![image](data:image/png;base64,…)`、音频是
+`[audio](data:audio/mpeg;base64,…)`。支持 markdown 的客户端能直接把图渲染出来；要存
+文件就 decode 逗号后面那段 base64。
 
 ```bash
-sudo systemctl disable --now gw2a-cookie-refresh.timer   # 用队列守护时执行这行
+curl http://127.0.0.1:8083/v1/chat/completions \
+  -H "Authorization: Bearer sk-gemini-..." -H "Content-Type: application/json" \
+  -d '{"model":"gemini-image","messages":[{"role":"user","content":"画一只戴宇航员头盔的橘猫"}]}'
 ```
 
-**6) 首次登录 Google**
+不转外链是有意的——Gemini 的产物链要带 cookie 才下得到，直接把链给客户端它打不开，
+所以服务端下回字节再转 base64。产物的 base64 **不计进 `completion_tokens`**（否则一张图
+上百万 token，下游按它计费就离谱了），只算模型附带的说明文字。都要登录态，没 cookie
+时这俩模型不进 `/v1/models`。参数如 `size` / `n` 上游没有对应旋钮，传了会被忽略。
 
-```bash
-# 打开 Chromium 登录页
-/opt/gw2a-cookie-sync/venv/bin/python /opt/gw2a-cookie-sync/gw2a-sync.py open acct1
+**多轮上下文是靠把 `messages` 拼成单个 prompt 实现的**（网页协议的原生多轮要一个
+浏览器 JS 运行时才能生成的令牌，纯 HTTP 造不出来）。代价是每轮重发全部历史，于是撞上
+单次输入的长度墙：**约 13 万 UTF-8 字节**，超了上游**从尾部静默截断且不报错**——而最新
+消息拼在末尾，被吃掉的正是你刚问的那句，表现像"模型突然变笨"。
 
-# 用浏览器访问 VNC 桌面，在桌面上完成 Google 登录
-#   http://<你的NAS地址>:16100/
+挂 cookie 时超长对话会自动转成 `message.txt` 附件发上去，绕开请求体那堵墙；**但附件
+另有一堵墙**：模型能看到的内容合计约 **16 万字节**，超出部分传上去了也读不到（实测总量
+固定、只挪暗号偏移：157,833 处读得到、163,371 处读不到；切成多份附件不涨额度）。
+所以挂 cookie 把可用长度从 13 万提到约 16 万，**真正的长对话仍需客户端自己压缩**。
+没挂 cookie 时直接返回 400 `context_length_exceeded`，不静默丢数据。
+
+## 配置
+
+配置只有两个地方，按"改了要不要重启"分：
+
+### 运行时配置 → 管理面板「设置」页
+
+保存**立刻生效**，不用重启。存在数据库里，优先级高于 `config.json` 和命令行参数。
+
+| 项 | 说明 |
+|---|---|
+| 默认模型 | 客户端没传 `model` 时用哪个 |
+| 每 slot 并发 / RPM / RPH | 限流额度，0 = 不限 |
+| Prompt 字节上限 | 超了：挂 cookie 时转成文本附件发（可用长度到约 16 万字节），没挂时返回 400 `context_length_exceeded`。都不静默截断。按 UTF-8 字节算（上游的墙跟 token 无关），默认 128000。0 = 不限 |
+| 多轮（`multi_turn`） | 默认关。开启后走 Gemini 原生 conversation_id 服务端续接——客户端每轮重发全历史，服务端识别续接后只发最新一句、历史留服务端，长会话不再撞单请求字节墙。登录/匿名都可用。**注意**：不放大模型上下文窗口，超窗的早期内容仍会被挤出，解决的是"长对话不撞墙 + 保住最近上下文"，不是"喂超长文档"。 |
+| 自动删会话（`auto_delete_conversation`） | 默认关。开启后每次出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录账号里堆一堆。只登录态生效，异步 best-effort、删失败不影响响应。 |
+| 匿名优先（`anon_first`） | 默认关。开启后不需要登录态能力的请求（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号。 |
+| 重试次数 / 重试间隔 / 上游超时 | |
+| 明细保留天数 | 过期只删明细，聚合数据永久保留 |
+| TLS 指纹 | `chrome_146`（默认）/ `chrome_144` / `chrome_133` / `firefox_147` / `safari_16_0` / `safari_ios_17_0` |
+| Gemini `bl` 版本 | 上游前端版本号，过期时改这里 |
+| 打印请求日志 | |
+
+所有值都在后端做范围校验（比如 `retry_attempts` 只接受 1-10、超时 5-600 秒），
+非法值会被拒绝并说明原因——浏览器端的限制随手就能绕过，真正的关卡在服务端。
+
+### 凭证 → 也在面板
+
+| 项 | 说明 |
+|---|---|
+| API Key | 首次启动自动生成，面板里可轮换或自定义 |
+| Google Cookie | 面板「设置」页直接粘贴，保存即生效。挂上之后 `gemini-3.1-pro` 才会出现在模型列表里 |
+
+两者都存在数据库里。已保存的值不回显（cookie 只显示识别到几个、关键项齐不齐）。
+
+### 部署期配置 → `docker-compose.yml`
+
+只剩改了必须重启进程的：
+
+| 项 | 位置 |
+|---|---|
+| 监听端口 | `ports` + `command: --port` |
+| 数据库路径 | `volumes` + `command: --db` |
+| `ADMIN_TOKEN` | `environment`，面板登录 token |
+
+`API_KEY` 环境变量会锁死 API key（面板改不了），用于不希望运行时被改的部署。
+
+`--proxy` 和 `--cookie-file` 是**播种参数**，不是第二套配置：启动时把值导入代理池 /
+Cookie 池（按 URL、cookie 内容去重），之后一律从面板管理。改了重启即生效。
+
+命令行参数仍然可用，定位是本地调试时的临时覆盖。优先级：
+**面板改动 > CLI flag / `config.json` > 内置默认**。
+
+不用 Docker 直接跑二进制时，可以把 `config.example.json` 复制成 `config.json` 当启动模板
+（不传 `--config` 时会自动找当前目录的 `config.json`，其次
+`$HOME/.config/gemini-web2api/config.json`）。里面的调优项面板改了就以面板为准，
+`config.json` 只决定第一次启动的初值。
+
+命令行参数全集：
+
+| flag | 说明 |
+|---|---|
+| `--port` | 监听端口，默认 8083 |
+| `--config` | 指定 `config.json` 路径 |
+| `--db` | SQLite 路径，默认 `./data/gemini.db` |
+| `--admin-token` | 面板登录 token，留空 = 面板不鉴权（只有绑 127.0.0.1 才可接受） |
+| `--api-key` | 锁定 `/v1/*` 的 key（面板改不了），等价于 `API_KEY` 环境变量 |
+| `--cookie-file` | 启动时把文件里的 cookie 导入 Cookie 池 |
+| `--proxy` | 启动时把这个代理导入代理池 |
+| `--impersonate` | TLS 指纹档位 |
+| `--version` | 打印版本退出（Docker healthcheck 用的就是它） |
+
+## Cookie（可选）
+
+挂 Google 账号 cookie 后请求走登录态，多出来的能力是 **`gemini-3.1-pro` + 思考链**
+（见上文「思考链」一节）、**读图 / 读视频**、**生图（`gemini-image`）/ 音乐（`gemini-music`）
+/ 画布（`gemini-canvas`）/ 生视频（`gemini-video`，要 Pro 号）**。免费账号实测可用，
+连打 6 次全部回报 `3.1 Pro`。
+
+深度研究（多步异步）仍**未实现**。
+
+> 带 cookie 的请求必须额外携带一个 XSRF token，本项目会自动从 Gemini 页面取并按
+> cookie 缓存、过期自动重取，无需配置。（这一步缺了会导致**所有**请求 400，
+> 匿名反而不受影响——早期版本踩过这个坑。）
+
+1. 浏览器登录 [gemini.google.com](https://gemini.google.com)
+2. DevTools (F12) → Application → Cookies → `https://gemini.google.com`
+3. 复制：`SID` / `HSID` / `SSID` / `APISID` / `SAPISID` / `__Secure-1PSID` / `__Secure-1PSIDTS`
+4. 粘进面板「Cookie 池 → 添加账号」；或写成 `cookie.txt` 后启动加
+   `--cookie-file cookie.txt`（启动时导入池子，之后从面板管理）：
+```
+SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...; __Secure-1PSIDTS=...
 ```
 
-**7) 安装扩展**
+JSON 形式 `{"cookie": "SID=...; ...", "sapisid": "..."}` 也吃。带 `SAPISID` 的请求会自动
+算 `SAPISIDHASH` 授权头，所以这一项不能少。
 
-```bash
-python3 /opt/gw2a-cookie-sync/install_ext.py \
-        /opt/gw2a-cookie-sync/ext-src \
-        --root /opt/gw2a-cookie-sync/ext
-sudo systemctl restart gw2a-browser-controller
-```
+**cookie 只有「Cookie 池」这一个入口**：每个请求按最久未用优先挑一个 enabled 账号，
+挑中即推进轮转。池子里有 enabled 账号，`gemini-3.1-pro` 就会出现在模型列表里。
 
-> 首次运行 `install_ext.py` 会生成扩展私钥 `ext/gw2a-ext.pem` 并固定扩展 ID。
-> **这个私钥不要提交、不要外发**，丢了扩展 ID 会变，systemd 里的 `GW2A_EXT_ID` 要同步改。
+账号的「失败次数 / 最近成功」会随请求自动更新。判据是**只把 401/403 算作 cookie 的错**：
+网络错误、代理失败、被 Google 拦（302）一律不计——住宅代理的出口退化率很高，把这些算
+进去会让失败次数变成代理噪音，好 cookie 反而被记成失败最多的那个。
 
-**8) 验证**
+注意「最近成功」只说明这个 cookie 参与的请求成功过，**不等于 cookie 仍然有效**：cookie
+过期后 Gemini 不报错，只是把你当匿名用户。要确认有效性点列表里的「检测」按钮，它区分
+"登录态有效"和"过期/无效"，不用发一次真实对话去试。
 
-```bash
-P=/opt/gw2a-cookie-sync/venv/bin/python
-S=/opt/gw2a-cookie-sync/gw2a-sync.py
+**cookie 会自动续期，不用你操心**。两件事一起做：
 
-$P $S state acct1      # 期望 logged_in: true, lastSyncOk: true
-$P $S sync acct1       # 立刻抓一次 cookie 入池
-$P $S pool             # 看池里 browser 来源的账号
-curl -s http://127.0.0.1:9280/cookie-pool
-journalctl -u gw2a-cookie-queue -f
-```
+- 上游几乎每个响应都会刷新 `SIDCC` / `__Secure-1PSIDCC` / `__Secure-3PSIDCC`，我们收下并写回账号。
+- 每 10 分钟（启动后 15 秒先刷一次）往 `accounts.google.com/RotateCookies` 打保活：
+  先用哨兵 payload 换发 `__Secure-1PSIDTS`（约 30 分钟过期的那张票，不刷就会被当匿名），
+  再走浏览器 iframe 那条刷 SIDCC。同一账号 60 秒内不重复打，避免 429。
 
-### 部署图片生成插件（可选）
+> **请用 Firefox 导出 cookie。** Chrome 新版本开了 Device Bound Session Credentials，
+> 导出的会话绑在这台设备上，`*PSIDTS` 续不了，大概半小时到几小时就死。Firefox 没有
+> 这层绑定，同一套保活可以一直续。用 Chrome 的话：开一个全新的隐私窗口登录、立刻导出、
+> **马上关掉那个窗口**，不要让浏览器自己再去轮转同一份会话。
 
-```bash
-cd tools/image-gen
-docker compose up -d          # 监听 :4010
-```
+**每个账号会粘住自己的出口**。cookie 池和代理池如果各自独立轮转，同一个 Google 账号会
+从几十个不同 IP 发出请求，这在 Google 眼里是账号共享的典型特征。账号首次用到哪个出口就
+绑定下来，出口不可用了才换。
 
-访问 `http://<host>:4010/image-gen.html`。它把非插件请求反代到 `new-api:3000`，所以需要先有名为 `new-api_new-api-network` 的 docker 网络（已在 compose 里声明为 external）。
+**一个号挂了会自动换下一个**，不让整个请求陪葬——否则池子越大越容易踩雷。
 
----
+## 代理池（白嫖路线核心）
 
-## 关键环境变量
+**为什么需要**：单 IP 突发地打到一定次数就会被重定向到 `google.com/sorry/index`。
+这个次数是 **80-180**，跨度很大，由**连接策略、出口质量和请求节奏**共同决定：
 
-### 控制器 `controller.js`
+| 出口 | 连接策略 | 并发 | 节奏 | 被拦时的成功次数 |
+|---|---|---|---|---|
+| 住宅 | 复用连接池 | 10 | 无间隔 | 151 / 172 / 177 |
+| 住宅 | 复用连接池 | 3 | 无间隔 | 103 / 111 |
+| 住宅 | 每次新建连接 | 10 | 无间隔 | 106 / 109 |
+| 住宅 | 每次新建连接 | 1 | 间隔 24s | 81 / 166 |
+| 静态 | 复用连接池 | 10 | 无间隔 | 188 |
+| 静态 | 复用连接池 | 1 | **10 次/分钟** | **800 次没被拦** |
 
-| 变量 | 默认值 | 说明 |
+判据只认 302 → `/sorry/`，出口都预筛过。
+
+**连接复用值约 60%**：并发钉死 10、两臂同时起跑、全程只跑 80 秒（短到出口来不及
+漂移），复用连接 172/177，每次新建 106/109。
+
+**平缓节奏比什么都管用**：同一个静态 IP，突发打在 188 次被拦，改成 10 次/分钟连打
+**800 次、跨 110 分钟一次没被拦**。所以默认 `per_ip_rph=80` 是很保守的下沿，
+明确按低速率跑的部署可以调高很多。
+
+> 早前这里写「放慢节奏没用」，判据是住宅出口上突发档 103-177 与慢速档 81-166 几乎
+> 完全重叠。那个观察没错，但归因错了：住宅出口跑久了自己会退化（8 个预筛干净的
+> 出口跑慢节奏，6 个中途失败率超 40%），退化盖过了节奏的影响。换静态 IP 排除掉
+> 这个混淆项之后，节奏的作用非常明显。
+
+**代理失败会提前消耗额度**：链路越脏上限来得越早，因为那些"失败"的请求有一部分其实
+已经到达 Google 并被计数（慢速档实际发出 195 次才换到 166 次成功，真实消耗高 17%）。
+别指望靠重试失败请求多榨产能。
+
+**被拦之后是硬拦，约两小时自动恢复。** 两次独立复测各探测 30 次、间隔 20s、
+跨约 10 分钟，合计 60 次零成功；继续探测到 **106-121 分钟**之间恢复正常。
+代理池的熔断冷却默认取 120 分钟就是照这个来的。
+
+对照：10 个 IP 各打 50 次（418 请求）零次 Google 拒绝。默认 `per_ip_rph=80` 落在突发
+档实测区间的下沿。
+
+**怎么解决**：在管理面板「代理池」页面加多个代理，**每个代理是一个独立的 IP slot**，享有独立的并发/RPM/RPH 配额。N 个代理 = N 倍总容量。
+
+支持的代理协议：
+- `http://user:pass@host:port`
+- `https://user:pass@host:port`
+- `socks5://user:pass@host:port`
+- `socks5h://user:pass@host:port`（远程 DNS 解析，绕开本地 DNS 污染）
+
+**自动调度规则**：
+- 配了代理后，**不会再退回直连**（避免代理满了把主机 IP 也打爆）
+- 失败 5 次自动熔断（管理面板可手动重置）
+- 全部代理满 → 返回 HTTP 429（不消耗 Google 配额，等空位再重试）
+
+**不读 `HTTPS_PROXY` / `ALL_PROXY` 环境变量。** 代理只从代理池里取
+（`--proxy` / `config.json` 只是启动时往池子里播种）——否则宿主机上一个随手 export 的变量会悄悄改变
+出口 IP，而面板显示的还是直连，排查时会误判。
+
+## 指纹模拟
+
+直连场景（无代理）走 [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client)，TLS 握手 + HTTP/2 SETTINGS 帧 + ALPS 全部对齐真实 Chrome 146。Google 风控视角下，跟真浏览器无法区分。
+
+走代理场景换用 stdlib `net/http` + `http.ProxyURL`（兼容性最佳），但应用层 header（`Sec-CH-UA` / `Sec-Fetch-*` / `User-Agent`）仍按 Chrome 146 真实值伪装。
+
+**注意走代理时 TLS 指纹是我们自己的，不是出口节点的。** HTTP CONNECT 只建隧道，TLS
+是我们跟 Google 端到端握的——JA3 回显实测：同一代理下 stdlib 和 tls-client 的 JA3
+不同（代理没改写），而 stdlib 直连和过代理的 JA3 完全相同（代理层不介入 TLS）。所以
+**配了代理，暴露给 Google 的就是 Go 标准库的指纹而不是 Chrome 146 的**。
+
+但这不影响封禁阈值：同时起跑的对照里 tls-client Chrome_146 打到 111 次、Go stdlib
+103 次，差 8 次，而同配置下出口之间的方差能到 36%（151 vs 111）。想让代理路径也走
+Chrome 指纹得有别的理由（比如担心长期账号画像），不能指望换来产能。
+
+**实测意外**：朴素 SDK 调用（如 Python urllib）触发风控时拿到 **HTTP 429**；伪装成 Chrome 后触发风控拿到 **HTTP 302** 跳转到 `google.com/sorry/index`（CAPTCHA 验证页）。两者本质都是 IP 黑名单，但 302 证明 Google 真的把我们认成了浏览器。
+
+## 隐私
+
+- **Prompt 和 response 内容永不入库**——只存元数据：模型、代理 ID、延迟、token 数、状态码、错误类型
+- 历史 `prompt_preview` / `response_preview` 列从老版本迁移时自动 DROP
+- Token 数用 [tiktoken-go](https://github.com/pkoukk/tiktoken-go) cl100k_base BPE 分词器精确计算（中英文都准），不是 `len/4` 估算
+- Gemini 网页端不返回真 token 数（实测响应里没有任何 token/usage 字段，只能本地估算）
+
+## OpenAI 协议覆盖
+
+| 路径 | 状态 | 备注 |
 |---|---|---|
-| `GW2A_CTRL_PORT` | `9280` | 控制器监听端口 |
-| `GW2A_PROFILE_BASE` | `/vol2/@appdata/gw2a-browser/profiles` | Chromium profile 根目录 |
-| `GW2A_CDP_BASE` | `9300` | CDP 调试端口起始值 |
-| `GW2A_DISPLAY` | `:13` | X display |
-| `GW2A_RUN_USER` | `fygo-browser` | 跑 Chromium 的用户（Chromium 拒绝 root） |
-| `GW2A_BROWSER_PROXY` | 空 | 浏览器出口代理，**必须与 cookie 池一致** |
-| `GW2A_BROWSER_PROXY_ID` | 空 | 手动指定代理表里的 id，跳过自动匹配 |
-| `GW2A_ADMIN_TOKEN` | 空 | gemini-web2api 的面板 token |
-| `GW2A_EXT_ID` | 内置 | 扩展 ID |
+| `POST /v1/chat/completions` | ✅ | 真流式：上游每出一帧就转发增量（实测 400 字中文回答产生 40 个 chunk）。chunk 序列为 `delta{role}` → `delta{content}`×N → 空 `delta`+`finish_reason` → `[DONE]`。**带 `tools` 时退化为收完再发**——tool_call 块要完整文本才能解析 |
+| `POST /v1/responses` | ✅ | OpenAI Responses API（Codex CLI 用）。**未做真流式**，仍是收完再按事件序列发 |
+| `GET /v1/models` | ✅ | 匿名 2 个，挂了 cookie 才出第 3 个 |
+| `GET /` | ✅ | 健康检查，不鉴权，返回 status/version/models |
+| `/v1beta/models/…`（Gemini CLI 原生格式） | ❌ | 未实现，只暴露 OpenAI 形状的接口 |
+| `/v1/embeddings`、`/v1/images/*`、`/v1/audio/*` | ❌ | 未实现，返回 404 |
+| Function calling | ⚠️ | Prompt 级实现（让模型输出 ` ```tool_call``` ` 块再 regex 解析），不是真协议层。**查私有数据/内部系统类可靠**，但 Gemini 自己能做的（如查天气）会被它直接回答，有副作用的动作（如发邮件）会被拒绝。**agentic 客户端（Codex 等）已可用**：4.11.0 前它们几十 KB 的系统提示会把工具指令冲没导致「已读乱回」，现已修复；4.12.0 起工具结果压成清爽成功/失败信号，弱模型不再因「命令无输出」误判失败而反复重试（实测同一任务从 26 轮循环降到 2-4 轮收尾）|
+| `tool_choice` | ⚠️ | `none` 完全不注入工具定义；`required` 和指定函数会加强制措辞、并把其余工具从 prompt 裁掉。但 prompt 级实现**无法真正强制**——实测模型自己答得上来的问题（天气、2+2）即使 `required` 也照样直接作答 |
+| `stream_options.include_usage` | ✅ | 在 `finish_reason` 之后补一个 `choices` 为空的 usage chunk |
+| `usage` token 数 | ✅ | tiktoken cl100k_base，与管理面板 requests 表同口径 |
+| `n` > 1 | ❌ | 返回 400。上游只给一个候选，静默按 1 处理会让客户端少拿结果 |
+| 采样参数 | ➖ | `temperature` / `top_p` / `max_tokens` / `stop` / `seed` / `presence_penalty` / `frequency_penalty` **收下即忽略，不报错**。Gemini 网页协议没有这些旋钮 |
+| `response_format` / `logprobs` | ➖ | 未实现，收下即忽略 |
+| Vision / 图片输入 | ⚠️ | **挂 cookie 时可用**：`image_url`（chat）和 `input_image`（responses）都认，支持 `data:` URL 和 http(s) 链接，单张 12MB 封顶。匿名态返回 400——匿名**能**把图传上去（`content-push.googleapis.com/upload/` 两步 resumable），但对话里引用被上游拒绝（`BardErrorInfo 1100`） |
+| Audio | ❌ | 传 `input_audio` 返回 400。网页端有音乐生成（Lyria 3），需要登录态 |
 
-### Cookie 工具链
+## 项目结构
 
-| 变量 | 默认值 | 说明 |
+```
+main.go                    只有一句 app.Run()；入口留在根目录，`go build .` 直接可用
+internal/app/              全部实现
+  app.go                   flag 解析 + 路由注册 + 启动
+  config.go                配置加载 + 默认值
+  client.go                tls-client (chrome146) + stdlib (走代理) 双 client
+  gemini.go                模型表 + 80 槽 payload + 模型 header + StreamGenerate + wrb.fr 解析
+  xsrf.go                  带 cookie 时必需的 XSRF token：抓取 + 按 cookie 缓存 + 过期自愈
+  messages.go              OpenAI messages → prompt，tool_call 解析
+  server.go                /v1/* + 限流入口 + 参数校验 + metrics 写入
+  sse.go                   SSE 写出器（懒发 header，失败仍能返回 502 JSON）
+  ratelimit.go             每 IP slot 独立并发 / RPM / RPH 限流
+  tokenizer.go             tiktoken cl100k_base 单例
+  apikey.go                API key（启动参数锁定 / 面板可轮换 双轨）
+  db.go                    SQLite schema：sessions / requests / accounts / kv
+  proxy.go                 代理池 CRUD + 容量调度 + 熔断
+  cookie_pool.go           Cookie 池数据层（CRUD + 最久未用优先挑选 + 健康度回写 + 刷新项合并）
+  rotate.go                会话保活（RotateCookies：1PSIDTS 哨兵 + SIDCC iframe，间隔由服务端指定）
+  upload.go                附件上传（content-push 两步 resumable）
+  context_file.go          超长对话转文本附件
+  vision.go                图片输入：data: URL / http(s) 链接 → 待上传附件
+  bl.go                    上游前端版本号 bl 自动跟随
+  scheduler.go             小时/天聚合 + 过期明细清理
+  runtime.go               运行时配置快照（面板改完即时生效）
+  admin.go                 /admin/api/* 鉴权 + REST
+  admin_cookies.go         Cookie 池的 admin REST（返回前脱敏）
+  admin_ui.go              embed admin_ui/
+  admin_ui/                管理面板前端（单页 + Chart.js，随二进制打包，不走 CDN）
+  gemini_test.go           协议层单测：payload 槽位、wrb.fr 解析、模型门控、限流
+Dockerfile                 多阶段构建（alpine builder → distroless runtime）
+docker-compose.yml         单容器，默认拉 ghcr 镜像，sqlite 挂 volume
+.github/workflows/         docker.yml 推镜像 / release.yml 打 tag 发二进制
+```
+
+## 限制
+
+- **单 IP 上限**：突发地打，实测 **80-180 次请求**后被重定向到 sorry 页（连接复用能多打约 60%：并发 10 时复用 172/177、每次新建 106/109）。但**平缓打几乎打不满**——静态 IP 上 10 次/分钟连打 800 次没被拦。默认 `per_ip_rph=80` 取的是区间下沿 → 要放大产能配代理池，或按低速率跑并调高限额
+- **登录态功能**：生图（`gemini-image`）、音乐（`gemini-music`）、画布（`gemini-canvas`）已实现；视频、深度研究没实现（视频免费号被 Google 收走，深度研究是多步异步流程）
+- **Function calling**：prompt 级实现，模型不一定每次都按格式返回（OpenAI 真协议层我们做不到）
+- **多模态**：读图/读视频要挂 cookie；生图/音乐/画布/生视频挂 cookie 可用，其中生视频还要 Pro/付费号
+- **长上下文有两堵墙**：请求体约 13 万字节、附件约 16 万字节（后者是模型能看到的内容**总量**，切成多份附件不涨额度）。挂 cookie 只能把可用长度从 13 万提到约 16 万，真正的长对话仍需客户端自己压缩
+- **token 数**：用 tiktoken 估算（Gemini 真 tokenizer 未公开），跟真值偏差 ±20% 以内
+- **Cookie 池不自动摘除坏号**：请求成败会回写（只把 401/403 算作 cookie 的错，网络错误和 302 拦截不算），但失败到一定次数不会自动禁用，得看面板手动停。另外 `last_ok_at` 只说明"这个 cookie 参与的请求成功过"，不等于它仍然有效——cookie 过期后 Gemini 不报错，只是把你当匿名用户，纯文本请求照样 200
+- **Chrome 导出的 cookie 可能续不了**：新版 Chrome 的 Device Bound Session Credentials 把会话绑在设备上，`__Secure-1PSIDTS` 换发会 401。用 Firefox 导出即可长期续命
+- **假流式的那一半**：`/v1/responses` 和带 `tools` 的 chat 请求都是收完再发，只有普通 chat 流式是真增量
+
+## 故障排查
+
+| 现象 | 多半是什么 | 怎么办 |
 |---|---|---|
-| `GW2A_PROFILE` | `acct1` | 用哪个 profile |
-| `GW2A_API` | `http://127.0.0.1:8083` | gemini-web2api 地址 |
-| `GW2A_ADMIN_TOKEN` | 空 | 面板 token |
-| `GW2A_COOLDOWN_SEC` | `60` | 刷新后的冷却窗口 |
-| `GW2A_MIN_GAP_SEC` | `30` | 两次刷新之间的最小间隔 |
-| `GW2A_MAX_REFRESH` | `3` | 一轮最多刷新几次 |
-| `GW2A_BUDGET_SEC` | `240` | 一轮总时长上限 |
-| `GW2A_SCHED_SEC` | `1800` | 定时周期（秒）= 30 分钟 |
-| `GW2A_502_THRESHOLD` | `2` | 累计几个 502 触发重抓 |
-| `GW2A_502_COOLDOWN_SEC` | `60` | 502 触发后的防抖冷却 |
-| `GW2A_KEEPALIVE_MAX_SEC` | `900` | 保活超过多久补一次（看门狗） |
-| `GW2A_SYNC_MAX_SEC` | `2100` | 入池超过多久补一次（看门狗） |
-| `GW2A_DB` | 见 `queue_daemon.py` | SQLite 路径 |
+| 我们返回 **429** | 所有 IP slot 的并发/RPM/RPH 都占满了，**不是 Google 拒绝**，没消耗上游配额 | 加代理，或在「设置」页调高限额 |
+| 面板诊断显示 **302 → `google.com/sorry/index`** | 这个出口 IP 被 Google 拦了（80-180 次请求后，取决于连接策略和出口质量） | 换出口/加代理。**是硬拦不是概率性**（被拦后 60 次探测零成功），原地重试没有意义 |
+| 偶发空响应、面板记为上游拒绝 | 上游瞬时拒绝（`1155`），没有可预测阈值，跟频率/并发/累积次数都无关 | 重发一次通常就好。**降 RPM 解决不了**，实测跟频率无关 |
+| 请求全部超时 | 本机到 `gemini.google.com` 不通 | 配代理（面板「代理池」或 `--proxy`）。注意**不读 `HTTPS_PROXY` 环境变量** |
+| 启动即退出，报 `unable to open database file (14)` | 容器以 nonroot(uid 65532) 运行，而 bind mount 的宿主目录属主是 root，写不进去 | 改用具名卷（compose 默认已是），或 `sudo chown -R 65532:65532 ./data` |
+| 选 `gemini-3.1-pro` 直接报错 | 没配 cookie 时它不暴露，这是故意的 | 挂 cookie（面板「设置」或「Cookie 池」）后即可用 |
+| 挂了 cookie 后请求全部 502 | cookie 已失效，取不到 XSRF token | 重新导出 cookie。判据：请求 `gemini-3.1-pro` 若回报 3.5 Flash-Lite 就是失效了 |
+| cookie 大约半小时就失效，保活没用 | Chrome 设备绑定会话，`__Secure-1PSIDTS` 换发 401 | 用 **Firefox** 重新登录再导出；点面板「保活」应能看到刷新了 `__Secure-1PSIDTS` |
+| 面板打不开 / 401 | `--admin-token`（或 `ADMIN_TOKEN`）没对上 | token 留空则不鉴权，只有绑 127.0.0.1 时才可接受 |
 
----
+Docker 用默认 bridge 网络时上游可能返回空内容（Google 拒绝某些 NAT 段）。本项目**没有复现过**，真遇到可以试 `network_mode: host` 验证是不是这个原因。
 
-## 常见问题
+## 致谢
 
-**Q：日志里 `logged_in: false`，一直抓不到 cookie。**
+- [bogdanfinn/tls-client](https://github.com/bogdanfinn/tls-client) — Chrome 真指纹 TLS 库
+- [pkoukk/tiktoken-go](https://github.com/pkoukk/tiktoken-go) — BPE tokenizer
+- [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) — 纯 Go SQLite（CGO-free，alpine 直接编）
 
-按顺序检查：
+## License
 
-1. VNC 桌面里的 Chromium 是否真的登录了 Google —— 打开 `gemini.google.com/app` 应该直接进对话页，而不是登录页。
-2. 扩展是否装上 —— `curl -s http://127.0.0.1:9280/extension-id` 应该返回扩展 ID。
-3. 出口 IP 是否一致 —— 浏览器和 cookie 池必须走同一个出口。NAS 双栈时 v4/v6 出口不一致，直连会被 Google 判定可疑。
-4. 扩展 ID 是否与 systemd 里的 `GW2A_EXT_ID` 一致 —— 重装扩展会换 ID。
+MIT — 详见 [LICENSE](LICENSE)
 
-**Q：web 明明登录着，但抓到的 cookie 一直报 502 / 重定向登录页？**
+## 友情链接
 
-多半是 `__Secure-1PSIDTS` 这张**有寿命的票**过期了（约 10~20 分钟）：
-过期后 `/app` 会返回「匿名单页」（HTTP 200 但无 `SNlM0e`），表现和 cookie 真失效
-一模一样。项目已内置三层自愈（续票 → 浏览器刷新 → 不累加 `fail_count`），
-正常情况下无需人工干预。详见上一节「4b. 会话票过期自愈」。
+- [Sophomoresty/gemini-web2api](https://github.com/Sophomoresty/gemini-web2api) —— 同类的 Python 实现，早期摸 Gemini 网页协议时借鉴过它的思路
+- [LINUX DO](https://linux.do) —— 本项目在该社区分享
 
-若长时间不恢复，按顺序排查：
+[![LinuxDo](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LinuxDo-blue?style=for-the-badge)](https://linux.do/)
 
-1. VNC 打开 Chromium，确认 `gemini.google.com/app` 里确实是已登录状态；
-2. `docker logs --tail 50 gemini-web2api | grep -E 'rotate|renew|browser'`
-   看保活是否在按 ~300s 周期刷新 `__Secure-1PSIDTS`；
-3. 手动触发一次检测自愈：
-
-```bash
-curl -s -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" \
-  http://127.0.0.1:8083/admin/api/cookies/<id>/check
-```
-
-
-**Q：所有请求 502。**
-
-先看代理是否通：
-
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' -x http://<你的代理> https://gemini.google.com/
-```
-
-代理挂了就修代理 —— 这是最常见的 502 原因。修复后队列守护会在 2×502 时自动重抓，无需手动干预。
-
-**Q：浏览器登录缓存被清掉。**
-
-不要用「删除 profile 目录」的方式重置。要重置请用 `setprofile.py` 或在管理面板里操作，避免误删登录态。
-
-**Q：生图请求返回 413。**
-
-图库参考图太大。本项目已在浏览器侧压缩，若仍 413，检查 nginx 的 `client_max_body_size`（`tools/image-gen/nginx.conf` 里是 100m）。
-
-**Q：CPU 占用高。**
-
-早期的实现是每次抓 cookie 都新建 Gemini 会话页，开销大且被风控。本版本改为**刷新已有页面**，CPU 占用显著下降。若仍然偏高，调大 `GW2A_SCHED_SEC`，或在不需要时停掉 `gw2a-cookie-queue`。
-
----
-
-## 安全提示
-
-- `ADMIN_TOKEN` 不要提交进仓库，用环境变量注入。systemd 单元里的 `CHANGE_ME_ADMIN_TOKEN` 是占位符。
-- 扩展私钥 `ext/gw2a-ext.pem` 由 `install_ext.py` 在你自己的机器上生成，**不要提交**。
-- Chromium profile 目录含完整 Google 登录态，**不要提交、不要外发**。
-- 控制器默认监听 `0.0.0.0:9280` 且无鉴权（可选 `GW2A_SYNC_TOKEN`）。**只在内网暴露**，不要直接映射到公网。
-- 本项目会读取你的 Google 会话 cookie 并写入本地 SQLite，请自行评估风险。
-
----
-
-## 许可证
-
-MIT License —— 详见 [LICENSE](LICENSE)。
-
-上游 `gemini-web2api-go` 同样是 MIT，其原始版权声明已在本仓库 LICENSE 中保留：
-
-```
-Copyright (c) 2026 gemini-web2api-go contributors              (上游)
-Copyright (c) 2026 gemini-web2api-go-browser-login contributors (本派生版)
-```
-
-详细的来源与改动清单见 [NOTICE.md](NOTICE.md)。
-
-再次致谢上游作者 [@zexadev](https://github.com/zexadev)。

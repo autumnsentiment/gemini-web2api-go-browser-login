@@ -166,6 +166,7 @@
        vertical-align: top; overflow-wrap: anywhere; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover { background: #F6F9FE; }
+  tbody tr.row-dead { background: var(--fail-bg); box-shadow: inset 3px 0 0 var(--fail); }
   td.nw, th.nw { white-space: nowrap; overflow-wrap: normal; }
   td.num { font-variant-numeric: tabular-nums; }
   .empty { text-align: center; color: var(--muted); padding: 36px 0; }
@@ -636,10 +637,12 @@ const pages = {
   cookies: async () => {
     const data = await api('api/cookies');
     const items = data.items || [];
+    const deadN = items.filter(a => a.health === 'dead').length;
     return `
       <div class="panel page-fill">
         <h2>Cookie 池
           <span class="controls">
+            ${deadN > 0 ? '<span class="badge fail" style="margin-right:8px" title="这些号鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">' + deadN + ' 疑似失效</span>' : ''}
             <span class="badge ${data.enabled > 0 ? 'ok' : 'muted'}" style="margin-right:8px">${data.enabled || 0} 启用 / ${data.total || 0} 共</span>
             <button class="btn" onclick="addCookieAcct()">+ 导入 Cookie</button>
           </span>
@@ -648,11 +651,12 @@ const pages = {
           <summary>每行一个 Google 登录态账号</summary>
           <div class="body">
             粘贴 gemini.google.com 下的<b>完整 cookie 串</b>（至少含 SID / HSID / SSID /
-            APISID / SAPISID / __Secure-1PSID）。请求时按<b>最久未用优先</b>自动轮转挑一个
+            APISID / SAPISID / __Secure-1PSID / __Secure-1PSIDTS）。请求时按<b>最久未用优先</b>自动轮转挑一个
             启用的账号，媒体生成有每账号 10/天 的配额，配越多号总容量越大。<br><br>
             凭证保存后<b>不再回传浏览器</b>，列表只显示脱敏摘要（cookie 数 / 关键项 /
-            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号无法长期续命，
-            会标黄提示。
+            SAPISID 末 4 位 / 失败次数）。缺 <code>__Secure-1PSIDTS</code> 的号会标黄，
+            首次保活会尝试向 Google 补发；若反复失败请用 <b>Firefox</b> 重新导出
+            （Chrome 新版本的设备绑定会话续不了）。
           </div>
         </details>
         <div class="table-scroll">
@@ -668,13 +672,18 @@ const pages = {
               <th class="nw">最近成功</th><th>最近错误</th><th class="nw">操作</th>
             </tr></thead>
             <tbody>${items.map(a => `
-              <tr>
+              <tr class="${a.health === 'dead' ? 'row-dead' : ''}">
                 <td class="num nw">${a.id}</td>
                 <td class="truncate" title="${escapeHtml(a.label || '')}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}</td>
-                <td class="nw">${a.status === 'enabled' ? '<span class="badge ok">启用</span>' : '<span class="badge muted">禁用</span>'}</td>
+                <td class="nw">${
+                  a.health === 'dead' ? '<span class="badge fail" title="鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">疑似失效</span>'
+                  : a.health === 'disabled' ? '<span class="badge muted">禁用</span>'
+                  : a.health === 'unknown' ? '<span class="badge warn" title="还没成功用过，点「检测」确认">待检测</span>'
+                  : '<span class="badge ok">正常</span>'
+                }</td>
                 <td class="nw" title="共 ${a.cookie_count} 个 cookie，关键项：${(a.key_cookies||[]).join(' / ')}">
                   <span class="badge ${a.has_1psidts ? 'ok' : 'warn'}">${(a.key_cookies||[]).length}/7 项</span>
-                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，无法长期续命">缺 TS</span>'}
+                  ${a.has_1psidts ? '' : '<span class="badge warn" title="缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出">缺 TS</span>'}
                 </td>
                 <td class="pre nw">${a.sapisid_tail ? '…' + escapeHtml(a.sapisid_tail) : '—'}</td>
                 <td class="num nw">${a.fail_count > 0 ? '<span class="badge fail">' + a.fail_count + '</span>' : 0}</td>
@@ -693,105 +702,6 @@ const pages = {
             </tbody>
           </table>
         </div>
-      </div>
-    `;
-  },
-
-  // 浏览器登录：用 Chromium(VNC) 容器里独立 profile 登录 Google/Gemini，
-  // 登录态自动抓成 cookie 写入 cookie 池，按「cookie 有效期 - 5 分钟」自动刷新（最长间隔 1 小时）。
-  browser: async () => {
-    const st = await api('api/browser/status');
-    if (!st.enabled) {
-      return `
-        <div class="panel page-fill">
-          <h2>浏览器登录</h2>
-          <div class="empty" style="padding:28px">
-            此功能未启用：需要配置 <code>BROWSER_CONTROLLER_URL</code>（例如
-            <code>http://chromium:9280</code>），让本服务能连到旁边 Chromium(VNC)
-            容器的 profile 控制器。配置后重启容器即可。<br><br>
-            <span class="muted">启用后：在这里添加「账号 profile」→ 容器会拉起一个
-            独立 Chromium 窗口并跳到 Gemini 登录页 → 点「在我的浏览器打开」在你自己浏览器里
-            完成 Google 登录 → 点「抓取」→ 登录态自动进 Cookie 池，按「有效期 - 5 分钟」自动保活刷新。</span>
-          </div>
-        </div>`;
-    }
-    const ok = st.healthy;
-    const rows = (st.profiles || []);
-    const accessUrl = (function(){
-      try { const v = (localStorage.getItem('gw2aAccessUrl') || '').trim(); if (v) return v; } catch (e) {}
-      return (st.access_url || '').trim();
-    })();
-    const rowHtml = rows.map(a => `
-      <tr>
-        <td class="nw"><span class="badge ${a.running ? 'ok' : 'muted'}">${a.running ? '运行中' : '已停止'}</span></td>
-        <td class="truncate" title="${escapeHtml(a.name)}"><b>${escapeHtml(a.name)}</b>
-          ${a.account_id ? `<div class="muted" style="font-size:12px">cookie 池 #${a.account_id}</div>` : ''}
-        </td>
-        <td class="nw num">${a.port || '—'}</td>
-        <td class="nw">${a.account_id
-            ? (a.status === 'enabled' ? '<span class="badge ok">已入池</span>' : '<span class="badge muted">已停用</span>')
-            : '<span class="badge warn">未抓取</span>'}</td>
-        <td class="pre truncate" style="max-width:220px" title="${escapeHtml(a.label || a.name)}">${escapeHtml(a.label || a.name)}</td>
-        <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
-        <td class="nw">
-          <span class="actions">
-            <button class="btn muted" onclick="browserOpenLogin('${escapeHtml(a.name)}', this)">容器内打开</button>
-            ${accessUrl ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
-            <button class="btn muted" onclick="browserFetch('${escapeHtml(a.name)}', this)">抓取 cookie</button>
-            ${a.account_id ? `<button class="btn muted" onclick="browserAccountInPool(${a.account_id})">池中账号</button>` : ''}
-            <button class="btn danger" onclick="browserDel('${escapeHtml(a.name)}', this)">删除</button>
-          </span>
-        </td>
-      </tr>`).join('') || '<tr><td colspan="7" class="empty">还没有 profile。点「+ 添加账号」开始。</td></tr>';
-
-    return `
-      <div class="panel page-fill">
-        <h2>浏览器登录（独立 Chromium profile）
-          <span class="controls">
-            <span class="badge ${ok ? 'ok' : 'fail'}">${ok ? '控制器在线' : '控制器离线'}</span>
-            <button class="btn" onclick="browserAdd()">+ 添加账号</button>
-            <button class="btn" onclick="browserRefreshAll(this)">全部刷新</button>
-          </span>
-        </h2>
-        <details class="note">
-          <summary>用法：容器发起登录 → 授权页显示在你自己浏览器 → 自动进 Cookie 池 → 按有效期自动保活</summary>
-          <div class="body">
-            每个「账号」= chromium 容器里一个<b>独立的 Chromium 窗口 + 独立登录态</b>（互相隔离）。
-            登录由容器发起（拉起窗口并导航到 Gemini），但授权页显示在<b>你自己电脑的浏览器</b>里 ——
-            通过容器桌面的网页（VNC Web）操作，无需在容器里输账号。
-            <br>① 点「+ 添加账号」填个名字 → 容器里的 Chromium 开一个专属窗口并跳到
-            <code>gemini.google.com</code> 登录页；
-            <br>② 点该行「在我的浏览器打开授权页」（首次会提示输入 VNC 账号
-            <code>user</code> / 密码），在桌面里点开该账号的 Chromium 窗口完成 Google 登录；
-            <br>③ 回到本页点「抓取 cookie」→ 登录态解析成 cookie 写进上方 Cookie 池；
-            <br>④ 之后按「cookie 有效期 - 5 分钟」自动抓一次保持新鲜（最长间隔 1 小时）；同一 profile 两次抓取至少隔 2 分钟。
-            <br><br><span class="muted">桌面网页地址（上方输入框）默认取自启动参数
-            <code>BROWSER_ACCESS_URL</code>；改完后点「保存」仅存在本浏览器，方便你在
-            <code>5666/chromium</code> 这类入口之间切换。</span>
-          </div>
-        </details>
-        <div class="row" style="margin-bottom:12px;gap:8px;align-items:center;flex-wrap:wrap">
-          <label class="muted" style="font-size:12px;white-space:nowrap">桌面网页地址：</label>
-          <input id="browserAccessUrl" type="text" value="${escapeHtml(accessUrl)}" spellcheck="false"
-                 placeholder="http://NAS_HOST:5666/chromium/  （可选，默认取 BROWSER_ACCESS_URL）"
-                 style="flex:1;min-width:220px;font-family:ui-monospace,monospace;font-size:12px" />
-          <button class="btn" onclick="openAccessUrl()">打开</button>
-          <button class="btn muted" onclick="saveAccessUrl()">保存</button>
-        </div>
-        <div class="table-scroll">
-          <table>
-            <colgroup>
-              <col style="width:80px"><col><col style="width:70px">
-              <col style="width:90px"><col style="width:180px"><col style="width:130px"><col style="width:230px">
-            </colgroup>
-            <thead><tr>
-              <th class="nw">状态</th><th>Profile</th><th class="nw">CDP 端口</th>
-              <th class="nw">Cookie 池</th><th>标签 / 账号</th><th class="nw">最近成功</th><th class="nw">操作</th>
-            </tr></thead>
-            <tbody>${rowHtml}</tbody>
-          </table>
-        </div>
-        ${st.detail ? `<div class="muted" style="margin-top:8px;font-size:12px">${escapeHtml(st.detail)}</div>` : ''}
       </div>
     `;
   },
@@ -995,6 +905,8 @@ async function loadReqs() {
 // ── 运行时配置 ───────────────────────────────────────────────────────────────
 // 字段定义跟后端 RuntimeConfig 一一对应；范围与后端 validateRuntimeConfig 一致，
 // 前端只做提示，真正的校验在后端（浏览器里的限制随便绕）。
+// 必须一一对应：saveRtCfg 只按这里的字段拼 PUT body，后端整体反序列化，漏在这里
+// 列出的 RuntimeConfig 字段每次保存都会被解成零值冲掉（multi_turn 栽过，见 #27）。
 // 按语义分组，组内自适应多列。分组的依据是"改这一项时在想什么"：
 // 调产能 / 调容错 / 调怎么发请求 / 调留多少数据，而不是按字段类型堆在一起。
 const RT_GROUPS = [
@@ -1031,10 +943,12 @@ const RT_GROUPS = [
         hint: '上游前端版本号。请求大面积失败时先看这里是不是过期了' },
       { k: 'gemini_bl_auto', label: '自动跟随 bl 版本', type: 'bool',
         hint: '每 6 小时从 /app 页面抓一次最新版本号，抓到就用抓到的。抓不到或格式不对就继续用上面钉的值' },
-      { k: 'auto_delete_conversation', label: '自动删网页会话（对话）', type: 'bool',
-        hint: '出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录号里堆一堆。作用于对话 / 音乐 / 视频 / 画布。只登录态生效，异步 best-effort，删失败不影响响应' },
-      { k: 'auto_delete_image_conversation', label: '自动删网页会话（生图）', type: 'bool',
-        hint: '单独控制生图（gemini-image）是否自动删网页会话。生图会话常要留着复看或二次编辑，跟对话的诉求相反，所以拆成独立开关。只登录态生效，异步 best-effort' },
+      { k: 'auto_delete_conversation', label: '自动删网页会话', type: 'bool',
+        hint: '出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录号里堆一堆。只登录态生效，异步 best-effort，删失败不影响响应' },
+      { k: 'multi_turn', label: '服务端多轮续接', type: 'bool',
+        hint: '走 Gemini 原生服务端多轮：按历史前缀认出这是上一轮的续接，命中就只发最新一句、历史留在服务端，同一串对话复用同一个 gemini 会话（不再每发一条就新开一个）。匿名/登录都行，带图或带工具时不生效。首轮/重启/改历史会退回整段重发。默认关' },
+      { k: 'anon_first', label: '匿名优先', type: 'bool',
+        hint: '这次请求不需要登录态能力时（纯文本、非思考、无工具、不带图）走匿名、不占用 cookie 账号，省账号额度；用到 3.1 Pro / 3.8 Flash / 扩展思考 / 生图 / 传文件这些才挑号。关掉则只要池里有号就一律用号（默认关）' },
     ],
   },
   {
@@ -1228,7 +1142,7 @@ async function resetProxy(id) {
 const COOKIE_KEYS = [
   { k: '__Secure-1PSID', hint: '主会话' },
   { k: 'SAPISID', req: true, hint: '算授权头用，缺了会被当匿名' },
-  { k: '__Secure-1PSIDTS', hint: '会话时间戳，随会话刷新而变' },
+  { k: '__Secure-1PSIDTS', hint: '约 30 分钟过期，保活会自动换发' },
   { k: 'SID' }, { k: 'HSID' }, { k: 'SSID' }, { k: 'APISID' },
 ];
 
@@ -1289,8 +1203,9 @@ async function addCookieAcct() {
       <div data-pane="raw">
         <div class="field">
           <textarea data-name="cookie" rows="6" spellcheck="false"
-            placeholder="SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=..."></textarea>
-          <div class="hint">整行粘贴，分号分隔。至少要含 SAPISID。DevTools 里全选复制即可，
+            placeholder="SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...; __Secure-1PSIDTS=..."></textarea>
+          <div class="hint">整行粘贴，分号分隔。至少要含 SAPISID 和 __Secure-1PSID。
+          建议用 Firefox 导出（Chrome 新版本的会话绑在设备上，续不了）。DevTools 里全选复制即可，
           多余的项会一并保留 —— 发得越全越像真实浏览器。</div>
         </div>
       </div>
@@ -1409,7 +1324,7 @@ async function checkCookieAcct(id, btn) {
   }
 }
 
-// 手动触发一次会话保活。后台按「有效期 - 5 分钟」自动跑，这个按钮用来当场验证。
+// 手动触发一次会话保活（刷新 1PSIDTS + SIDCC）。后台启动 15 秒后跑第一次，之后每 10 分钟。
 async function rotateCookieAcct(id, btn) {
   const old = btn.textContent;
   btn.textContent = '…'; btn.disabled = true;
@@ -1439,126 +1354,6 @@ async function delCookieAcct(id) {
   await api('api/cookies/' + id, { method: 'DELETE' });
   flash('已删除');
   await refreshPage();
-}
-
-// 浏览器登录（Chromium profile）动作 ──────────────────────────────────────────
-async function browserAdd() {
-  const data = await modalForm({
-    title: '添加浏览器账号（独立 profile）',
-    desc: '给这个账号起个名字。它会在 Chromium(VNC) 容器里开一个独立窗口，登录态与其它账号互不影响。',
-    fields: [
-      { name: 'name', label: 'Profile 名', required: true, placeholder: '例如 acct1 / gemini-a', hint: '只允许字母数字 . _ -，将作为该账号的隔离标识' },
-      { name: 'label', label: '标签（可选）', placeholder: '例如 test@gmail.com', hint: '入池后显示在 Cookie 池里的名字' },
-    ],
-    submitText: '创建并打开',
-  });
-  if (!data) return;
-  const r = await fetch('api/browser/profiles', {
-    method: 'POST', credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (j.error) return flash('创建失败：' + j.error);
-  flash('profile 已就绪。请点该行的「在我的浏览器打开授权页」登录 Google，然后点「抓取 cookie」。');
-  await refreshPage();
-}
-
-// 打开/聚焦该 profile 的 gemini 登录页
-async function browserOpenLogin(name, btn) {
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '打开中…'; btn.disabled = true; }
-  try {
-    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name) + '/open',
-      { method: 'POST', credentials: 'include' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) return flash('打开失败：' + (j.error || r.status));
-    flash(j.detail || '已在容器内打开 gemini.google.com（桌面窗口可见），可在自己浏览器里操作');
-    await refreshPage();
-  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
-}
-
-// 在用户自己的浏览器里打开容器 Chromium 桌面（VNC Web），显示该账号的 Gemini 授权页。
-function browserOpenInUser(url, btn) {
-  if (!url) return flash('未配置桌面网页地址：请在上方输入并保存，或在 compose 里设 BROWSER_ACCESS_URL');
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '打开中…'; btn.disabled = true; }
-  try { window.open(url, '_blank'); } catch (e) {}
-  if (btn) { btn.textContent = old; btn.disabled = false; }
-  flash('已在新标签打开容器桌面（VNC）。请点开该账号的 Chromium 窗口完成 Google 登录。');
-}
-
-function getAccessUrlInput() {
-  const el = document.getElementById('browserAccessUrl');
-  return el ? el.value.trim() : '';
-}
-function currentAccessUrl() {
-  const el = document.getElementById('browserAccessUrl');
-  return el ? (el.value.trim() || (el.placeholder || '')) : '';
-}
-function openAccessUrl() {
-  const u = currentAccessUrl();
-  if (!u) return flash('先填写桌面网页地址');
-  window.open(u, '_blank');
-}
-function saveAccessUrl() {
-  const el = document.getElementById('browserAccessUrl');
-  if (!el) return;
-  const v = el.value.trim();
-  try {
-    if (v) localStorage.setItem('gw2aAccessUrl', v);
-    else localStorage.removeItem('gw2aAccessUrl');
-  } catch (e) {}
-  flash(v ? '已保存桌面网页地址（仅本浏览器生效）' : '已清除自定义地址，恢复默认');
-  refreshPage();
-}
-
-// 抓取 cookie 入池
-async function browserFetch(name, btn) {
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '抓取中…'; btn.disabled = true; }
-  try {
-    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name) + '/fetch',
-      { method: 'POST', credentials: 'include' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) return flash('抓取失败：' + (j.error || r.status));
-    flash((j.ok ? '✓ ' : '✗ ') + (j.detail || ''));
-    await refreshPage();
-  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
-}
-
-// 删除 profile（停实例 + 删池记录）
-async function browserDel(name, btn) {
-  const okc = await modalConfirm({
-    title: '删除浏览器账号',
-    desc: `删除 profile「${name}」？将关闭对应 Chromium 窗口，并删除它在 Cookie 池里的账号记录。此操作不可撤销。`,
-    confirmText: '删除', danger: true,
-  });
-  if (!okc) return;
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '删除中…'; btn.disabled = true; }
-  try {
-    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name),
-      { method: 'DELETE', credentials: 'include' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) return flash('删除失败：' + (j.error || r.status));
-    flash('已删除');
-    await refreshPage();
-  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
-}
-
-// 全部刷新（手动触发一次所有 browser 账号的 cookie 刷新）
-async function browserRefreshAll(btn) {
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '刷新中…'; btn.disabled = true; }
-  try {
-    const r = await fetch('api/browser/refresh', { method: 'POST', credentials: 'include' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) return flash('刷新失败：' + (j.error || r.status));
-    flash(j.detail || '刷新完成');
-    await refreshPage();
-  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
-}
-
-// 跳到 Cookie 池页查看对应账号
-function browserAccountInPool(id) {
-  // 高亮不太好做，先简单切到 Cookie 池页
-  switchPage('cookies');
 }
 
 async function doLogout() {
@@ -1865,7 +1660,6 @@ const ICONS = {
   proxies: '<path d="M12 2a2.5 2.5 0 011 4.79V9h4a2 2 0 012 2v1.21a2.5 2.5 0 11-2 0V11h-4v1.21a2.5 2.5 0 11-2 0V11H7v1.21a2.5 2.5 0 11-2 0V11a2 2 0 012-2h4V6.79A2.5 2.5 0 0112 2z"/>',
   settings: '<path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/>',
   cookies: '<path d="M12 2a10 10 0 100 20 10 10 0 000-20zm-1 4a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm7 3a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zM8 13a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm6 4a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z"/>',
-  browser: '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>',
   menu: '<path d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"/>',
   logout: '<path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4a2 2 0 00-2 2v14a2 2 0 002 2h8v-2H4V5z"/>',
 };
@@ -1874,12 +1668,10 @@ const NAV = [
   ['requests', '请求记录'],
   ['proxies', '代理池'],
   ['cookies', 'Cookie 池'],
-  ['browser', '浏览器登录'],
   ['settings', '设置'],
 ];
 const PAGE_TITLES = {
-  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Cookie 池',
-browser: '浏览器登录', settings: '设置',
+  dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Cookie 池', settings: '设置',
 };
 
 function toggleSidebar() {
@@ -1989,24 +1781,8 @@ const I18N_EN = {
   '请求记录': 'Requests',
   '代理池': 'Proxy Pool',
   'Cookie 池': 'Cookie Pool',
-  '浏览器登录': 'Browser Login',
   '设置': 'Settings',
   '运行中': 'Running',
-  '已停止': 'Stopped',
-  '已入池': 'In Pool',
-  '未抓取': 'Not fetched',
-  '控制器在线': 'Controller Online',
-  '控制器离线': 'Controller Offline',
-  '全部刷新': 'Refresh All',
-  '抓取 cookie': 'Fetch Cookies',
-  '打开登录页': 'Open Login',
-  '删除': 'Delete',
-  'Profile': 'Profile',
-  'CDP 端口': 'CDP Port',
-  '控制器健康': 'Controller Health',
-  '标签 / 账号': 'Label / Account',
-  '最近成功': 'Last Success',
-  '操作': 'Actions',
   '无法连接': 'Disconnected',
   '收起 / 展开': 'Collapse / Expand',
   '收起或展开侧边栏': 'Collapse or expand sidebar',
@@ -2118,7 +1894,8 @@ const I18N_EN = {
   '最近成功': 'Last success',
   '未命名': 'Unnamed',
   '缺 TS': 'Missing TS',
-  '缺 __Secure-1PSIDTS，无法长期续命': 'Missing __Secure-1PSIDTS; cannot be kept alive long-term',
+  '缺 __Secure-1PSIDTS，首次保活会尝试补发；失败请用 Firefox 重新导出': 'Missing __Secure-1PSIDTS; first keepalive will try to mint one. If that fails, re-export from Firefox',
+  '约 30 分钟过期，保活会自动换发': 'Expires in ~30 minutes; keepalive rotates it automatically',
   '检测': 'Check',
   '保活': 'Keep-alive',
   '编辑': 'Edit',
@@ -2201,8 +1978,8 @@ const I18N_EN = {
   '仅用于面板里区分账号，不参与请求。': 'Only used to tell accounts apart in the panel; not sent with requests.',
   '整串粘贴（推荐）': 'Paste full string (recommended)',
   '逐项填写': 'Fill in individually',
-  '整行粘贴，分号分隔。至少要含 SAPISID。DevTools 里全选复制即可，多余的项会一并保留 —— 发得越全越像真实浏览器。':
-    'Paste the whole line, semicolon-separated. Must contain at least SAPISID. Select-all and copy in DevTools; extra items are kept too — the more complete, the more it looks like a real browser.',
+  '整行粘贴，分号分隔。至少要含 SAPISID 和 __Secure-1PSID。 建议用 Firefox 导出（Chrome 新版本的会话绑在设备上，续不了）。DevTools 里全选复制即可， 多余的项会一并保留 —— 发得越全越像真实浏览器。':
+    'Paste the whole line, semicolon-separated. Must contain at least SAPISID and __Secure-1PSID. Prefer Firefox (recent Chrome binds the session to the device and it will not renew). Select-all and copy in DevTools; extra items are kept too — the more complete, the more it looks like a real browser.',
   '备注': 'Note',
   'Cookie 不能为空': 'Cookie cannot be empty',
   'cookie 里没有 SAPISID，多半没复制全': 'No SAPISID in the cookie — you probably did not copy it all',

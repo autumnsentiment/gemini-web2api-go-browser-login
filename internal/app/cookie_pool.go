@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,9 +26,10 @@ type CookieAccount struct {
 	FailCount  int64  `json:"fail_count"`
 	ProxyID    int64  `json:"proxy_id"` // 绑定的出口，0 = 还没绑
 
-	// Source 表示该账号来源：manual(手动导入) 或 browser(浏览器登录自动导入)
+	// Source 表示该账号来源：manual(手动导入) 或 browser(浏览器登录自动导入)。
+	// 上游没有这两列，是本地「浏览器登录」增强（browser_cdp.go）加的。
 	Source string `json:"source"`
-	// Profile 是 browser 来源对应的 Chromium profile 名
+	// Profile 是 browser 来源对应的 Chromium profile 名。
 	Profile string `json:"profile"`
 }
 
@@ -49,14 +51,38 @@ func splitCookiePairs(cookie string) [][2]string {
 	return out
 }
 
-// extractSAPISID 从一整串 cookie 里取 SAPISID 的值，取不到返回空串。
-func extractSAPISID(cookie string) string {
+// cookieValue 从一整串 cookie 里取指定名字的值，取不到返回空串。
+func cookieValue(cookie, name string) string {
 	for _, kv := range splitCookiePairs(cookie) {
-		if kv[0] == "SAPISID" {
+		if kv[0] == name {
 			return kv[1]
 		}
 	}
 	return ""
+}
+
+// extractSAPISID 从一整串 cookie 里取 SAPISID 的值，取不到返回空串。
+func extractSAPISID(cookie string) string {
+	return cookieValue(cookie, "SAPISID")
+}
+
+// cookieSubset 只留下指定名字的项，顺序跟原串一致。刷新 1PSIDTS 时不能把整串
+// 都带上：多带 Chrome DBSC / 其它主机的 cookie 实测会让 RotateCookies 回 401。
+func cookieSubset(cookie string, names []string) string {
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var parts []string
+	seen := map[string]bool{}
+	for _, kv := range splitCookiePairs(cookie) {
+		if !want[kv[0]] || kv[1] == "" || seen[kv[0]] {
+			continue
+		}
+		seen[kv[0]] = true
+		parts = append(parts, kv[0]+"="+kv[1])
+	}
+	return strings.Join(parts, "; ")
 }
 
 // cookieNames 返回 cookie 串里出现的所有 cookie 名（顺序保留），供 UI 展示。
@@ -372,6 +398,14 @@ func poolHasCookie(cookie string) bool {
 	return false
 }
 
+// pickMu 把「SELECT 最久未用的号 + UPDATE 标记它刚用过」串成原子操作。
+// 不加锁时两个并发请求会 SELECT 到同一个"最久未用"的号、各自 UPDATE，于是同一瞬间
+// 双双用它，轮转形同虚设（CLAUDE.md 记的已知缺陷）。本进程内一把锁就够——限流器、
+// 轮转调度、代理池都是进程内状态，这个反代天生单实例，不存在跨进程并发挑号；也就
+// 不必为此上跨方言的事务/行锁（sqlite 无 FOR UPDATE、mysql 无 RETURNING，那条路
+// 全是方言分支）。挑号只是一次极快的 SELECT+UPDATE，串行化的争用可忽略。
+var pickMu sync.Mutex
+
 // pickCookieAccount 从池里挑一个 enabled 账号，按 last_used_at 最久优先，
 // 挑中后立刻把 last_used_at 记为现在（下次轮到别人）。池空返回 (nil,false)。
 func pickCookieAccount() (*CookieAccount, bool) {
@@ -384,6 +418,8 @@ func pickCookieAccount() (*CookieAccount, bool) {
 // 轮转会让大约一半请求撞上坏号 —— 表现就是"成功率莫名其妙很低"，而每次失败
 // 看起来都像是上游的问题。
 func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
+	pickMu.Lock()
+	defer pickMu.Unlock()
 	// 健康的排前面，同样健康的按最久未用轮转。
 	//
 	// 不这么排的话坏号会跟好号平起平坐地轮到，而挑到坏号时它没有绑定的出口，
@@ -421,10 +457,9 @@ func pickCookieAccountExcept(skip map[int64]bool) (*CookieAccount, bool) {
 //
 // statusCode 为 0 表示压根没拿到响应（网络层失败）。
 //
-// 但「不计入 fail_count」≠「什么都不写」：旧版 default 分支是彻底沉默，会话票
-// 过期（no SNlM0e）、上游 5xx、出口被拦时面板上的账号看着毫发无损，而实际每个
-// 请求都在失败 —— 排查时完全看不到线索。所以这里把 last_error 记下来（只描述
-// 现象，不动 fail_count / status），成功时 markAccountResult 会把它清掉。
+// 本地增强（上游 default 分支完全沉默）：不计 fail_count ≠ 什么都不写。
+// 会话票过期（no SNlM0e）、出口被拦时面板上账号看着毫发无损，排查没线索 ——
+// 把现象记进 last_error（不动 fail_count / status），成功时自然被清掉。
 func markCookieByStatus(id int64, statusCode int, errStr string) {
 	switch {
 	case statusCode == 200:
@@ -502,11 +537,14 @@ type CookieCheck struct {
 
 // checkAccountCookie 判断一条 cookie 还有没有登录态。
 //
-// 判据是 /app 页面里有没有 SNlM0e：cookie 失效时 Gemini 不报错，只是把你当匿名
-// 用户，纯文本请求照样 200 —— 所以不能拿"请求成功"当有效性判据。这个页面没有
-// SNlM0e 就说明服务端没认这个登录态。
-//
+// 判据是 /app 页面里有没有非空 SNlM0e：cookie 失效时 Gemini 不报错，只是把你当
+// 匿名用户，纯文本请求照样 200 —— 所以不能拿"请求成功"当有效性判据。
 // 只抓页面，不发对话，不消耗生成配额。
+//
+// 本地增强（上游是单发判定，失败直接记 fail_count）：
+//   1. 「票旧了」先自动续票复检 —— __Secure-1PSIDTS 是短命票，票旧不等于号死；
+//   2. 续不回来且账号来自浏览器登录，走浏览器重抓自愈；
+//   3. 只有确凿的 401/403（且非票旧症状）才累加 fail_count。
 func checkAccountCookie(a CookieAccount) CookieCheck {
 	t0 := time.Now()
 	picked, ok, err := acquireSlot(a.ProxyID)
@@ -524,31 +562,24 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	invalidateXSRF(a.Cookie)
 	_, err = getXSRF(a.Cookie, proxyURL)
 	needRelogin := false
-	// ★ 续票复检（2026-09-12 实测的真根因）★
-	//   __Secure-1PSIDTS 是有寿命的票（实测约 10~20 分钟）。票一旧，带着它打
-	//   /app 就只会拿到「匿名单页」（200 但没有 SNlM0e），看起来跟 cookie 真失效
-	//   一模一样。但这不是号坏了 —— POST RotateCookies 换张新票，同一份 cookie
-	//   立刻恢复。所以检测遇到这个症状时，先自动续一次票再复检，
-	//   只有续票之后仍然不行，才真的判失效（否则好号会被一遍遍误停用）。
-	stale := looksLikeStaleSession(err)
-	if stale {
-		// 第一步：进程内续票（最便宜，不动浏览器）。
-		if fresh := renewAccountBoundCookies(a.ID); fresh != "" && fresh != a.Cookie {
-			a.Cookie = fresh
-			invalidateXSRF(fresh)
-			if tok, err2 := getXSRF(fresh, proxyURL); err2 == nil && tok != "" {
-				logf("[cookie] 账号 #%d 检测时续票成功，恢复可用", a.ID)
-				err = nil
-			} else {
-				err = err2
+	if err != nil && looksLikeStaleSession(err) {
+		// 第一步：哨兵续票（POST /RotateCookies 换发 1PSIDTS，最便宜，不动浏览器）。
+		if _, refreshed, rerr := tryRotate1PSIDTS(a.ID, a.Cookie, proxyURL); rerr == nil && len(refreshed) > 0 {
+			if fresh := accountByID(a.ID); fresh != nil {
+				a.Cookie = fresh.Cookie
+				invalidateXSRF(fresh.Cookie)
+				if tok, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil && tok != "" {
+					logf("[cookie] 账号 #%d 检测时续票成功，恢复可用", a.ID)
+					err = nil
+				} else {
+					err = err2
+				}
 			}
 		}
 	}
 	if err != nil && looksLikeStaleSession(err) {
-		// 第二步：票已经彻底过期时 RotateCookies 会回 401，换不出新票了。
-		// 但**浏览器里那份 cookie 永远是新鲜的**，所以回落到「浏览器刷新」这条
-		// 真实自愈路径：让 Chromium 重新访问 Gemini，把新票读回来入库。
-		// 实测这条路径可用（[browser] profile "acct1" cookie 已刷新）。
+		// 第二步：票彻底过期（哨兵回 401）时换不出新票。账号来自浏览器登录的话，
+		// 浏览器里那份 cookie 永远是新鲜的，回落到「浏览器刷新」这条自愈路径。
 		if a.Source == "browser" && a.Profile != "" {
 			logf("[browser] 账号 #%d 会话票已过期，尝试用浏览器刷新自愈", a.ID)
 			ok2, _, berr := browserRefreshOne(a.Label, a.Profile)
@@ -565,8 +596,6 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 				}
 			} else if berr != nil {
 				logf("[browser] 账号 #%d 浏览器刷新未成功（忽略，不改健康度）：%v", a.ID, berr)
-				// 浏览器里 Google 正在要求重新验证密码：这不是续票能解决的了，
-				// 提示语别再说「续票后即可恢复」，把真正的恢复路径告诉运维。
 				if errors.Is(berr, errBrowserNeedRelogin) {
 					needRelogin = true
 				}
@@ -575,14 +604,10 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	}
 	took := time.Since(t0).Milliseconds()
 	if err != nil {
-		// 只有确凿的鉴权失败才记进 fail_count。断网/代理挂时 getXSRF 返回
-		// EOF，如果也累加，点几次「检测」就能把好号停用（历史上真发生过）。
-		//
-		// ★ 会话票过期（no SNlM0e）同样不算 ★
-		//   实测它绝大多数只是 __Secure-1PSIDTS 过期，续票/浏览器刷新就能恢复，
-		//   属于「可自愈的暂时态」。若也累加 fail_count，3 次就会把好号自动停用，
-		//   于是「web 明明登录着」却永久 502 —— 这正是用户报的故障。
-		//   只更新 last_error 让面板看得见，不碰 fail_count。
+		// 只有确凿的鉴权失败才记进 fail_count。断网/代理挂时 getXSRF 返回 EOF，
+		// 如果也累加，点几次「检测」就能把好号停用（历史上真发生过）。
+		// ★ 会话票过期（no SNlM0e）同样不算：绝大多数只是 __Secure-1PSIDTS 过期，
+		//   属于可自愈的暂时态；只更新 last_error 让面板看得见，不碰 fail_count。
 		if st := xsrfAuthStatus(err); (st == 401 || st == 403) && !looksLikeStaleSession(err) {
 			markAccountResult(a.ID, false, err.Error())
 		} else {
@@ -607,26 +632,24 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 // looksLikeStaleSession 判断这个错误是不是「票旧了」而不是「号没了」。
 //
 // 「票旧」的症状：/app 打得开（200）但页面里没有 SNlM0e —— 上游把请求当匿名处理。
-// 实测这几乎总是 __Secure-1PSIDTS 过期导致的（见 renewBoundCookies 的说明），
-// 换张新票就好，不该判号死。
+// 实测这几乎总是 __Secure-1PSIDTS 过期导致的，换张新票就好，不该判号死。
 func looksLikeStaleSession(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "no SNlM0e")
+	return strings.Contains(err.Error(), "no SNlM0e")
 }
 
 // explainCookieFailure 把底层错误翻成运维看得懂的结论。
+//
+// 302 有好几种来源，必须分开说：把所有 302 都当 cookie 失效，
+// 会让出口被反爬时好 cookie 被反复判死（2026-09-12 实测踩过）。
 func explainCookieFailure(err error) string {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no SNlM0e"):
 		return "cookie 的会话票已过期（页面能打开但被当匿名）：多为 __Secure-1PSIDTS 过期，续票后即可恢复；若持续如此才考虑重新登录"
 	case strings.Contains(msg, "HTTP 302"), strings.Contains(msg, "HTTP 30"):
-		// 302 有好几种来源，必须分开说 —— 见 xsrf.go 的 httpStatusErr()。
-		// 历史上这里把所有 302 都当 cookie 失效，害得出口被反爬时
-		// 好 cookie 被反复判死。
 		switch {
 		case strings.Contains(msg, "sorry/index"), strings.Contains(msg, "/sorry/"):
 			return "出口被上游反爬拦截（302 sorry 页），不是 cookie 的问题；换出口或等几分钟再试"

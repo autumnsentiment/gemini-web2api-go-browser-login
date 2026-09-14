@@ -2,9 +2,6 @@
 *.exe
 gemini-web2api-go
 gemini-web2api
-*.crx
-*.pem
-*.key
 
 # ─── Runtime data ─────────
 data/
@@ -14,21 +11,6 @@ data/
 cookie.txt
 *.log
 tmp_*
-*.bak
-*.bak.*
-*.bak-*
-*~
-
-# ─── Secrets / local config ─
-.env
-.env.*
-config.json
-!config.example.json
-profiles/
-ext/
-venv/
-__pycache__/
-*.pyc
 
 # ─── Docker ───────────────
 .env
@@ -41,5 +23,5 @@ __pycache__/
 vendor/
 *.exe~
 
-# ─── 本地工程笔记 ─────────
+# ─── 本地工程笔记（给 Claude 跨会话续接，不入库不分发）──
 docs/local/

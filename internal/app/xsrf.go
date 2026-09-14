@@ -105,34 +105,6 @@ func getUploadTokens(cookie, proxyURL string) (pushID, pctx string, err error) {
 	return e.pushID, e.pctx, nil
 }
 
-// httpStatusErr 把非 200 响应连 Location 一起带出来。
-//
-// 为什么必须带 Location：Google 有**两种**完全不同的非 200——
-//
-//	· 302 -> accounts.google.com/ServiceLogin   = cookie 真的失效了
-//	· 302 -> www.google.com/sorry/index         = 出口 IP 被反爬，cookie 是好的，
-//	                                             过几分钟封禁自己会过期
-//
-// 不带 Location 就没法区分，只能一律当成 cookie 失效，
-// 于是好号被反复判死、fail_count 累加、最后被自动停用（2026-09-12 实测踩到）。
-func httpStatusErr(prefix string, resp *http.Response) error {
-	loc := resp.Header.Get("Location")
-	if loc == "" {
-		return fmt.Errorf("%s: HTTP %d", prefix, resp.StatusCode)
-	}
-	return fmt.Errorf("%s: HTTP %d -> %s", prefix, resp.StatusCode, loc)
-}
-
-// httpStatusErrF 同上，只是给 fhttp（tls-client 那套）用 —— 它的 Response
-// 是另一个包的类型，没法跟 net/http.Response 共用一个函数。
-func httpStatusErrF(prefix string, resp *fhttp.Response) error {
-	loc := resp.Header.Get("Location")
-	if loc == "" {
-		return fmt.Errorf("%s: HTTP %d", prefix, resp.StatusCode)
-	}
-	return fmt.Errorf("%s: HTTP %d -> %s", prefix, resp.StatusCode, loc)
-}
-
 // fetchAppPage 抓 gemini.google.com/app 的 HTML。
 // 走跟主请求相同的出口：配了代理走 stdlib，没配走 tls-client，
 // 免得页面里取到的 token 和后续请求来自两个不同 IP。
@@ -163,7 +135,7 @@ func fetchAppPage(cookie, proxyURL string) ([]byte, error) {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return nil, httpStatusErr("fetch /app", resp)
+			return nil, fmt.Errorf("fetch /app: HTTP %d", resp.StatusCode)
 		}
 		body, err = io.ReadAll(resp.Body)
 		if err != nil {
@@ -183,7 +155,7 @@ func fetchAppPage(cookie, proxyURL string) ([]byte, error) {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 {
-			return nil, httpStatusErrF("fetch /app", resp)
+			return nil, fmt.Errorf("fetch /app: HTTP %d", resp.StatusCode)
 		}
 		body, err = io.ReadAll(resp.Body)
 		if err != nil {
@@ -221,18 +193,17 @@ func isXSRFError(raw string) bool {
 	return strings.Contains(raw, `"xsrf"`)
 }
 
-// xsrfAuthStatus 把 getXSRF 的错误映射成 cookie 健康度用的状态码。
+// xsrfAuthStatus 把 getXSRF 的错误映射成 cookie 健康度用的状态码（本地增强，
+// 上游没有这个函数；配套测试见 session_302_test.go）。
 //
 // 只有**确实说明 cookie 失效**的错误才返回 401：
-//   - "no SNlM0e in page (cookie expired or not signed in)"：页面打开了但里面没有 token
 //   - "fetch /app: HTTP 401/403"：上游明确告诉我们鉴权失败
 //
-// EOF、超时、代理挂掉、502/503、DNS 失败、302 一律返回 0，
-// 交给 markCookieByStatus 的 default 分支忽略。
+// EOF、超时、代理挂掉、5xx、DNS 失败、302（含 sorry / consent 跳转）一律返回 0，
+// 交给 markCookieByStatus 的 default 分支只记 last_error 不动 fail_count。
 //
-// 为什么要这么严？因为一旦断网，每次请求都会累加 fail_count，
-// 3 次就会把好号自动停用，甚至被清理出池子。
-// 历史上真发生过。
+// 为什么这么严：一旦断网每次请求都累加 fail_count，3 次就把好号自动停用，
+// 历史上真发生过。no SNlM0e（票旧）也不算 —— 见 looksLikeStaleSession。
 func xsrfAuthStatus(err error) int {
 	if err == nil {
 		return 0
@@ -241,7 +212,6 @@ func xsrfAuthStatus(err error) int {
 	const pfx = "fetch /app: HTTP "
 	if strings.HasPrefix(msg, pfx) {
 		rest := strings.TrimSpace(msg[len(pfx):])
-		// 状态码后面现在可能跟着 " -> <location>"（见 httpStatusErr），先切掉
 		code := rest
 		if i := strings.Index(rest, " "); i > 0 {
 			code = rest[:i]
@@ -249,18 +219,6 @@ func xsrfAuthStatus(err error) int {
 		if code == "401" || code == "403" {
 			return 401
 		}
-		// 302（含 sorry / consent 跳转）、429、5xx 都算网络或反爬类，
-		// 绝不记进 cookie 健康度
-		return 0
-	}
-	// 「页面里没有 SNlM0e」**不再**算 cookie 鉴权失败。
-	//
-	// 历史判据把它当 401，于是累加 fail_count、3 次自动停用账号。但 2026-09-12
-	// 实测证明这个症状绝大多数只是 __Secure-1PSIDTS 这张票过期（约 10~20 分钟），
-	// 带着过期票打 /app 一律拿到「匿名单页」；续票或浏览器刷新后同一份 cookie
-	// 立刻恢复。把它判死，就会让「web 明明登录着」变成永久 502 —— 用户报的正是这个。
-	// 真失效由更外层的探针负责（会话看门狗 / 重新登录工具）。
-	if strings.Contains(msg, "no SNlM0e in page") {
 		return 0
 	}
 	return 0

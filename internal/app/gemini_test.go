@@ -1,7 +1,9 @@
 package app
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -57,7 +59,7 @@ func TestModelHeader(t *testing.T) {
 		t.Errorf("只应存在 4 个真模型 hex, got %d", len(hexes))
 	}
 	// 反过来：每个真 hex 都应该有一个 thinking 版
-	for _, base := range []string{hexFlash36, hexFlashLite, hexPro31, hexFlash37} {
+	for _, base := range []string{hexFlash36, hexFlashLite, hexPro31, hexFlash38} {
 		found := false
 		for _, m := range Models {
 			if m.HexID == base && m.Thinking {
@@ -290,6 +292,119 @@ func TestProHiddenWithoutCookie(t *testing.T) {
 	if _, _, err := resolveModel("no-such-model"); err == nil ||
 		!strings.Contains(err.Error(), "unknown model") {
 		t.Errorf("未知模型应报 unknown model, got %v", err)
+	}
+}
+
+// modelNeedsLogin 是「没 cookie 时排除哪些模型」和「#20 匿名优先要不要占号」
+// 共用的单一判据，逐个模型钉死：纯文本非思考的 3.6/3.5-lite 匿名可用，其余全需登录。
+func TestModelNeedsLogin(t *testing.T) {
+	anon := map[string]bool{"gemini-3.6-flash": true, "gemini-3.5-flash-lite": true}
+	for name, mc := range Models {
+		want := !anon[name]
+		if got := modelNeedsLogin(mc); got != want {
+			t.Errorf("%s: modelNeedsLogin=%v want %v", name, got, want)
+		}
+	}
+	// 跟 availableModels 的排除口径必须一致：无 cookie 时暴露的正好是匿名可用那批
+	for name := range availableModels() {
+		if modelNeedsLogin(Models[name]) {
+			t.Errorf("%s 被 availableModels 暴露却判为需登录，两处判据不一致", name)
+		}
+	}
+}
+
+// cookieAcctView 的 health 派生（#18 面板标红）：fail_count>0 一律红（含被自动停用的死号），
+// 手动停用且无失败=灰，没成功过=待检测，其余=正常。
+func TestCookieHealthView(t *testing.T) {
+	cases := []struct {
+		a    CookieAccount
+		want string
+	}{
+		{CookieAccount{Status: "enabled", FailCount: 0, LastOkAt: 100}, "ok"},
+		{CookieAccount{Status: "enabled", FailCount: 3, LastOkAt: 100}, "dead"},
+		{CookieAccount{Status: "disabled", FailCount: 5, LastOkAt: 100}, "dead"},
+		{CookieAccount{Status: "disabled", FailCount: 0}, "disabled"},
+		{CookieAccount{Status: "enabled", FailCount: 0, LastOkAt: 0}, "unknown"},
+	}
+	for _, c := range cases {
+		if got := cookieAcctView(c.a)["health"]; got != c.want {
+			t.Errorf("status=%s fail=%d ok=%d: health=%v want %s",
+				c.a.Status, c.a.FailCount, c.a.LastOkAt, got, c.want)
+		}
+	}
+}
+
+// pickCookieAccount 的 SELECT+UPDATE 必须原子：N 个号被 N 个并发请求挑，
+// 每个都该拿到不同的号。没加锁时两个请求会 SELECT 到同一个"最久未用"的号、
+// 双双用它（跑 -race 更容易暴露）。
+func TestPickCookieConcurrentDistinct(t *testing.T) {
+	const n = 8
+	for i := 0; i < n; i++ {
+		id, err := accountAdd("conc", fmt.Sprintf("SAPISID=d%d; SID=x", i), "")
+		if err != nil {
+			t.Fatalf("插号失败: %v", err)
+		}
+		t.Cleanup(func() { _ = accountDelete(id) })
+	}
+
+	got := make([]int64, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			if a, ok := pickCookieAccount(); ok {
+				got[idx] = a.ID
+			}
+		}(i)
+	}
+	close(start) // 让所有 goroutine 尽量同时冲挑号
+	wg.Wait()
+
+	seen := map[int64]int{}
+	for _, id := range got {
+		seen[id]++
+	}
+	for id, c := range seen {
+		if c > 1 {
+			t.Errorf("账号 #%d 被并发挑中 %d 次，挑号未串行化", id, c)
+		}
+	}
+}
+
+// 匿名优先（#20）的挑号判据：开关关时恒 false（保持旧行为）；开时只有纯文本、
+// 非思考、无工具、不带附件的请求才走匿名，其余一律挑号。
+func TestAnonFirstEligible(t *testing.T) {
+	set := func(on bool) { rtMu.Lock(); rtVal.AnonFirst = on; rtMu.Unlock() }
+	defer set(false)
+
+	plain := Models["gemini-3.6-flash"]
+	pro := Models["gemini-3.1-pro"]
+	img := Models["gemini-image"]
+	think := Models["gemini-3.6-flash-thinking"]
+
+	set(false)
+	if anonFirstEligible(plain, false) {
+		t.Error("开关关时应恒 false（池里有号就用号）")
+	}
+
+	set(true)
+	if !anonFirstEligible(plain, false) {
+		t.Error("开 + 纯文本无附件应走匿名")
+	}
+	if anonFirstEligible(plain, true) {
+		t.Error("带附件必须挑号（匿名引用被上游 1100 拒）")
+	}
+	if anonFirstEligible(pro, false) {
+		t.Error("3.1 Pro 需登录，不能走匿名")
+	}
+	if anonFirstEligible(img, false) {
+		t.Error("生图需登录，不能走匿名")
+	}
+	if anonFirstEligible(think, false) {
+		t.Error("扩展思考需登录，不能走匿名")
 	}
 }
 

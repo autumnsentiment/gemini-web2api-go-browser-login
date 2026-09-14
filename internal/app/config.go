@@ -43,19 +43,22 @@ type Config struct {
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果是否自动删掉 gemini.google.com 上留下的这条会话（#19，rpc GzXR5e）。
 	// 只登录态生效（删除要 XSRF）；异步 best-effort，删失败只记日志不影响响应。默认 false。
-	// 作用于**非生图**请求（对话 / 音乐 / 视频 / 画布）；生图另有开关，见下一项。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
-	// AutoDeleteImageConversation 单独控制**生图**（gemini-image）是否自动删网页会话。
-	// 生图会话常常想留着复看 / 二次编辑，跟对话的诉求相反，所以从上面那个开关里拆出来。
-	// 同样只登录态生效，异步 best-effort。默认 false。
-	AutoDeleteImageConversation bool `json:"auto_delete_image_conversation"`
+	// 匿名优先（#20）：这次请求不需要登录态能力（纯文本、非思考、无工具、无图）时
+	// 不占用 cookie 账号，走匿名省额度；需要登录才挑号。默认 false。见 modelNeedsLogin。
+	AnonFirst bool `json:"anon_first"`
 
-	// 浏览器登录（Chromium CDP）支持。浏览器跑在旁边的 chromium(VNC) 容器，
-	// 由 controller.js 管理独立 Chromium profile。留空 = 关闭该功能。
-	BrowserControllerURL  string `json:"browser_controller_url"`  // 例如 http://chromium:9280
-	BrowserCDPHost        string `json:"browser_cdp_host"`        // CDP 主机，默认取控制器主机
-	BrowserRefreshMinutes int    `json:"browser_refresh_minutes"` // 兜底抓取间隔（分钟），0=用默认 10；读得到 cookie 有效期时按「有效期-5分钟」调度
-	BrowserAccessURL      string `json:"browser_access_url"`      // 用户在**自己浏览器**打开 Chromium 桌面的地址（VNC Web），如 http://NAS_HOST:5666/chromium/ 。留空 = 前端隐藏“在我的浏览器打开”按钮
+	// ── 浏览器登录（Chromium CDP）本地增强 ────────────────────────────────
+	// BrowserControllerURL: controller.js 的 HTTP 基址（如 http://172.21.0.1:9280），
+	// 空串 = 浏览器登录功能关闭。见 browser_cdp.go。
+	BrowserControllerURL string `json:"browser_controller_url"`
+	// BrowserCDPHost: CDP 调试端口要连的主机，默认取控制器 URL 的 host 部分。
+	BrowserCDPHost string `json:"browser_cdp_host"`
+	// BrowserAccessURL: 展示给用户的 Chromium 桌面（VNC web）入口，纯展示。
+	BrowserAccessURL string `json:"browser_access_url"`
+	// BrowserRefreshMinutes: 抓取兜底间隔（分钟）。读得到 cookie 有效期时按
+	// 「有效期 - 5 分钟」动态调度，见 browser_cdp.go。
+	BrowserRefreshMinutes int `json:"browser_refresh_minutes"`
 }
 
 var (
@@ -96,8 +99,8 @@ func defaultConfig() Config {
 		MaxPromptBytes:         128000,
 		MultiTurn:              false,
 		AutoDeleteConversation: false,
-		// 生图会话单独开关，默认与对话一致（都不删）。
-		AutoDeleteImageConversation: false,
+		AnonFirst:              false,
+		BrowserRefreshMinutes:  10,
 	}
 }
 

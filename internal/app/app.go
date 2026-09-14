@@ -39,9 +39,10 @@ func Run() {
 	dbPath := flag.String("db", "", "SQLite path (default: ./data/gemini.db)")
 	adminToken := flag.String("admin-token", "", "admin token (empty = no auth, only safe on 127.0.0.1)")
 	apiKey := flag.String("api-key", "", "API key for /v1/* (locked). Empty = use kv-table key (auto-gen on first boot, mutable from admin UI)")
-	browserCtrl := flag.String("browser-controller-url", "", "Chromium controller base URL (e.g. http://chromium:9280). Empty = browser login disabled")
+	// 浏览器登录（本地增强，上游没有）：Chromium profile 控制器地址等。
+	browserCtrl := flag.String("browser-controller-url", "", "Chromium controller base URL (e.g. http://172.21.0.1:9280). Empty = browser login disabled")
 	browserCDPHost := flag.String("browser-cdp-host", "", "CDP host to dial (default: controller URL host)")
-	browserAccessURL := flag.String("browser-access-url", "", "public URL where the user's own browser opens the Chromium desktop (VNC web), e.g. http://NAS_HOST:5666/chromium/. Empty = hide the open-in-browser button")
+	browserAccessURL := flag.String("browser-access-url", "", "public URL where the user's own browser opens the Chromium desktop (VNC web)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -75,6 +76,7 @@ func Run() {
 	if envTok := os.Getenv("ADMIN_TOKEN"); envTok != "" && cfg.AdminToken == "" {
 		cfg.AdminToken = envTok
 	}
+	// 浏览器登录配置：CLI flag > 环境变量 > config.json（loadConfig 已填）。
 	if *browserCtrl != "" {
 		cfg.BrowserControllerURL = *browserCtrl
 	}
@@ -103,7 +105,7 @@ func Run() {
 	resolvedAPIKey := initAPIKey(*apiKey)
 	initTokenizer()
 	startScheduler()
-	startBrowserAutoRefresh() // 浏览器登录 cookie 每 10 分钟自动刷新
+	startBrowserAutoRefresh() // 浏览器登录：按「cookie 有效期 - 5 分钟」调度抓取（本地增强）
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
@@ -139,29 +141,6 @@ func Run() {
 	// /v1/videos —— OpenAI(Sora) 形状的异步视频生成。POST 建任务，GET 轮询，GET .../content 下 MP4。
 	mux.HandleFunc("/v1/videos", requireAPIKey(handleCreateVideo))
 	mux.HandleFunc("/v1/videos/", requireAPIKey(handleVideoItem))
-	// /v1/images/* —— OpenAI 图像 API 形状。上游只有一条生成通道（StreamGenerate +
-	// inner[49]=14，即模型 gemini-image），所以两个端点都转成 chat 那条链去跑；
-	// 产物直接以 data[].b64_json 回传。见 images.go。
-	mux.HandleFunc("/v1/images/generations", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case "OPTIONS":
-			handleOptions(w, r)
-		case "POST":
-			handleImageGenerations(w, r)
-		default:
-			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
-		}
-	}))
-	mux.HandleFunc("/v1/images/edits", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case "OPTIONS":
-			handleOptions(w, r)
-		case "POST":
-			handleImageEdits(w, r)
-		default:
-			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
-		}
-	}))
 	// MCP over HTTP（Streamable HTTP）：跟 OpenAI 接口同进程同端口，暴露 web_search。
 	// 用同一把 API key 鉴权，客户端配 Authorization: Bearer <key> 连这个 URL。
 	mux.HandleFunc("/mcp", requireAPIKey(handleMCPHTTP))
@@ -189,6 +168,7 @@ func Run() {
 		mux.HandleFunc("/admin/api/config", requireAuth(handleAdminConfig))
 		mux.HandleFunc("/admin/api/cookies", requireAuth(handleAdminCookies))
 		mux.HandleFunc("/admin/api/cookies/", requireAuth(handleAdminCookieItem))
+		// 浏览器登录（本地增强）：Chromium profile 管理 + cookie 抓取
 		mux.HandleFunc("/admin/api/browser/status", requireAuth(handleAdminBrowserStatus))
 		mux.HandleFunc("/admin/api/browser/profiles", requireAuth(handleAdminBrowserProfiles))
 		mux.HandleFunc("/admin/api/browser/profiles/", requireAuth(handleAdminBrowserProfileAction))

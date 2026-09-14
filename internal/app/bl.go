@@ -62,22 +62,6 @@ func currentBL(proxyURL string) string {
 	return pinned
 }
 
-// currentBLPinned 返回配置里钉死的 bl，**不做自动更新**。
-//
-// 媒体请求（图片/音乐/视频）必须用它。实测（2026-09-12）：自动抓到的
-// boq_assistant-bard-web-server_20260910.05_p2 会让 inner[49] 的工具位失效 ——
-// 上游不理这个字段、退回纯文本模型（响应自带模型标 "3.6 Flash"），于是
-// "media generation succeeded but artifact retrieval failed: 响应里没有图片 CDN 链接"。
-// 同一账号、同一代理、同一份请求体，只把 bl 换回钉死的 20260525.09_p0 就立刻恢复
-// （响应标回 "Nano Banana 2"）。工具位是上游前端私有的编码，新版前端改了含义，
-// 我们钉的值才是跟当前请求体匹配的那一版。
-//
-// 所以媒体走钉死值、普通对话走自动值：对话的载荷简单，新旧 bl 都能用；
-// 工具的载荷是逆向出来的，必须配对。
-func currentBLPinned() string {
-	return rtCfg().GeminiBL
-}
-
 // refreshBL 抓一次 /app 把 cfb2h 取出来。匿名抓即可，这个值跟登录态无关。
 func refreshBL(proxyURL string) {
 	defer func() {

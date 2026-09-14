@@ -13,6 +13,11 @@ import (
 // 也避免把凭证放进一个网页表单。这里只放调优参数——为了改个超时重启一次服务太蠢。
 //
 // 取值优先级：面板改过的（存 kv 表） > config.json / CLI flag > 内置默认。
+//
+// 加字段必读：面板保存走整体反序列化（admin.go 的 Decode(&RuntimeConfig)），而前端
+// saveRtCfg 只按 admin_ui 的 RT_GROUPS 拼 PUT body。新加的字段必须同步进 RT_GROUPS，
+// 否则它不在 body 里、每次点「保存并生效」都被解成零值冲掉（multi_turn 就这么被静默
+// 重置过，连 config.json 里设的都白设，见 #27）。
 type RuntimeConfig struct {
 	RetryAttempts   int    `json:"retry_attempts"`
 	RetryDelaySec   int    `json:"retry_delay_sec"`
@@ -46,12 +51,12 @@ type RuntimeConfig struct {
 	// 对话不撞单请求墙——对 Codex 这类长会话有用，对"喂长文档"没用。
 	MultiTurn bool `json:"multi_turn"`
 	// 出完结果自动删掉 gemini.google.com 上的这条会话（#19）。只登录态生效。默认 false。
-	// 作用于**非生图**请求（对话 / 音乐 / 视频 / 画布）。
 	AutoDeleteConversation bool `json:"auto_delete_conversation"`
-	// AutoDeleteImageConversation 单独控制**生图**（gemini-image）是否自动删网页会话。
-	// 生图会话常常想留着复看 / 二次编辑，跟对话的诉求相反，所以拆成独立开关。默认 false。
-	AutoDeleteImageConversation bool `json:"auto_delete_image_conversation"`
-	// 浏览器登录自动刷新间隔（分钟）。0 = 用启动配置/默认 10。
+	// 匿名优先（#20）：不需要登录态能力的请求（纯文本、非思考、无工具、无图）走匿名、
+	// 不占 cookie 账号，省账号额度；需要登录才挑号。默认 false，见 modelNeedsLogin。
+	AnonFirst bool `json:"anon_first"`
+	// 浏览器抓取兜底间隔（分钟）：读不到 cookie 有效期时按它排下一次浏览器抓取；
+	// 读得到有效期时按「有效期 - 5 分钟」。见 browser_cdp.go。0 = 用默认 10。
 	BrowserRefreshMinutes int `json:"browser_refresh_minutes"`
 }
 
@@ -85,10 +90,10 @@ func initRuntimeConfig() {
 		MaxPromptBytes:   cfg.MaxPromptBytes,
 		MultiTurn:        cfg.MultiTurn,
 
-		AutoDeleteConversation:      cfg.AutoDeleteConversation,
-		AutoDeleteImageConversation: cfg.AutoDeleteImageConversation,
+		AutoDeleteConversation: cfg.AutoDeleteConversation,
+		AnonFirst:              cfg.AnonFirst,
+		BrowserRefreshMinutes:  cfg.BrowserRefreshMinutes,
 	}
-	base.BrowserRefreshMinutes = cfg.BrowserRefreshMinutes
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
 		if err := json.Unmarshal([]byte(raw), &saved); err == nil {
@@ -132,6 +137,7 @@ func validateRuntimeConfig(c RuntimeConfig) error {
 		{"retention_days", c.RetentionDays, 1, 3650},
 		{"proxy_cooldown_min", c.ProxyCooldownMin, 0, 10080},
 		{"max_prompt_bytes", c.MaxPromptBytes, 0, 10000000},
+		{"browser_refresh_minutes", c.BrowserRefreshMinutes, 0, 1440},
 	} {
 		if r.v < r.min || r.v > r.max {
 			return fmt.Errorf("%s=%d 超出允许范围 [%d, %d]", r.name, r.v, r.min, r.max)

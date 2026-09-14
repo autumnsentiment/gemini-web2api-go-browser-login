@@ -438,12 +438,17 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 	if fresh {
 		conv = &convState{}
 		// 有 cookie 池就用登录号（能力更全），否则匿名（首轮就地拿 session cookie）。
-		if a, ok := pickCookieAccount(); ok {
-			conv.cookie = a.Cookie
-			conv.sapisid = extractSAPISID(a.Cookie)
-			conv.isLogin = true
-			conv.accountID = a.ID
-			conv.proxyID = a.ProxyID
+		// #20 匿名优先：模型不需要登录态时不占号（多轮已被 gate 限成无图无工具，附件
+		// 恒无，所以第二个参数传 false）。必须在调用前短路：pickCookieAccount 会更新
+		// last_used_at，调了不用等于白占一轮。
+		if !anonFirstEligible(mc, false) {
+			if a, ok := pickCookieAccount(); ok {
+				conv.cookie = a.Cookie
+				conv.sapisid = extractSAPISID(a.Cookie)
+				conv.isLogin = true
+				conv.accountID = a.ID
+				conv.proxyID = a.ProxyID
+			}
 		}
 		// 首轮带上 tools 指令：模型要靠它知道怎么吐 tool_call 围栏，续接轮不再重发
 		//（指令已在服务端首轮历史里）。
