@@ -30,7 +30,15 @@ var (
 )
 
 // modelGuardCooldownSec 同一账号两次「模型不一致 → 重抓」的最小间隔（外层防抖）。
-const modelGuardCooldownSec = 180
+//
+// ★ 5 小时（2026-09-13 调整）★
+//
+// Gemini 对每个账号有 **5 小时滚动用量窗口 + 周限量**。guard 一旦触发，说明这个
+// 账号刚才已经消耗过配额了（会话被当匿名前那些请求都算在窗口里）——窗口内反复
+// 检出降级、反复续票/重抓没有任何意义：票是好的，配额就是耗尽状态，等 5 小时
+// 窗口滚动过去自然恢复。把冷却设成 5 小时正好对齐用量窗口：一次触发只救一次，
+// 之后整个窗口期安静，既不再打扰上游，也不给浏览器增加风控暴露。
+const modelGuardCooldownSec = 5 * 60 * 60
 
 // modelGuardFallbackRe 匹配「上游自报模型」里的匿名档名字。
 // 3.5 Flash-Lite 是已知的静默降级落点（3.1 Pro / thinking / 媒体工具匿名时全部
@@ -75,9 +83,12 @@ func modelGuardCheck(model, upstream string, accountID int64, status int) {
 
 	modelGuardMu.Lock()
 	now := time.Now().Unix()
-	if last, ok := modelGuardLastFired[accountID]; ok && now-last < modelGuardCooldownSec {
-		modelGuardMu.Unlock()
-		return
+	if last, ok := modelGuardLastFired[accountID]; ok {
+		if remain := modelGuardCooldownSec - (now - last); remain > 0 {
+			modelGuardMu.Unlock()
+			logf("[model-guard] 账号 #%d 检测冷却中（剩约 %d 小时 %d 分钟），跳过：5 小时用量窗口内重复触发无意义", accountID, remain/3600, remain%3600/60)
+			return
+		}
 	}
 	modelGuardLastFired[accountID] = now
 	modelGuardMu.Unlock()
