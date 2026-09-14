@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -213,9 +214,17 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 	if cid == "" {
 		return nil, fmt.Errorf("没拿到会话 id，无法定位产物")
 	}
+	logf("[media] 开始轮询产物 cid=%s maxPolls=%d interval=%s", cid, maxPolls, interval)
 	var dlURLs []string
+	var lastBody string
+	var pollErrs int
 	for i := 0; i < maxPolls; i++ {
-		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err == nil {
+		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err != nil {
+			pollErrs++
+			lastBody = ""
+			logf("[media] 轮询 %d/%d 失败: %v", i+1, maxPolls, err)
+		} else {
+			lastBody = body
 			if picked := pickResponseDataURLs(collectDownloadURLs(body)); len(picked) > 0 {
 				dlURLs = picked
 				break
@@ -228,6 +237,21 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 		time.Sleep(interval)
 	}
 	if len(dlURLs) == 0 {
+		// 诊断：把最后一轮 hNvQHb 的关键片段计数打出来，便于定位是格式变了
+		// 还是生成根本没完成。仅失败路径，不影响正常请求。
+		if lastBody != "" {
+			logf("[media] 轮询耗尽 cid=%s pollErrs=%d bodyLen=%d fragments: response_data=%d contribution=%d usercontent=%d mp4=%d temp_data=%d video=%d",
+				cid, pollErrs, len(lastBody),
+				strings.Count(lastBody, "response_data"),
+				strings.Count(lastBody, "contribution"),
+				strings.Count(lastBody, "usercontent"),
+				strings.Count(lastBody, "mp4"),
+				strings.Count(lastBody, "temp_data"),
+				strings.Count(lastBody, "video"))
+			_ = os.WriteFile("/tmp/hnv_last_"+cid+".txt", []byte(lastBody), 0644)
+		} else {
+			logf("[media] 轮询耗尽 cid=%s pollErrs=%d（全部轮询都失败，从未拿到响应体）", cid, pollErrs)
+		}
 		return nil, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
 	}
 	var arts []MediaArtifact
@@ -244,11 +268,208 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 		if err != nil {
 			return arts, err
 		}
+		// contribution 下载链对音乐返回裸 mp3，但对视频返回的是一层 protobuf
+		// 信封（content-type: application/protobuf）：field1=元数据子消息（prompt/
+		// summary 等）、后面跟着资源子消息（内含 "video/mp4" mime 字符串 + 完整
+		// MP4 字节，尾部还可能带 "Current time is …" trailer）。
+		// 不剥开的话客户端拿到的是播放器打不开的几 MB "protobuf"。
+		if strings.Contains(mime, "protobuf") {
+			if mp4, innerMime := extractVideoFromEnvelope(data); mp4 != nil {
+				data = mp4
+				if innerMime != "" {
+					mime = innerMime
+				} else {
+					mime = defaultMime
+				}
+			}
+		}
 		if !artifactSeen(arts, data) {
 			arts = append(arts, MediaArtifact{Mime: mime, Data: data})
 		}
 	}
 	return arts, nil
+}
+
+// protobufVarint 解析一个 varint，返回 (值, 下一偏移)。
+func protobufVarint(d []byte, i int) (uint64, int, error) {
+	var v uint64
+	var s uint
+	for {
+		if i >= len(d) {
+			return 0, i, fmt.Errorf("varint 越界")
+		}
+		b := d[i]
+		i++
+		v |= uint64(b&0x7f) << s
+		if b&0x80 == 0 {
+			return v, i, nil
+		}
+		s += 7
+		if s > 63 {
+			return 0, i, fmt.Errorf("varint 过长")
+		}
+	}
+}
+
+// protobufSkip 跳过一个字段值（tag 已读），返回值的结束偏移。
+func protobufSkip(d []byte, i int, wire int) (int, error) {
+	switch wire {
+	case 0: // varint
+		_, k, err := protobufVarint(d, i)
+		return k, err
+	case 1: // 64-bit
+		return i + 8, nil
+	case 2: // length-delimited
+		n, j, err := protobufVarint(d, i)
+		if err != nil {
+			return i, err
+		}
+		return j + int(n), nil
+	case 5: // 32-bit
+		return i + 4, nil
+	default:
+		return i, fmt.Errorf("不支持的 wire type %d", wire)
+	}
+}
+
+// extractVideoFromEnvelope 从 contribution 下载链返回的 protobuf 信封里剥出
+// 嵌入的 MP4 字节与声明的 mime。
+//
+// 结构（2026-09-15 对线上产物逐字节解析）：
+//
+//	0a <len1> { prompt / summary 等元数据 }   field1: 元数据子消息
+//	0a <len2> { 12 <len> "video/mp4"          field2: 资源子消息
+//	            0a <len3> <MP4 字节> }                （field2 内还有一层包裹）
+//	1a .. "Current time is …"                 尾部 trailer
+//
+// 剥离按结构走：在顶层找资源子消息，再在其内找 mime 字符串与 ftyp 开头的 MP4。
+func extractVideoFromEnvelope(data []byte) ([]byte, string) {
+	i := 0
+	for i < len(data) {
+		tag, j, err := protobufVarint(data, i)
+		if err != nil {
+			return nil, ""
+		}
+		field := int(tag >> 3)
+		wire := int(tag & 7)
+		if wire != 2 {
+			k, err := protobufSkip(data, j, wire)
+			if err != nil {
+				return nil, ""
+			}
+			i = k
+			continue
+		}
+		n, s, err := protobufVarint(data, j)
+		if err != nil {
+			return nil, ""
+		}
+		payload := data[s : s+int(n)]
+		if field == 1 {
+			// 元数据子消息，跳过
+			i = s + int(n)
+			continue
+		}
+		if mp4, mime := extractVideoFromResource(payload); mp4 != nil {
+			return mp4, mime
+		}
+		i = s + int(n)
+	}
+	return nil, ""
+}
+
+// extractVideoFromResource 在资源子消息里找 mime 字符串与 MP4 字节。
+// 递归下钻：field2 可能是「再包一层」的子消息（线上实测就是如此）。
+func extractVideoFromResource(d []byte) ([]byte, string) {
+	mime := ""
+	var mp4 []byte
+	i := 0
+	for i < len(d) {
+		tag, j, err := protobufVarint(d, i)
+		if err != nil {
+			break
+		}
+		wire := int(tag & 7)
+		if wire != 2 {
+			k, err := protobufSkip(d, j, wire)
+			if err != nil {
+				break
+			}
+			i = k
+			continue
+		}
+		n, s, err := protobufVarint(d, j)
+		if err != nil {
+			break
+		}
+		payload := d[s : s+int(n)]
+		switch {
+		case looksLikeMP4(payload):
+			if mp4 == nil {
+				mp4 = payload
+			}
+		case looksLikeMimeString(payload):
+			// mime 字符串（"video/mp4" / "audio/mpeg"）。线上信封里它出现在
+			// 不同层级/字段号（外层 field2、内层 field1 都见过），按内容识别
+			// 比按字段号可靠。
+			if mime == "" {
+				mime = string(payload)
+			}
+		default:
+			// 可能是再包一层的子消息，下钻
+			if m2, m2mime := extractVideoFromResource(payload); m2 != nil {
+				mp4 = m2
+				if m2mime != "" {
+					mime = m2mime
+				}
+			}
+		}
+		i = s + int(n)
+	}
+	return mp4, mime
+}
+
+// looksLikeMimeString 判断一段字节是不是 mime 字符串："type/subtype" 形状、
+// 全可打印、长度合理。信封里还见过 "video/mp4" 之外的值，别硬编码清单。
+func looksLikeMimeString(d []byte) bool {
+	if len(d) == 0 || len(d) >= 64 {
+		return false
+	}
+	slash := bytes.IndexByte(d, '/')
+	if slash <= 0 || slash == len(d)-1 {
+		return false
+	}
+	return isPrintableASCII(d)
+}
+
+// findEmbeddedMP4 在一段字节里定位以 "ftyp" box 开头的 MP4（box 长度在 ftyp 前
+// 4 字节），返回从 box 头开始到末尾的字节。返回 nil 表示没找到。
+func findEmbeddedMP4(d []byte) []byte {
+	idx := bytes.Index(d, []byte("ftyp"))
+	if idx < 4 {
+		return nil
+	}
+	start := idx - 4
+	brand := d[idx+4 : idx+8]
+	for _, b := range brand {
+		if b < 0x20 || b > 0x7e {
+			return nil
+		}
+	}
+	return d[start:]
+}
+
+func isPrintableASCII(d []byte) bool {
+	for _, b := range d {
+		if b < 0x20 || b > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikeMP4(d []byte) bool {
+	return len(d) > 12 && bytes.Equal(d[4:8], []byte("ftyp"))
 }
 
 // pollHistoryRaw 调一次 hNvQHb 取会话历史，返回原始响应体。
@@ -282,7 +503,9 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error)
 // deleteConversation 删掉 gemini.google.com 上留下的一条会话（#19）。
 //
 // 协议逐字取自抓包：rpc GzXR5e，参数 ["<cid>"]，mode "generic"，带 at=XSRF。
-//   f.req=[[["GzXR5e","[\"c_xxx\"]",null,"generic"]]]&at=<xsrf>
+//
+//	f.req=[[["GzXR5e","[\"c_xxx\"]",null,"generic"]]]&at=<xsrf>
+//
 // 只登录态可用（匿名没有 XSRF、会话也没落到账号里）。best-effort：删失败只记日志，
 // 不影响已经返给客户端的响应。
 func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string) {
