@@ -439,6 +439,11 @@ func parseToolChoice(tc interface{}) (string, string) {
 type PromptTooLongError struct {
 	Bytes, Budget int
 	HasCookie     bool // 有 cookie 却还超，说明附件那条路也没救回来
+	// PoolTemporarilyDown 表示**池里有 enabled 的号、只是这一轮全部不可用**
+	// （出口被 sorry 页拦 / 网络抖动）而降级匿名。此时「去添加 cookie」是
+	// 死路 —— 号明明在。2026-09-14 实测：#71 出口撞 sorry 页的一瞬间，
+	// 176K 的长对话降级匿名、附件传不了、报 400，文案却让人去加 cookie。
+	PoolTemporarilyDown bool
 }
 
 func (e *PromptTooLongError) Error() string {
@@ -448,8 +453,17 @@ func (e *PromptTooLongError) Error() string {
 			"truncates from the end, which would drop your latest message and produce an "+
 			"unrelated answer, so this request is rejected instead.",
 		e.Bytes, e.Budget)
-	if !e.HasCookie {
-		// 没 cookie 时这不是死路：导一个进来就能走附件，长度限制基本就没了。
+	switch {
+	case e.PoolTemporarilyDown:
+		// 池里有号、只是这轮不可用：说清根因和恢复方式，别让人去白加 cookie。
+		return base + " A cookie IS configured in the pool, but every account was " +
+			"unavailable this round (egress IP blocked by Google's sorry page or a " +
+			"network hiccup), so the request fell back to anonymous — which cannot " +
+			"upload oversized conversations as a text attachment. Retry shortly; " +
+			"the browser keep-alive path usually restores the egress within minutes. " +
+			"Check the admin panel (Cookie pool → 检测) for the underlying error."
+	case !e.HasCookie:
+		// 池子整个是空的：导一个进来就能走附件，长度限制基本就没了。
 		// 不说这句的话用户只会以为"这项目撑不住长上下文"。
 		return base + " Add a Google account cookie in the admin panel (Cookie pool) — " +
 			"with one configured, oversized conversations are uploaded as a text " +

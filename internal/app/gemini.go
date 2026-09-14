@@ -302,6 +302,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	var picked Proxy
 	var cookieID int64
 	var cookieLabel string
+	// 「池里有 enabled 的号、但这轮全部不可用而降级匿名」的标记：PromptTooLongError
+	// 用它把文案从「去添加 cookie」换成「等出口恢复/重试」，见 messages.go。
+	cookiePoolTemporarilyDown := false
 	attrib := func(err error) (*StreamResult, error) {
 		return &StreamResult{
 			AccountID: cookieID, AccountLabel: cookieLabel,
@@ -403,8 +406,17 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				"到面板「Cookie 池」用「检测」按钮逐个排查，或打开 fallback_anon 降级匿名",
 				len(tried), lastCookieErr))
 		}
-		logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
-		cookieID, cookieLabel = 0, ""
+		// 降级匿名。但如果池子里本来有 enabled 的号（比如 #71 只是这轮出口被
+		// sorry 页拦了一下），PromptTooLongError 的文案就不能再说「去添加
+		// cookie」—— 号明明在，只是这一轮不可用，按它说的去添加是死路。
+		// HasCookie 语义修正为「cookie 池整体可用」，两条文案分开见 messages.go。
+		if _, enabled := accountCount(); enabled > 0 {
+			cookieID, cookieLabel = 0, ""
+			cookiePoolTemporarilyDown = true
+		} else {
+			logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
+			cookieID, cookieLabel = 0, ""
+		}
 	}
 	// 图片附件：上传要 cookie，而且必须走跟正式请求同一个出口，所以排在这里。
 	if len(pending) > 0 {
@@ -441,6 +453,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	if budget > 0 && len(prompt) > budget {
 		return attrib(&PromptTooLongError{
 			Bytes: len(prompt), Budget: budget, HasCookie: cookieStr != "",
+			PoolTemporarilyDown: cookiePoolTemporarilyDown,
 		})
 	}
 
