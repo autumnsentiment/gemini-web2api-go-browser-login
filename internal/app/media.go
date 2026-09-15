@@ -865,7 +865,8 @@ func artifactSeen(arts []MediaArtifact, data []byte) bool {
 }
 
 // appendArtifactMarkdown 把产物字节转成 base64 data URL 追加到正文后面。
-// 图片用 markdown 图片语法（多数聊天 UI 能直接渲染），其余（音频）用链接语法。
+// 图片用 markdown 图片语法（多数聊天 UI 能直接渲染），视频/音频用链接语法
+// （markdown 没有标准视频内联语法，链接是客户端识别 data URL 的通用做法）。
 func appendArtifactMarkdown(text string, arts []MediaArtifact) string {
 	var b strings.Builder
 	b.WriteString(text)
@@ -874,9 +875,12 @@ func appendArtifactMarkdown(text string, arts []MediaArtifact) string {
 			b.WriteString("\n\n")
 		}
 		dataURL := "data:" + a.Mime + ";base64," + base64.StdEncoding.EncodeToString(a.Data)
-		if strings.HasPrefix(a.Mime, "image/") {
+		switch {
+		case strings.HasPrefix(a.Mime, "image/"):
 			b.WriteString("![image](" + dataURL + ")")
-		} else {
+		case strings.HasPrefix(a.Mime, "video/"):
+			b.WriteString("[video](" + dataURL + ")")
+		default:
 			b.WriteString("[audio](" + dataURL + ")")
 		}
 	}
