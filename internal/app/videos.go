@@ -11,7 +11,9 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -95,7 +97,18 @@ func handleCreateVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 // runVideoJob 后台跑视频生成，结果写回 job。
+//
+// recover 兜底（2026-09-15 线上事故）：媒体链路任何一处 panic（当时是信封解析
+// 越界）以前会把整个进程带崩 —— 容器重启、所有内存里的 video job 凭空消失，
+// 客户端轮询拿到 404，new-api 侧表现为 502。有了这层兜底，panic 只让**当前
+// 这一个任务**失败并留下原因，服务继续跑。
 func runVideoJob(j *videoJob) {
+	defer func() {
+		if r := recover(); r != nil {
+			logf("[videos] 任务 %s panic（已兜底，进程不受影响）: %v\n%s", j.ID, r, debug.Stack())
+			finishVideoJob(j, nil, "", fmt.Sprintf("internal error: %v", r))
+		}
+	}()
 	videoJobsMu.Lock()
 	j.Status = "in_progress"
 	videoJobsMu.Unlock()

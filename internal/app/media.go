@@ -398,6 +398,15 @@ func extractVideoFromResource(d []byte) ([]byte, string) {
 		if err != nil {
 			break
 		}
+		// ★ 边界保护（2026-09-15 线上 panic 修复）★
+		// 递归下钻会把**普通文本子消息**（例如 "To satisfy ..." 一段几千字的
+		// 拒绝说明）当成 protobuf 再解析，里面的 ASCII 字节被读成天文数字的
+		// varint 长度（实测 187452407），d[s:s+n] 直接越界 panic —— 整个进程
+		// 崩溃重启，所有内存里的 video job 全部丢失，客户端拿到 502。
+		// 长度声明超出剩余字节 = 不是合法的 protobuf 字段，停止本层解析。
+		if n > uint64(len(d)-s) {
+			break
+		}
 		payload := d[s : s+int(n)]
 		switch {
 		case looksLikeMP4(payload):
@@ -412,11 +421,68 @@ func extractVideoFromResource(d []byte) ([]byte, string) {
 				mime = string(payload)
 			}
 		default:
-			// 可能是再包一层的子消息，下钻
-			if m2, m2mime := extractVideoFromResource(payload); m2 != nil {
-				mp4 = m2
-				if m2mime != "" {
-					mime = m2mime
+			// 可能是再包一层的子消息，下钻。限定递归深度与最小尺寸：
+			// 太短的 payload 不可能是「子消息 + 内嵌 mp4」，别浪费栈。
+			if len(payload) >= 32 && int(tag>>3) < 100 {
+				if m2, m2mime := extractVideoFromResourceDepth(payload, mime, 1); m2 != nil {
+					mp4 = m2
+					if m2mime != "" {
+						mime = m2mime
+					}
+				}
+			}
+		}
+		i = s + int(n)
+	}
+	return mp4, mime
+}
+
+// extractVideoFromResourceDepth 是 extractVideoFromResource 的递归体，
+// depth 防失控：合法信封的嵌套实测最多 3 层（顶层 → 资源 → mime/mp4）。
+func extractVideoFromResourceDepth(d []byte, mime string, depth int) ([]byte, string) {
+	if depth > 6 {
+		return nil, ""
+	}
+	var mp4 []byte
+	i := 0
+	for i < len(d) {
+		tag, j, err := protobufVarint(d, i)
+		if err != nil {
+			return mp4, mime
+		}
+		wire := int(tag & 7)
+		if wire != 2 {
+			k, err := protobufSkip(d, j, wire)
+			if err != nil {
+				return mp4, mime
+			}
+			i = k
+			continue
+		}
+		n, s, err := protobufVarint(d, j)
+		if err != nil {
+			return mp4, mime
+		}
+		if n > uint64(len(d)-s) {
+			return mp4, mime
+		}
+		payload := d[s : s+int(n)]
+		switch {
+		case looksLikeMP4(payload):
+			if mp4 == nil {
+				mp4 = payload
+			}
+		case looksLikeMimeString(payload):
+			if mime == "" {
+				mime = string(payload)
+			}
+		default:
+			if len(payload) >= 32 && int(tag>>3) < 100 {
+				if m2, m2mime := extractVideoFromResourceDepth(payload, mime, depth+1); m2 != nil {
+					mp4 = m2
+					if m2mime != "" {
+						mime = m2mime
+					}
 				}
 			}
 		}

@@ -133,3 +133,42 @@ func TestExtractVideoEnvelopeDeepField1(t *testing.T) {
 		t.Error("混入了非 mp4 尾部")
 	}
 }
+
+// TestExtractVideoFromResourceNoPanic 回归 2026-09-15 线上 panic：递归下钻把
+// 一段普通英文说明文本当 protobuf 解析，ASCII 字节被读成 187452407 的长度，
+// slice 越界崩掉整个进程。修复后必须静默返回而不是 panic。
+func TestExtractVideoFromResourceNoPanic(t *testing.T) {
+	// 线上崩溃样本的形状：长英文文本 + 其中嵌着少量二进制位
+	text := bytes.Repeat([]byte("To satisfy your request we need to generate the video first. "), 200)
+	text[100] = 0xa0 // 随机高位字节，让 varint 读出大数
+	text[101] = 0x8e
+	text[102] = 0x01
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("解析崩溃未兜住: %v", r)
+		}
+	}()
+	// 直接喂整段文本（就是线上崩掉的那条路径）
+	_, _ = extractVideoFromResource(text)
+	// 再喂包了一层的
+	_, _ = extractVideoFromEnvelope(text)
+}
+
+// TestExtractVideoFromResourceFuzzShape 随机二进制打不崩。
+func TestExtractVideoFromResourceFuzzShape(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("fuzz 崩溃: %v", r)
+		}
+	}()
+	variants := [][]byte{
+		{0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01},       // 巨大长度声明
+		{0x0a, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}, // 超长 varint
+		{0xff, 0xff, 0xff, 0xff},                         // 乱 tag
+		{0x0a, 0x05, 'h', 'e', 'l', 'l', 'o'},            // 正常小消息
+	}
+	for i, v := range variants {
+		_, _ = extractVideoFromResource(v)
+		_ = i
+	}
+}
