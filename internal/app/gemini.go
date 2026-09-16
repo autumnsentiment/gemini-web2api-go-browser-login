@@ -353,9 +353,20 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// endpoint 要等出口定下来才能拼：currentBL 可能顺手踢一次后台抓取，
 	// 那个抓取必须跟正式请求走同一个出口，否则配了代理池也会从本机 IP 漏一次。
 	reqid := time.Now().Unix() % 1000000
+	// 媒体请求（生图/音乐/视频）的 bl 选择。
+	//
+	// 历史：钉死的老 bl 曾能保住 inner[49] 工具位（自动抓到的新版会让工具位
+	// 失效）。但 2026-09-17 实测上游再次改版：老 bl 下视频返回「异步渲染任务」
+	// （r_... 任务 ID + 进度标记，无内容帧），必须跟随新版 bl 才走同步产物流程。
+	// 由 media_use_auto_bl 开关控制（默认 true = 跟随自动 bl），出问题时可以
+	// 关掉退回钉死值。
+	bl := currentBL(proxyURL)
+	if mc.Tool > 0 && !rtCfg().MediaUseAutoBL {
+		bl = currentBLPinned()
+	}
 	endpoint := fmt.Sprintf(
 		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid,
+		bl, reqid,
 	)
 
 	// 取 XSRF token。一个 cookie 失效不该让整个请求失败：当前号取不到就换下一个，
@@ -591,8 +602,26 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 	}
 
-	for attempt := 0; attempt < rtCfg().RetryAttempts; attempt++ {
-		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB)
+	// ── 重试预算：媒体请求单独收紧 + 按失败类型区分（2026-09-16 线上实测）──
+	//
+	// 视频生成的 StreamGenerate 比普通对话慢得多（实测 >273 秒，队列繁忙时更久），
+	// 默认 3 次重试会把它放大成「3 × 超时 + 间隔」≈ 15 分钟 —— 客户端/网关早就
+	// 判超时了，我们还在重试。所以媒体请求的预算压到 2 次，并且**只对网络类错误
+	// 重试**：连接被代理重置（read: connection reset by peer）这类瞬时故障值得
+	// 一次重试；而超时（context deadline exceeded）说明已经等满 480 秒预算，
+	// 再试一次只会把总时长翻倍，没有意义 —— 直接失败让调用方决定。
+	retryBudget := rtCfg().RetryAttempts
+	if mc.Tool > 0 && retryBudget > 2 {
+		retryBudget = 2
+	}
+	for attempt := 0; attempt < retryBudget; attempt++ {
+		// 媒体请求（生图/音乐/视频）用单独的长超时：视频 StreamGenerate 实测
+		// 182.9 秒，全局 180 秒会把它拦腰砍断（产物其实已生成好）。
+		reqTimeout := 0
+		if mc.Tool > 0 {
+			reqTimeout = mediaTimeoutSec
+		}
+		statusCode, raw, ttfb, setCookie, err := doGeminiRequest(endpoint, body, geminiHeaders, proxyURL, lineCB, reqTimeout)
 		if len(setCookie) > 0 && cookieID > 0 {
 			if merged := mergeSetCookie(cookieStr, setCookie); merged != cookieStr {
 				cookieStr = merged
@@ -602,14 +631,28 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		if err != nil {
 			lastErr = err
 			if pickedOK {
-				recordProxyResult(picked.ID, false, err.Error())
+				// ★ 媒体请求的超时不算代理的错（2026-09-17 线上事故）★
+				// 视频生成本来就慢（实测 >480 秒），「等满超时预算」反映的是上游
+				// 排队时长，不是出口质量。把它记成代理失败会让唯一出口在几次
+				// 视频测试后熔断（fail_count=5，冷却 120 分钟），之后所有请求
+				// 都 429 —— 客户端看到的是「模型突然全挂」，排查时完全想不到
+				// 是视频超时把代理熔断了。网络类错误（连接重置/EOF）仍然照记。
+				if !(mc.Tool > 0 && isTimeoutError(err)) {
+					recordProxyResult(picked.ID, false, err.Error())
+				}
 			}
 			// 已经往客户端吐过内容就不能重试，否则会重复（思考链也算吐过）。
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: %v", attempt+1, rtCfg().RetryAttempts, err)
+			// 媒体请求超时不重试：已经等满 540 秒预算，再试一次只是把总时长翻倍。
+			// 网络类错误（连接重置/EOF）才值得一次重试 —— 那是瞬时故障。
+			if mc.Tool > 0 && isTimeoutError(err) {
+				logf("媒体请求超时（%v），不重试、不计代理失败（已等满 %d 秒预算）", err, mediaTimeoutSec)
+				break
+			}
+			if attempt < retryBudget-1 {
+				logf("retry %d/%d: %v", attempt+1, retryBudget, err)
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
@@ -637,7 +680,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
-			if attempt < rtCfg().RetryAttempts-1 {
+			if attempt < retryBudget-1 {
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
@@ -662,8 +705,8 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			// 诊断：空响应不是一种东西 —— 1155 瞬时拒绝、内容政策拒、参数不认，
 			// 原文各不相同。打出截断原文（换行折叠），排查不用再猜。
 			logf("空响应原文（%d 字节）: %s", len(raw), truncate(strings.ReplaceAll(string(raw), "\n", " "), 300))
-			if attempt < rtCfg().RetryAttempts-1 {
-				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
+			if attempt < retryBudget-1 {
+				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, retryBudget, len(raw))
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)
 			}
 			continue
@@ -789,7 +832,7 @@ func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
 // __Secure-3PSIDCC，浏览器收下再带回去。一直发旧值的客户端会被判定为过期会话，
 // 实测号活一两小时就失效 —— 所以这些必须收下来并写回账号。
 func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL string,
-	onLine func(string)) (int, []byte, int64, []string, error) {
+	onLine func(string), timeoutSec int) (int, []byte, int64, []string, error) {
 	sendAt := time.Now()
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
@@ -801,7 +844,7 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibClient(proxyURL)
+		client := getStdlibClientTimeout(proxyURL, timeoutSec)
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, 0, nil, err
@@ -822,7 +865,7 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := getTLSClient()
+	client := getTLSClientTimeout(timeoutSec)
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, 0, nil, err
@@ -1080,6 +1123,7 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	body := form.Encode()
 
 	reqid := time.Now().Unix() % 1000000
+	// probe 走普通对话载荷，用自动 bl 即可（媒体请求的钉死值见 streamGenerateWithFiles）。
 	endpoint := fmt.Sprintf(
 		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
 		currentBL(proxyURL), reqid,
@@ -1178,4 +1222,15 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	res.ResponseText = truncate(text, 200)
 	res.Diagnostic = "调用成功。延迟 / 内容见上面字段。"
 	return res
+}
+
+// isTimeoutError 判断错误是不是「等满超时预算」类（区别于连接重置等网络错误）。
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "Client.Timeout") ||
+		strings.Contains(msg, "i/o timeout")
 }

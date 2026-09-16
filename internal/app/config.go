@@ -59,6 +59,8 @@ type Config struct {
 	// BrowserRefreshMinutes: 抓取兜底间隔（分钟）。读得到 cookie 有效期时按
 	// 「有效期 - 5 分钟」动态调度，见 browser_cdp.go。
 	BrowserRefreshMinutes int `json:"browser_refresh_minutes"`
+	// MediaUseAutoBL: 媒体请求是否跟随自动 bl（见 bl.go）。默认 true。
+	MediaUseAutoBL bool `json:"media_use_auto_bl"`
 }
 
 var (
@@ -101,6 +103,7 @@ func defaultConfig() Config {
 		AutoDeleteConversation: false,
 		AnonFirst:              false,
 		BrowserRefreshMinutes:  10,
+		MediaUseAutoBL:         true,
 	}
 }
 

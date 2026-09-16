@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,8 +56,20 @@ func resolveProfile(name string) profiles.ClientProfile {
 // For proxied connections we use stdlib (see getStdlibClient) — tls-client's SOCKS5
 // implementation is fragile compared to net/http.
 func getTLSClient() tls_client.HttpClient {
+	return getTLSClientTimeout(0)
+}
+
+// getTLSClientTimeout 同 getTLSClient，但可指定超时（秒）；0 = 用全局配置。
+// tls-client 没有运行时的超时 setter（超时在建实例时固化），所以按
+// (指纹, 超时) 组合缓存独立实例。媒体请求用 mediaTimeoutSec。
+func getTLSClientTimeout(timeoutSec int) tls_client.HttpClient {
+	if timeoutSec <= 0 {
+		timeoutSec = rtCfg().RequestTimeout
+	}
+	key := rtCfg().Impersonate + "|" + strconv.Itoa(timeoutSec)
+
 	clientCacheMu.RLock()
-	if c, ok := clientCache[rtCfg().Impersonate]; ok {
+	if c, ok := clientCache[key]; ok {
 		clientCacheMu.RUnlock()
 		return c
 	}
@@ -64,11 +77,11 @@ func getTLSClient() tls_client.HttpClient {
 
 	clientCacheMu.Lock()
 	defer clientCacheMu.Unlock()
-	if c, ok := clientCache[rtCfg().Impersonate]; ok {
+	if c, ok := clientCache[key]; ok {
 		return c
 	}
 	opts := []tls_client.HttpClientOption{
-		tls_client.WithTimeoutSeconds(rtCfg().RequestTimeout),
+		tls_client.WithTimeoutSeconds(timeoutSec),
 		tls_client.WithClientProfile(resolveProfile(rtCfg().Impersonate)),
 		tls_client.WithNotFollowRedirects(),
 	}
@@ -77,7 +90,7 @@ func getTLSClient() tls_client.HttpClient {
 		fmt.Fprintf(os.Stderr, "[client] tls-client init failed: %v\n", err)
 		os.Exit(1)
 	}
-	clientCache[rtCfg().Impersonate] = client
+	clientCache[key] = client
 	return client
 }
 
@@ -103,10 +116,28 @@ var (
 	stdlibClientCache sync.Map // proxyURL -> *http.Client
 )
 
-// getStdlibClient returns an http.Client routed through proxyURL.
-// proxyURL must not be empty (caller checks).
-func getStdlibClient(proxyURL string) *http.Client {
-	if cached, ok := stdlibClientCache.Load(proxyURL); ok {
+// mediaTimeoutSec 是媒体请求（生图/音乐/视频）的单独超时（秒）。
+//
+// 为什么单独给：视频（Veo）生成比普通对话慢得多。实测数据（2026-09-16/17）：
+//   - 180 秒超时：视频 StreamGenerate 撞墙（182.9s 被砍）
+//   - 300 秒超时：仍然不够（310.7s 被砍）
+// 视频生成的 StreamGenerate 是**同步等待**上游把视频做完才回，队列繁忙时
+// 需要数分钟。全局 180 秒是为普通对话调的，媒体请求必须给足预算。
+//
+// 取 540 秒（9 分钟）：new-api 渠道测试实测能等约 9 分 8 秒（观测值），
+// 540 秒留出链路开销的余量，避免我们比客户端先放弃。
+// 超时后不重试（见 gemini.go：isTimeoutError 分支），总耗时 ≈ 单次超时；
+// 网络类错误（连接被重置）才重试一次，那是瞬时故障。
+const mediaTimeoutSec = 540
+
+// getStdlibClientTimeout 同 getStdlibClient，但可指定超时（秒）。
+// 超时不同则用独立缓存键，互不干扰。
+func getStdlibClientTimeout(proxyURL string, timeoutSec int) *http.Client {
+	if timeoutSec <= 0 {
+		timeoutSec = rtCfg().RequestTimeout
+	}
+	key := proxyURL + "|" + strconv.Itoa(timeoutSec)
+	if cached, ok := stdlibClientCache.Load(key); ok {
 		return cached.(*http.Client)
 	}
 	t := &http.Transport{
@@ -121,15 +152,21 @@ func getStdlibClient(proxyURL string) *http.Client {
 		t.Proxy = http.ProxyURL(u)
 	}
 	c := &http.Client{
-		Timeout:   time.Duration(rtCfg().RequestTimeout) * time.Second,
+		Timeout:   time.Duration(timeoutSec) * time.Second,
 		Transport: t,
 		// 跟 tls-client 一致：不自动跟随重定向（302 是诊断信号）
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	stdlibClientCache.Store(proxyURL, c)
+	stdlibClientCache.Store(key, c)
 	return c
+}
+
+// getStdlibClient returns an http.Client routed through proxyURL.
+// proxyURL must not be empty (caller checks).
+func getStdlibClient(proxyURL string) *http.Client {
+	return getStdlibClientTimeout(proxyURL, 0)
 }
 
 // loadCookie reads the cookie file (Netscape one-line format or JSON).

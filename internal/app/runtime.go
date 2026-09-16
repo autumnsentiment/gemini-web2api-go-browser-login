@@ -58,6 +58,9 @@ type RuntimeConfig struct {
 	// 浏览器抓取兜底间隔（分钟）：读不到 cookie 有效期时按它排下一次浏览器抓取；
 	// 读得到有效期时按「有效期 - 5 分钟」。见 browser_cdp.go。0 = 用默认 10。
 	BrowserRefreshMinutes int `json:"browser_refresh_minutes"`
+	// MediaUseAutoBL: 媒体请求（生图/音乐/视频）是否跟随自动抓到的 bl。
+	// 默认 true —— 上游前端改版后老 bl 会让视频走异步渲染分支（无内容帧）。见 bl.go。
+	MediaUseAutoBL bool `json:"media_use_auto_bl"`
 }
 
 const runtimeConfigKey = "runtime_config"
@@ -93,6 +96,7 @@ func initRuntimeConfig() {
 		AutoDeleteConversation: cfg.AutoDeleteConversation,
 		AnonFirst:              cfg.AnonFirst,
 		BrowserRefreshMinutes:  cfg.BrowserRefreshMinutes,
+		MediaUseAutoBL:         cfg.MediaUseAutoBL,
 	}
 	if raw := kvGet(runtimeConfigKey); raw != "" {
 		saved := base
