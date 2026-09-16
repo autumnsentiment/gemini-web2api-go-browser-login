@@ -173,6 +173,12 @@ func Run() {
 		mux.HandleFunc("/admin/api/browser/profiles", requireAuth(handleAdminBrowserProfiles))
 		mux.HandleFunc("/admin/api/browser/profiles/", requireAuth(handleAdminBrowserProfileAction))
 		mux.HandleFunc("/admin/api/browser/refresh", requireAuth(handleAdminBrowserNow))
+		mux.HandleFunc("/admin/api/browser/env", requireAuth(handleAdminBrowserEnv))
+		mux.HandleFunc("/admin/api/browser/access-url", requireAuth(handleAdminBrowserAccessURL))
+		mux.HandleFunc("/admin/api/browser/guide-done", requireAuth(handleAdminBrowserGuideDone))
+		mux.HandleFunc("/admin/api/browser/extension", requireAuth(handleAdminBrowserExtension))
+		// 远程浏览器扩展推送 cookie（扩展填 API key，独立于 admin 会话）
+		mux.HandleFunc("/api/browser/ingest", requireAPIKey(handleBrowserIngest))
 		mux.HandleFunc("/admin/api/test", requireAuth(handleAdminTest))
 	}
 

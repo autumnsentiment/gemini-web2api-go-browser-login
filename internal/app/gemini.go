@@ -659,6 +659,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			if tracker.emitted != "" || rtracker.emitted != "" {
 				break
 			}
+			// 诊断：空响应不是一种东西 —— 1155 瞬时拒绝、内容政策拒、参数不认，
+			// 原文各不相同。打出截断原文（换行折叠），排查不用再猜。
+			logf("空响应原文（%d 字节）: %s", len(raw), truncate(strings.ReplaceAll(string(raw), "\n", " "), 300))
 			if attempt < rtCfg().RetryAttempts-1 {
 				logf("retry %d/%d: 空响应（无内容帧，%d 字节）", attempt+1, rtCfg().RetryAttempts, len(raw))
 				time.Sleep(time.Duration(rtCfg().RetryDelaySec) * time.Second)

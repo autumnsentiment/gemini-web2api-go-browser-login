@@ -110,17 +110,24 @@ func browserNextRefreshAt(profile string) int64 {
 	return n
 }
 
-// browserScheduleNextRefresh 抓取成功后按「关键 cookie 有效期 - 5 分钟」排下一次。
+// browserScheduleNextRefresh 排下一次抓取。
 //
-// 有效期取本轮抓到的轮换 cookie（*PSIDTS / SIDCC / *PSIDCC）里最早到期的那个；
-// 读不到有效期就退回 browserRefreshMinutes 的兜底间隔。结果钳制在
-// [冷却间隔, 最大间隔] 区间内：再急也不得小于冷却（反风控），再富余也不超过
-// 一小时（jar 有效期不等于票据寿命，不能真按一年排）。
+// 节奏（2026-09-16 用户要求「间隔可在设置里自定义，单位分钟」）：
+//   - 设置里 browser_refresh_minutes > 0 时按**固定间隔**排（用户显式配的节奏优先）；
+//   - 否则按「关键 cookie 有效期 - 5 分钟」动态排，读不到有效期退回默认间隔。
+//
+// 结果统一钳制在 [冷却间隔, 最大间隔]：再急不得小于冷却（反风控），
+// 再富余不超过一小时（jar 有效期不等于票据寿命，不能真按一年排）。
 func browserScheduleNextRefresh(profile string, minExpiryUnix int64) {
 	now := time.Now().Unix()
-	candidate := now + int64(browserRefreshMinutes())*60
-	if minExpiryUnix > 0 {
-		candidate = minExpiryUnix - browserRefreshSafetySec
+	var candidate int64
+	if configured := browserRefreshMinutesConfigured(); configured > 0 {
+		candidate = now + int64(configured)*60
+	} else {
+		candidate = now + int64(browserRefreshMinutes())*60
+		if minExpiryUnix > 0 {
+			candidate = minExpiryUnix - browserRefreshSafetySec
+		}
 	}
 	if lo := now + browserRefreshCooldownSec; candidate < lo {
 		candidate = lo
@@ -750,6 +757,15 @@ func verifyByInPageFetch(hostPort string) bool {
 //     写进 kv 排程，到点前 browserAutoRefresh 一律跳过
 //
 // 返回 (是否成功, 描述, 错误)。
+//
+// ★ 抓取模式（2026-09-16 用户要求）★
+//
+// 先「只读抓取」：不导航、不刷新页面，直接从现有页面/CDP 读 cookie。只有读到的
+// cookie 验证失败（页面判匿名 / 缺关键项）才导航刷新一次再抓。这样日常抓取不再
+// 反复刷新页面，显著降低风控暴露；刷新只发生在确实需要时。
+//
+// 顺序：冷却闸门 → 控制器确保实例在跑 → 只读抓取（读页面登录态 + 抓 cookie）
+// → 失败才导航刷新 → 重读 → 入库 → 按有效期排程下次。
 func browserRefreshOne(label, profile string) (bool, string, error) {
 	if !browserEnabled() {
 		return false, "", fmt.Errorf("浏览器登录未启用")
@@ -758,12 +774,28 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 		return false, "", fmt.Errorf("%w：profile %q 距上次抓取尝试不足 %d 秒，剩余约 %d 秒",
 			errBrowserRefreshCooldown, profile, browserRefreshCooldownSec, remain)
 	}
+	return browserRefreshCore(label, profile)
+}
+
+// browserRefreshCore 是抓取主体（不含闸门），供 browserRefreshOne（带闸门）
+// 与 browserRefreshOneForce（校验失败后的强制重抓）共用。
+func browserRefreshCore(label, profile string) (bool, string, error) {
 	port, err := ensureBrowserProfile(profile)
 	if err != nil {
 		return false, "", err
 	}
 	hostPort := fmt.Sprintf("%s:%d", browserCDPHost(), port)
 
+	// ── 第一步：只读抓取（不导航、不刷新）────────────────────────────────
+	// 直接从 Chromium 现有页面读登录态并抓 cookie。页面若停在别的 tab 或
+	// 尚未加载完，这步会判「未登录」，随即进入第二步的刷新路径。
+	if ok, detail := browserTryReadOnly(hostPort, label, profile); ok {
+		return true, detail, nil
+	} else {
+		logf("[browser] profile %q 只读抓取未成功（%s），刷新页面后重试", profile, detail)
+	}
+
+	// ── 第二步：导航刷新后重抓 ──────────────────────────────────────────
 	// 导航到 gemini.google.com 并等加载
 	if err := cdpNavigate(hostPort, "https://gemini.google.com/"); err != nil {
 		return false, "", err
@@ -843,6 +875,55 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 	return true, "已抓取并入库", nil
 }
 
+// browserTryReadOnly 只读抓取：不导航、不刷新，直接读现有页面的登录态并抓 cookie。
+//
+// 判据与刷新路径一致（非空 SNlM0e / 页面内 fetch 兜底），但**不做任何导航**。
+// 页面不在 gemini.google.com 上、或登录态读不到时返回 ok=false，让调用方走刷新路径。
+func browserTryReadOnly(hostPort, label, profile string) (bool, string) {
+	// 先看当前页面在哪。不在 gemini 域上就没有可读的登录态。
+	cur, err := cdpEval(hostPort, `String(location.href || '')`)
+	if err != nil {
+		return false, "读取当前页面地址失败"
+	}
+	cur = strings.TrimSpace(strings.Trim(strings.TrimSpace(cur), `"`))
+	if !strings.Contains(cur, "gemini.google.com") {
+		return false, "当前页面不在 gemini.google.com（" + truncate(cur, 60) + "）"
+	}
+	// 读登录态（只读，不导航）。
+	has, err := cdpEval(hostPort, pageStateJS)
+	if err != nil {
+		return false, "读取页面登录态失败"
+	}
+	s := strings.TrimSpace(has)
+	s = strings.Trim(s, `"`)
+	s = strings.ReplaceAll(s, `\"`, `"`)
+	if strings.Contains(s, `"err":true`) {
+		return false, "页面是错误页"
+	}
+	if strings.Contains(s, `"signin":true`) {
+		// 重验页：只读路径不处理，交给刷新路径给出「需要重新登录」的明确结论。
+		return false, "页面停在 Google 登录/重验流程"
+	}
+	if !strings.Contains(s, `"token":true`) {
+		return false, "页面里没有非空 SNlM0e"
+	}
+
+	cap, err := cdpCaptureCookies(hostPort)
+	if err != nil {
+		return false, "抓取 cookie 失败：" + err.Error()
+	}
+	cookie := cap.Cookie
+	if extractSAPISID(cookie) == "" || !strings.Contains(cookie, "__Secure-1PSID=") {
+		return false, "cookie 缺关键项（SAPISID / __Secure-1PSID）"
+	}
+	if err := browserStoreCookie(label, profile, cookie); err != nil {
+		return false, "入库失败：" + err.Error()
+	}
+	browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
+	logf("[browser] profile %q 只读抓取成功（未刷新页面）", profile)
+	return true, "已抓取并入库（未刷新页面）"
+}
+
 // browserCDPHost 返回 CDP 要连的主机：控制器和 chromium 同网络时用容器名。
 // 若 BROWSER_CDP_HOST 配置了（比如控制器与 CDP 不在同机），用配置值。
 func browserCDPHost() string {
@@ -863,10 +944,18 @@ func browserCDPHost() string {
 
 // browserStoreCookie 把抓到的 cookie 写进 accounts 表（按 profile 幂等）。
 func browserStoreCookie(label, profile, cookie string) error {
-	// 找已存在的 browser 来源 + 同 profile 的行
+	return browserStoreCookieSource(label, profile, cookie, "browser")
+}
+
+// browserStoreCookieSource 同上，但可指定来源（browser=容器抓取 / remote=远程扩展推送）。
+func browserStoreCookieSource(label, profile, cookie, source string) error {
+	if source == "" {
+		source = "browser"
+	}
+	// 找已存在的同来源 + 同 profile 的行
 	var id int64
 	err := getDB().QueryRow(
-		`SELECT id FROM accounts WHERE source='browser' AND profile=? LIMIT 1`, profile).Scan(&id)
+		`SELECT id FROM accounts WHERE source=? AND profile=? LIMIT 1`, source, profile).Scan(&id)
 	if err == nil && id > 0 {
 		// 更新 cookie，并清错误/失败
 		_, e := getDB().Exec(
@@ -877,36 +966,39 @@ func browserStoreCookie(label, profile, cookie string) error {
 		if e != nil {
 			return e
 		}
-		logf("[browser] profile %q cookie 已刷新 -> 账号 #%d", profile, id)
+		logf("[browser] profile %q cookie 已刷新 -> 账号 #%d（source=%s）", profile, id, source)
 		return nil
 	}
 	// 不存在：新建。note 标来源。
 	note := "浏览器登录自动导入"
+	if source == "remote" {
+		note = "远程浏览器扩展导入"
+	}
 	if label == "" {
 		label = profile
 	}
 	nid, e := insertID(
 		`INSERT INTO accounts(label, cookie, status, note, source, profile, created_at)
 		 VALUES (?,?,?,?,?,?,?)`,
-		strings.TrimSpace(label), cookie, "enabled", note, "browser", profile, time.Now().Unix())
+		strings.TrimSpace(label), cookie, "enabled", note, source, profile, time.Now().Unix())
 	if e != nil {
 		return e
 	}
-	logf("[browser] profile %q cookie 已入库 -> 新账号 #%d", profile, nid)
+	logf("[browser] profile %q cookie 已入库 -> 新账号 #%d（source=%s）", profile, nid, source)
 	return nil
 }
 
 // browserDeleteByProfile 删除某 profile 对应的池记录（登录态没了/手动删账号）。
 func browserDeleteByProfile(profile string) {
-	_, _ = getDB().Exec(`DELETE FROM accounts WHERE source='browser' AND profile=?`, profile)
+	_, _ = getDB().Exec(`DELETE FROM accounts WHERE source IN ('browser','remote') AND profile=?`, profile)
 }
 
-// browserAccounts 返回所有 source='browser' 的账号（含 profile 名）。
+// browserAccounts 返回所有浏览器来源（容器抓取 browser / 远程扩展 remote）的账号。
 func browserAccounts() []BrowserAccount {
 	rows, err := getDB().Query(
 		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at,
 		        last_error, fail_count, proxy_id, profile, source
-		 FROM accounts WHERE source='browser' ORDER BY id`)
+		 FROM accounts WHERE source IN ('browser','remote') ORDER BY id`)
 	if err != nil {
 		return nil
 	}
@@ -1029,6 +1121,19 @@ func browserRefreshMinutes() int {
 		return 10
 	}
 	return m
+}
+
+// browserRefreshMinutesConfigured 返回**用户显式配置**的抓取间隔（分钟）；
+// 没配过返回 0。与 browserRefreshMinutes 的区别：后者带默认值 10，
+// 用于「读不到有效期时的兜底」；本函数用于判断「用户是否要求固定间隔」。
+func browserRefreshMinutesConfigured() int {
+	if m := rtCfg().BrowserRefreshMinutes; m > 0 {
+		return m
+	}
+	if m := cfg.BrowserRefreshMinutes; m > 0 {
+		return m
+	}
+	return 0
 }
 
 // ctxNoCancel 供未来扩展。

@@ -706,6 +706,76 @@ const pages = {
     `;
   },
 
+  // 初始化引导：按部署环境给出浏览器接入路径（用户要求）。
+  // docker 环境 → 检查浏览器容器；无控制器 → 提示部署或改用本机浏览器 + 扩展。
+  // Windows 环境 → 前端探测本机浏览器，引导安装扩展并在登录后立刻抓取。
+  guide: async () => {
+    const env = await api('api/browser/env');
+    const st = await api('api/browser/status');
+    const localBrowsers = detectLocalBrowsers();
+    const isWin = (navigator.userAgent || '').includes('Windows');
+    const hasCookie = !!(st && st.profiles && st.profiles.some(p => p.account_id));
+    const kind = env.browser_kind || 'none';
+    const step = (n, title, body) => `
+      <div style="display:flex;gap:12px;margin:14px 0">
+        <div style="flex:0 0 26px;height:26px;border-radius:50%;background:var(--nav-on-fg,#0B57D0);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px">${n}</div>
+        <div style="flex:1">
+          <div style="font-weight:500;margin-bottom:4px">${title}</div>
+          <div style="font-size:13px;line-height:1.7;color:var(--muted)">${body}</div>
+        </div>
+      </div>`;
+    let body = '';
+    body += step(1, '环境识别',
+      `运行平台：<b>${escapeHtml(env.os || 'unknown')}</b> · ` +
+      (env.in_docker ? '检测到 <b>Docker 容器</b>环境' : '非容器（本机进程）') + ' · ' +
+      `浏览器控制器：${env.has_controller
+          ? (env.controller_ok ? '<b style="color:var(--ok,#188038)">在线</b>' : '<b style="color:var(--fail,#d93025)">离线</b>')
+          : '<b>未配置</b>'}` +
+      (env.running_profiles ? ` · 运行中 profile：${env.running_profiles} 个` : ''));
+    if (kind === 'docker-chromium') {
+      body += step(2, '浏览器容器方案（已就绪）',
+        '服务端已配置浏览器控制器：每个账号对应一个隔离的 Chromium 实例。' +
+        '到「浏览器登录」页点「+ 添加账号」，然后在容器桌面（VNC）里登录 Google，' +
+        '回到面板点「抓取 cookie」即可。抓取会先用默认模型校验，不通过会自动重抓/提示。');
+    } else {
+      body += step(2, '选择浏览器接入方式', '当前没有可用的服务端浏览器控制器。两个选择：');
+      body += `
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 4px 38px">
+          <button class="btn" onclick="guideDeployBrowser()">部署浏览器容器（服务器端 Chromium）</button>
+          <button class="btn muted" onclick="guideUseLocalBrowser()">使用我电脑上的浏览器（扩展抓取）</button>
+        </div>`;
+    }
+    body += step(3, '用你自己电脑上的浏览器（推荐给 Windows）',
+      isWin
+        ? `检测到你在 <b>Windows</b> 上：本机浏览器 ${localBrowsers.length
+            ? localBrowsers.map(b => '<b>' + escapeHtml(b) + '</b>').join(' / ') + ' 可用'
+            : '（未识别到 Chrome/Edge，请确认已安装）'}。` +
+          `步骤：① 下载扩展 → ② 解压后在浏览器「扩展管理 → 开发者模式 → 加载已解压的扩展程序」→ ` +
+          `③ 扩展设置里填本服务地址与 API Key → ④ 打开并登录 gemini.google.com → 扩展会立刻抓取并推送。`
+        : '下载扩展安装到 Chrome/Edge（开发者模式加载解压目录），填入服务地址与 API Key，登录 gemini.google.com 后扩展会立刻抓取并推送。')
+      + `
+        <div style="margin-top:8px"><a class="btn muted" href="api/browser/extension" download>下载抓取扩展（zip）</a></div>`;
+    body += step(4, '完成',
+      hasCookie
+        ? 'Cookie 池已有浏览器来源账号，引导完成。'
+        : '抓取成功后 cookie 会自动进入 Cookie 池，并立即用默认模型校验一次。')
+      + `
+        <div style="margin-top:10px">
+          <button class="btn" onclick="guideDone()">完成引导</button>
+          <button class="btn muted" onclick="switchPage('browser')">去「浏览器登录」</button>
+        </div>`;
+    return `
+      <div class="panel page-fill">
+        <h2>初始化引导
+          <span class="controls">
+            <span class="badge ${env.guide_completed ? 'ok' : 'warn'}">${env.guide_completed ? '已完成过' : '未完成'}</span>
+          </span>
+        </h2>
+        <p class="lede">按当前部署环境接入浏览器登录，让 Gemini 的登录态自动进入 Cookie 池。</p>
+        ${body}
+      </div>`;
+  },
+
   // 浏览器登录：用 Chromium(VNC) 容器里独立 profile 登录 Google/Gemini，
   // 登录态自动抓成 cookie 写入 cookie 池，按「cookie 有效期 - 5 分钟」自动刷新（最长间隔 1 小时）。
   browser: async () => {
@@ -726,10 +796,8 @@ const pages = {
     }
     const ok = st.healthy;
     const rows = (st.profiles || []);
-    const accessUrl = (function(){
-      try { const v = (localStorage.getItem('gw2aAccessUrl') || '').trim(); if (v) return v; } catch (e) {}
-      return (st.access_url || '').trim();
-    })();
+    // 桌面网页地址存服务端（kv），所有访问面板的设备看到同一份配置。
+    const accessUrl = (st.access_url || '').trim();
     const rowHtml = rows.map(a => `
       <tr>
         <td class="nw"><span class="badge ${a.running ? 'ok' : 'muted'}">${a.running ? '运行中' : '已停止'}</span></td>
@@ -775,7 +843,7 @@ const pages = {
             <br>③ 回到本页点「抓取 cookie」→ 登录态解析成 cookie 写进上方 Cookie 池；
             <br>④ 之后按「cookie 有效期 - 5 分钟」自动抓一次保持新鲜（最长间隔 1 小时）；同一 profile 两次抓取至少隔 2 分钟。
             <br><br><span class="muted">桌面网页地址（上方输入框）默认取自启动参数
-            <code>BROWSER_ACCESS_URL</code>；改完后点「保存」仅存在本浏览器，方便你在
+            <code>BROWSER_ACCESS_URL</code>；改完后点「保存」会写入服务端数据（所有设备生效），方便你在
             <code>5666/chromium</code> 这类入口之间切换。</span>
           </div>
         </details>
@@ -1059,6 +1127,13 @@ const RT_GROUPS = [
         hint: '关：直接返回 429，本机 IP 不会暴露给上游（默认）。开：可用性优先，但上游会看到本机真实出口' },
       { k: 'fallback_anon', label: 'cookie 失效时降级匿名', type: 'bool',
         hint: '关：直接报错，能立刻发现该换号了（默认）。开：继续跑，但 3.1 Pro 会被静默降级成 3.5 Flash-Lite、思考链消失，客户端看不出来' },
+    ],
+  },
+  {
+    title: '浏览器登录',
+    fields: [
+      { k: 'browser_refresh_minutes', label: '抓取间隔（分钟）', type: 'int', min: 0, max: 1440,
+        hint: '浏览器 cookie 的抓取节奏。0 = 自动模式（按 cookie 有效期 - 5 分钟，最长 1 小时）；大于 0 则按固定间隔抓取。无论哪种模式，两次抓取至少间隔 2 分钟，且抓取时先只读读取（不刷新页面），只有读到的 cookie 失效才刷新页面重抓' },
     ],
   },
   {
@@ -1455,6 +1530,48 @@ async function delCookieAcct(id) {
   await refreshPage();
 }
 
+// 初始化引导辅助 ─────────────────────────────────────────────────────────────
+// 探测本机浏览器（用户要求：Windows 环境检测 edge / chrome）。
+// 浏览器不暴露安装清单，只能从 UA / userAgentData 推断当前在用什么；
+// 若当前是 Edge/Chrome，就把它作为「本机可用浏览器」呈现。
+function detectLocalBrowsers() {
+  const ua = navigator.userAgent || '';
+  const out = [];
+  if (/Edg\//.test(ua)) out.push('Edge');
+  if (/Chrome\//.test(ua) && !/Edg\//.test(ua) && !/OPR\//.test(ua)) out.push('Chrome');
+  if (/Firefox\//.test(ua)) out.push('Firefox');
+  return out;
+}
+
+async function guideDone() {
+  await api('api/browser/guide-done', { method: 'POST' });
+  flash('引导已完成');
+  await switchPage('browser');
+}
+
+function guideDeployBrowser() {
+  return showVerifyDialog({
+    status: 'guide', model: '', detail: '',
+    hint: '部署浏览器容器（服务器端 Chromium）的步骤：<br>' +
+      '1. 在服务器上部署 Chromium + 控制器（本仓库 tools/browser-controller/controller.js + deploy/ 下的 systemd 单元）；<br>' +
+      '2. 给本服务配置环境变量 BROWSER_CONTROLLER_URL（如 http://<host-ip>:9280）与 BROWSER_ACCESS_URL（VNC 桌面入口）；<br>' +
+      '3. 重启本服务容器，回到「初始化引导」页会识别为 docker-chromium 方案；<br>' +
+      '4. 到「浏览器登录」页添加账号并在 VNC 里登录 Google。',
+  });
+}
+
+function guideUseLocalBrowser() {
+  return showVerifyDialog({
+    status: 'guide', model: '', detail: '',
+    hint: '使用你电脑上的浏览器（扩展抓取）步骤：<br>' +
+      '1. 点下方「下载抓取扩展」得到 zip，解压到任意目录；<br>' +
+      '2. Chrome/Edge 打开扩展管理（chrome://extensions 或 edge://extensions）→ 开启「开发者模式」→「加载已解压的扩展程序」选择解压目录；<br>' +
+      '3. 点扩展图标进入设置：控制器地址填本服务地址，Token 填 API Key；<br>' +
+      '4. 打开并登录 https://gemini.google.com —— 扩展会在登录后立刻抓取并推送到本服务；<br>' +
+      '5. 抓取后本服务会自动用默认模型校验一次（302 时会提示重置代理池）。',
+  });
+}
+
 // 浏览器登录（Chromium profile）动作 ──────────────────────────────────────────
 async function browserAdd() {
   const data = await modalForm({
@@ -1513,29 +1630,74 @@ function openAccessUrl() {
   if (!u) return flash('先填写桌面网页地址');
   window.open(u, '_blank');
 }
-function saveAccessUrl() {
+async function saveAccessUrl() {
   const el = document.getElementById('browserAccessUrl');
   if (!el) return;
   const v = el.value.trim();
-  try {
-    if (v) localStorage.setItem('gw2aAccessUrl', v);
-    else localStorage.removeItem('gw2aAccessUrl');
-  } catch (e) {}
-  flash(v ? '已保存桌面网页地址（仅本浏览器生效）' : '已清除自定义地址，恢复默认');
-  refreshPage();
+  const j = await api('api/browser/access-url', {
+    method: 'PUT',
+    body: JSON.stringify({ access_url: v }),
+  });
+  if (!j || j.error) return flash('保存失败：' + ((j && j.error) || '未知错误'));
+  flash(v ? '已保存桌面网页地址（存服务端，所有设备生效）' : '已清除自定义地址，恢复默认');
+  await refreshPage();
 }
 
 // 抓取 cookie 入池
 async function browserFetch(name, btn) {
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '抓取中…'; btn.disabled = true; }
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '抓取并校验中…'; btn.disabled = true; }
   try {
     const r = await fetch('api/browser/profiles/' + encodeURIComponent(name) + '/fetch',
       { method: 'POST', credentials: 'include' });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) return flash('抓取失败：' + (j.error || r.status));
-    flash((j.ok ? '✓ ' : '✗ ') + (j.detail || ''));
+    // 抓取后模型校验结果：302 被拦时弹窗给具体解决方法（用户要求）。
+    const v = j.verify;
+    if (v && !v.ok && v.status === 'proxy_blocked') {
+      showVerifyDialog(v, j.detail);
+      await refreshPage();
+      return;
+    }
+    if (v && !v.ok) {
+      showVerifyDialog(v, j.detail);
+      await refreshPage();
+      return;
+    }
+    flash('✓ ' + (j.detail || '抓取完成'));
     await refreshPage();
   } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
+}
+
+// showVerifyDialog 展示抓取后模型校验失败的弹窗（含 302 的解决方法）。
+function showVerifyDialog(v, detail) {
+  const is302 = v.status === 'proxy_blocked';
+  const title = is302 ? '出口 IP 被 Google 拦截（302）' : '模型校验未通过';
+  const desc = is302
+    ? (v.proxy_reset
+        ? '出口 IP 被 Google 反爬拦截，已自动重置代理池失败计数并重试，仍未通过。'
+        : '出口 IP 被 Google 反爬拦截，当前没有可用代理池可重置。')
+    : ('抓取已入库，但用默认模型 ' + escapeHtml(v.model || '') + ' 校验失败：' + escapeHtml(v.detail || ''));
+  const hint = (v.hint || '').replace(/\n/g, '<br>');
+  return new Promise((resolve) => {
+    const el = document.createElement('div');
+    el.className = 'modal-overlay';
+    el.innerHTML = `
+      <div class="modal" style="max-width:560px">
+        <h3>${title}</h3>
+        <p style="margin:8px 0 12px">${escapeHtml(desc)}</p>
+        ${hint ? `<div style="background:var(--bg2,#f6f7f9);border-radius:8px;padding:12px;font-size:13px;line-height:1.7">${hint}</div>` : ''}
+        <div class="modal-actions" style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn muted" data-act="proxy">去代理池</button>
+          <button class="btn" data-act="ok">知道了</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    el.addEventListener('click', (e) => {
+      const act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
+      if (act === 'proxy') { el.remove(); switchPage('proxies'); resolve(); return; }
+      if (act === 'ok' || e.target === el) { el.remove(); resolve(); }
+    });
+  });
 }
 
 // 删除 profile（停实例 + 删池记录）
@@ -1879,6 +2041,7 @@ const ICONS = {
   settings: '<path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/>',
   cookies: '<path d="M12 2a10 10 0 100 20 10 10 0 000-20zm-1 4a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm7 3a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zM8 13a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0zm6 4a1.5 1.5 0 11-3 0 1.5 1.5 0 013 0z"/>',
   browser: '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>',
+  guide: '<path d="M12 2l2.4 7.2H22l-6 4.6 2.3 7.2-6.3-4.5-6.3 4.5L8 13.8 2 9.2h7.6z"/>',
   menu: '<path d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"/>',
   logout: '<path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5-5-5zM4 5h8V3H4a2 2 0 00-2 2v14a2 2 0 002 2h8v-2H4V5z"/>',
 };
@@ -1888,11 +2051,12 @@ const NAV = [
   ['proxies', '代理池'],
   ['cookies', 'Cookie 池'],
   ['browser', '浏览器登录'],
+  ['guide', '初始化引导'],
   ['settings', '设置'],
 ];
 const PAGE_TITLES = {
   dashboard: '概览', requests: '请求记录', proxies: '代理池', cookies: 'Cookie 池',
-  browser: '浏览器登录', settings: '设置',
+  browser: '浏览器登录', guide: '初始化引导', settings: '设置',
 };
 
 function toggleSidebar() {
