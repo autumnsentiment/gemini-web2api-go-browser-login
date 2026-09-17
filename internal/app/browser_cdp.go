@@ -484,14 +484,27 @@ func urlQueryEscape(s string) string {
 	return replacer.Replace(s)
 }
 
-// cdpNavigate 导航到 url（若无 page 就开新 tab），等待基本加载。
+// cdpNavigate 导航到 url（优先复用现有 page，仅确认没有任何 page 时才开新 tab）。
+//
+// ★ 不要轻易开新 tab（2026-09-17 用户反馈）★
+// 服务器 Chromium 桌面上开始堆积多个 Gemini 窗口：/json/list 瞬时失败（WS 忙、
+// profile 刚拉起还没监听）时旧逻辑立刻 cdpOpenTab —— 每次"抓取"都多一个窗口。
+// 现在先重试 list 两次；确认「确实没有任何 page」才开新 tab。已有 page 时
+// Page.navigate 就是"刷新该页"，不会产生新窗口。
 func cdpNavigate(hostPort, url string) error {
 	ws, err := cdpListPages(hostPort)
 	if err != nil {
-		// 没有 page 就开一个
-		ws, err = cdpOpenTab(hostPort, url)
+		// list 失败多为瞬时状态，重试而不是立刻开新 tab
+		for retry := 0; retry < 2 && err != nil; retry++ {
+			time.Sleep(2 * time.Second)
+			ws, err = cdpListPages(hostPort)
+		}
 		if err != nil {
-			return err
+			// 确认没有任何可复用的 page，才开新 tab
+			ws, err = cdpOpenTab(hostPort, url)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	pg, err := cdpDial(ws, 15*time.Second)
@@ -878,9 +891,28 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 // browserTryReadOnly 只读抓取：不导航、不刷新，直接读现有页面的登录态并抓 cookie。
 //
 // 判据与刷新路径一致（非空 SNlM0e / 页面内 fetch 兜底），但**不做任何导航**。
-// 页面不在 gemini.google.com 上、或登录态读不到时返回 ok=false，让调用方走刷新路径。
+//
+// ★ 2026-09-17 调整抓取顺序：先 cookie、后页面 ★
+// Network.getAllCookies 读的是**整个 profile 的 cookie jar**，不依赖当前页面
+// 在哪个 tab —— 页面停在别的站点时照样能抓到完整登录态。旧顺序先查页面 URL
+// / SNlM0e，页面不在 gemini 域或 SPA 未渲染完就判「只读失败」，然后走导航
+// 路径，平白多刷新一次页面。改成先抓 cookie：有 SAPISID + 1PSID 就直接入库，
+// 页面检查只作为「cookie 缺项时的二次确认」，绝大多数抓取完全零导航。
 func browserTryReadOnly(hostPort, label, profile string) (bool, string) {
-	// 先看当前页面在哪。不在 gemini 域上就没有可读的登录态。
+	// 第一步：直接抓 cookie jar（与页面所在 tab 无关）
+	cap, err := cdpCaptureCookies(hostPort)
+	if err == nil {
+		cookie := cap.Cookie
+		if extractSAPISID(cookie) != "" && strings.Contains(cookie, "__Secure-1PSID=") {
+			if err := browserStoreCookie(label, profile, cookie); err == nil {
+				browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
+				logf("[browser] profile %q 只读抓取成功（未刷新页面）", profile)
+				return true, "已抓取并入库（未刷新页面）"
+			}
+		}
+	}
+
+	// 第二步：cookie 缺项/抓取失败 —— 用页面登录态做二次确认（仍然零导航）。
 	cur, err := cdpEval(hostPort, `String(location.href || '')`)
 	if err != nil {
 		return false, "读取当前页面地址失败"
@@ -889,7 +921,6 @@ func browserTryReadOnly(hostPort, label, profile string) (bool, string) {
 	if !strings.Contains(cur, "gemini.google.com") {
 		return false, "当前页面不在 gemini.google.com（" + truncate(cur, 60) + "）"
 	}
-	// 读登录态（只读，不导航）。
 	has, err := cdpEval(hostPort, pageStateJS)
 	if err != nil {
 		return false, "读取页面登录态失败"
@@ -904,24 +935,17 @@ func browserTryReadOnly(hostPort, label, profile string) (bool, string) {
 		// 重验页：只读路径不处理，交给刷新路径给出「需要重新登录」的明确结论。
 		return false, "页面停在 Google 登录/重验流程"
 	}
-	if !strings.Contains(s, `"token":true`) {
-		return false, "页面里没有非空 SNlM0e"
+	if strings.Contains(s, `"token":true`) {
+		// 页面有登录态但 cookie jar 缺项：再抓一次（可能上一轮 jar 读取太早）
+		cap2, err := cdpCaptureCookies(hostPort)
+		if err == nil {
+			if err := browserStoreCookie(label, profile, cap2.Cookie); err == nil {
+				browserScheduleNextRefresh(profile, cap2.MinExpiryUnix)
+				return true, "已抓取并入库（未刷新页面，页面确认后重抓）"
+			}
+		}
 	}
-
-	cap, err := cdpCaptureCookies(hostPort)
-	if err != nil {
-		return false, "抓取 cookie 失败：" + err.Error()
-	}
-	cookie := cap.Cookie
-	if extractSAPISID(cookie) == "" || !strings.Contains(cookie, "__Secure-1PSID=") {
-		return false, "cookie 缺关键项（SAPISID / __Secure-1PSID）"
-	}
-	if err := browserStoreCookie(label, profile, cookie); err != nil {
-		return false, "入库失败：" + err.Error()
-	}
-	browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
-	logf("[browser] profile %q 只读抓取成功（未刷新页面）", profile)
-	return true, "已抓取并入库（未刷新页面）"
+	return false, "cookie 缺关键项（SAPISID / __Secure-1PSID）"
 }
 
 // browserCDPHost 返回 CDP 要连的主机：控制器和 chromium 同网络时用容器名。
@@ -942,31 +966,46 @@ func browserCDPHost() string {
 	return "chromium"
 }
 
-// browserStoreCookie 把抓到的 cookie 写进 accounts 表（按 profile 幂等）。
+// browserStoreCookie 把抓到的 cookie 写进 accounts 表（容器抓取路径，source=browser）。
 func browserStoreCookie(label, profile, cookie string) error {
 	return browserStoreCookieSource(label, profile, cookie, "browser")
 }
 
-// browserStoreCookieSource 同上，但可指定来源（browser=容器抓取 / remote=远程扩展推送）。
+// browserStoreCookieSource 把 cookie 写进 accounts 表。
+//
+// ★ 去重按 profile 全局（2026-09-17 线上实测修正）★
+// 同一个 Gemini 登录可能被两条路径写入：服务器 Chromium 抓取（source=browser）
+// 和本机扩展推送（source=remote）。这是**同一个账号的两条供给路**，不是两个
+// 账号 —— 按 (source, profile) 去重会让池子里出现 browser:browser1 和
+// remote:browser1 两行，同一个号被轮转两份、配额算两遍。改为按 profile 全局
+// 去重：最新写入获胜（source 跟随最新来源），同 profile 其它行合并删除
+// （与服务器侧 pool.py 的策略一致）。
 func browserStoreCookieSource(label, profile, cookie, source string) error {
 	if source == "" {
 		source = "browser"
 	}
-	// 找已存在的同来源 + 同 profile 的行
 	var id int64
+	var prevSource string
 	err := getDB().QueryRow(
-		`SELECT id FROM accounts WHERE source=? AND profile=? LIMIT 1`, source, profile).Scan(&id)
+		`SELECT id, source FROM accounts WHERE profile=? ORDER BY id DESC LIMIT 1`,
+		profile).Scan(&id, &prevSource)
 	if err == nil && id > 0 {
-		// 更新 cookie，并清错误/失败
+		// 更新 cookie，并清错误/失败；source 跟随最新写入的来源
 		_, e := getDB().Exec(
-			`UPDATE accounts SET cookie=?, label=?, last_ok_at=?, last_error='', fail_count=0,
+			`UPDATE accounts SET cookie=?, label=?, note=CASE WHEN ?<>'' THEN note ELSE note END,
+			     last_ok_at=?, last_error='', fail_count=0, source=?,
 			     last_used_at=last_used_at
 			 WHERE id=?`,
-			cookie, strings.TrimSpace(label), time.Now().Unix(), id)
+			cookie, strings.TrimSpace(label), "", time.Now().Unix(), source, id)
 		if e != nil {
 			return e
 		}
-		logf("[browser] profile %q cookie 已刷新 -> 账号 #%d（source=%s）", profile, id, source)
+		logf("[browser] profile %q cookie 已刷新 -> 账号 #%d（source=%s，原 %s）", profile, id, source, prevSource)
+		// 合并同 profile 的其它历史行（比如两条路径各自建过一行）
+		if _, e := getDB().Exec(
+			`DELETE FROM accounts WHERE profile=? AND id<>?`, profile, id); e != nil {
+			logf("[browser] 合并 profile %q 旧记录失败: %v", profile, e)
+		}
 		return nil
 	}
 	// 不存在：新建。note 标来源。
@@ -978,9 +1017,9 @@ func browserStoreCookieSource(label, profile, cookie, source string) error {
 		label = profile
 	}
 	nid, e := insertID(
-		`INSERT INTO accounts(label, cookie, status, note, source, profile, created_at)
-		 VALUES (?,?,?,?,?,?,?)`,
-		strings.TrimSpace(label), cookie, "enabled", note, source, profile, time.Now().Unix())
+		`INSERT INTO accounts(label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile)
+		 VALUES (?,?,'enabled',?,?,?,'',0,0,0,?,?)`,
+		strings.TrimSpace(label), cookie, note, time.Now().Unix(), time.Now().Unix(), source, profile)
 	if e != nil {
 		return e
 	}
