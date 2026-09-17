@@ -41,11 +41,16 @@
 
   <div class="card">
     <label class="f">Profile 标识</label>
-    <input type="text" id="profile" placeholder="browser1">
-    <label class="f">控制器地址</label>
-    <input type="text" id="controller" placeholder="http://127.0.0.1:9280">
-    <label class="f">控制器密钥（可空）</label>
-    <input type="text" id="token" placeholder="">
+    <input type="text" id="profile" placeholder="本机浏览器">
+    <label class="f">推送模式</label>
+    <select id="pushMode" style="width:100%;background:#0b0d11;border:1px solid var(--line);color:inherit;border-radius:6px;padding:6px">
+      <option value="service">服务端（远程服务器，推荐）</option>
+      <option value="controller">控制器（同机/同网 Chromium）</option>
+    </select>
+    <label class="f">目标地址</label>
+    <input type="text" id="controller" placeholder="http://192.168.5.246:8083">
+    <label class="f">密钥（服务端模式填 API Key；控制器模式填共享密钥，可空）</label>
+    <input type="text" id="token" placeholder="sk-gemini-...">
 
     <div class="chk"><input type="checkbox" id="enabled"><label for="enabled">启用扩展（自动保活/入池）</label></div>
     <div class="chk"><input type="checkbox" id="autoKeepalive"><label for="autoKeepalive">自动保活</label></div>
@@ -62,7 +67,7 @@
     <button id="btnKa" class="sec">立即保活</button>
     <button id="btnSync">立即入池</button>
   </div>
-  <div class="hint">保活/入池=刷新已有 gemini 页面（不新开页面）让 Google 轮换会话 cookie；每次刷新后有冷却窗口，窗口内只提取 cookie、不重复刷新。</div>
+  <div class="hint">「服务端」模式直推 gemini-web2api（端点 /api/browser/ingest，用 API Key 鉴权），适合浏览器在你电脑、服务在远端服务器；「控制器」模式推给同机/同网的 Chromium 控制器。抓取优先只读，会话失效时才刷新页面。</div>
 
   <script src="popup.js"></script>
 </body>

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Cookie Sync",
-  "version": "1.0.5",
-  "description": "刷新已有 Gemini 页面（不新开页面）读取会话 Cookie，每次刷新后有冷却窗口，冷却内提取、超时再刷新；推送到 gemini-web2api 控制器写入 cookie 池。",
+  "version": "1.1.0",
+  "description": "读取已登录 Gemini 会话的 Cookie 并推送到 gemini-web2api（控制器或服务端 ingest）。支持本机浏览器直连远程服务器，抓取前不刷新页面，仅在会话失效时刷新。",
   "minimum_chrome_version": "110",
   "permissions": [
     "cookies",
@@ -15,7 +15,9 @@
     "https://*.google.com/*",
     "https://*.googleusercontent.com/*",
     "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "http://*/*",
+    "https://*/*"
   ],
   "externally_connectable": {
     "matches": [

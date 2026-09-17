@@ -30,6 +30,9 @@
 
 const DEFAULTS = {
   controller: 'http://127.0.0.1:9280',
+  // pushMode: controller = 推给同机/同网控制器；service = 直推 gemini-web2api
+  // 服务端（远程场景必需，端点 /api/browser/ingest，用 Bearer API key 鉴权）。
+  pushMode: 'controller',
   profile: '',
   token: '',
   enabled: true,
@@ -552,23 +555,43 @@ async function sync(reason, _internal) {
       client: 'gw2a-ext/1.0.5',
     };
 
-    const url = c.controller.replace(/\/+$/, '') + '/cookie-sync';
+    // ── 推送目标（两种模式，2026-09-17 新增远程模式）────────────────────
+    //
+    // controller 模式（默认）：推给本机/同网的 Chromium 控制器
+    //   http://<controller>:9280/cookie-sync（无鉴权，靠内网限制）
+    //
+    // service 模式（远程服务器）：直推 gemini-web2api 服务端
+    //   http://<server>:8083/api/browser/ingest（Bearer API key 鉴权）
+    //   用于「浏览器在你自己电脑、服务在远端服务器」的场景 —— 这是
+    //   远程接入的**唯一可行路径**：控制器只监听服务器内网，外部够不着。
+    const mode = (c.pushMode === 'service') ? 'service' : 'controller';
+    const base = (c.controller || '').replace(/\/+$/, '');
+    const url = mode === 'service' ? (base + '/api/browser/ingest') : (base + '/cookie-sync');
     let r;
     try {
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' },
-          c.token ? { 'X-GW2A-Token': c.token } : {}),
-        body: JSON.stringify(payload),
-      });
+      const headers = { 'Content-Type': 'application/json' };
+      if (mode === 'service') {
+        if (c.token) headers['Authorization'] = 'Bearer ' + c.token;
+      } else if (c.token) {
+        headers['X-GW2A-Token'] = c.token;
+      }
+      const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
       const text = await resp.text();
       let body = null;
       try { body = JSON.parse(text); } catch (e) { body = { raw: text }; }
-      r = { ok: resp.ok && !(body && body.error), http: resp.status, body };
-      if (!r.ok) r.detail = '控制器返回 ' + resp.status + ' ' + ((body && (body.error || body.detail)) || text.slice(0, 120));
-      else r.detail = (body && body.detail) || '已入池';
+      r = { ok: resp.ok && !(body && body.error), http: resp.status, body, mode };
+      if (!r.ok) {
+        const why = (body && (body.error || body.detail)) || text.slice(0, 120);
+        r.detail = (mode === 'service' ? '服务端返回 ' : '控制器返回 ') + resp.status + ' ' + why;
+      } else {
+        r.detail = (body && body.detail) || '已入池';
+        // 服务端会在入库后用默认模型校验，把结论带回面板
+        if (body && body.verify && body.verify.ok === false) {
+          r.detail += ' · 校验未通过：' + (body.verify.detail || '');
+        }
+      }
     } catch (e) {
-      r = { ok: false, detail: '推送失败: ' + e.message };
+      r = { ok: false, detail: '推送失败: ' + e.message + '（目标 ' + url + '）' };
     }
 
     await setCfg({

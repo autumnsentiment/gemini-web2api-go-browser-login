@@ -1048,7 +1048,14 @@ func browserAutoRefresh() {
 		_ = kvSet(kvKeyBrowserNextRefresh(profile),
 			strconv.FormatInt(time.Now().Unix()+sec, 10))
 	}
-	for _, a := range accts {
+	for _, a := range browserAccounts() {
+		// ★ remote 来源的账号归扩展负责（扩展自己保活+重推），浏览器刷新
+		// 循环绝不碰它们（2026-09-17 线上事故）：remote 账号没有对应
+		// Chromium profile，browserRefreshOne 对它必然报「未登录」，紧接着
+		// 就把刚推送入池的新 cookie 删掉 —— 扩展推一次被删一次。
+		if a.Source == "remote" {
+			continue
+		}
 		if a.Status != "enabled" {
 			continue
 		}

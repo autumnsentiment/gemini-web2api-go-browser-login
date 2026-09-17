@@ -23,7 +23,23 @@ import (
 // /cookie-sync（控制器侧、内网限定）分开 —— 这个端点面向公网可达的部署。
 
 // handleBrowserIngest — POST /api/browser/ingest
+//
+// CORS：扩展 service worker 从 chrome-extension:// 源发起 POST + Authorization
+// 头，浏览器先发 OPTIONS 预检。预检必须**免鉴权**放行并回 CORS 头，否则
+// fetch 直接 "Failed to fetch"（2026-09-17 线上实测）。实际 POST 仍走
+// requireAPIKey 鉴权。源限定为 chrome-extension:// —— 网页源不允许跨域调用。
 func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if strings.HasPrefix(origin, "chrome-extension://") {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		return
@@ -34,14 +50,16 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p struct {
-		Profile   string `json:"profile"`
-		Cookie    string `json:"cookie"`
-		LoggedIn  *bool  `json:"logged_in"`
-		Label     string `json:"label"`
-		Note      string `json:"note"`
-		UserAgent string `json:"user_agent"`
-		Client    string `json:"client"`
-		Summary   string `json:"summary"`
+		Profile   string          `json:"profile"`
+		Cookie    string          `json:"cookie"`
+		LoggedIn  *bool           `json:"logged_in"`
+		Label     string          `json:"label"`
+		Note      string          `json:"note"`
+		UserAgent string          `json:"user_agent"`
+		Client    string          `json:"client"`
+		// Summary 扩展发的是对象（{SID:{len,expires},...}），用 RawMessage
+		// 接住再序列化成字符串存 note，避免类型不匹配 400（2026-09-17 实测）。
+		Summary json.RawMessage `json:"summary"`
 	}
 	if err := json.Unmarshal(body, &p); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "bad json: " + err.Error()})
@@ -77,6 +95,10 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 	note := strings.TrimSpace(p.Note)
 	if note == "" {
 		note = fmt.Sprintf("远程浏览器扩展推送 @ %s（%s）", time.Now().Format("2006-01-02 15:04:05"), truncate(p.Client, 40))
+	}
+	// summary 是扩展上报的 cookie 摘要对象，原样序列化进 note 备查
+	if len(p.Summary) > 0 && string(p.Summary) != "null" {
+		note += " · summary=" + truncate(string(p.Summary), 400)
 	}
 
 	// 入库（与容器路径同一套存储逻辑，source 标 remote 以示区分）

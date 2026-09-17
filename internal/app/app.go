@@ -177,8 +177,16 @@ func Run() {
 		mux.HandleFunc("/admin/api/browser/access-url", requireAuth(handleAdminBrowserAccessURL))
 		mux.HandleFunc("/admin/api/browser/guide-done", requireAuth(handleAdminBrowserGuideDone))
 		mux.HandleFunc("/admin/api/browser/extension", requireAuth(handleAdminBrowserExtension))
-		// 远程浏览器扩展推送 cookie（扩展填 API key，独立于 admin 会话）
-		mux.HandleFunc("/api/browser/ingest", requireAPIKey(handleBrowserIngest))
+		// 远程浏览器扩展推送 cookie。OPTIONS 预检必须免鉴权（浏览器发预检时
+		// 不带 Authorization，被拦的话扩展 fetch 直接 Failed to fetch），CORS
+		// 头与 OPTIONS 响应在 handleBrowserIngest 内处理；实际 POST 仍需 API key。
+		mux.HandleFunc("/api/browser/ingest", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodOptions {
+				handleBrowserIngest(w, r)
+				return
+			}
+			requireAPIKey(handleBrowserIngest)(w, r)
+		})
 		mux.HandleFunc("/admin/api/test", requireAuth(handleAdminTest))
 	}
 
