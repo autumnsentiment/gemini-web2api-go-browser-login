@@ -129,15 +129,34 @@ func filterDownloadCookies(cookie string) string {
 // 音乐/视频走 contribution.usercontent.google.com/download（链在 hNvQHb 历史里，单次
 // 200）。按 tool 分流。
 func fetchMediaArtifacts(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, error) {
+	return fetchMediaArtifactsBudget(tool, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, 0)
+}
+
+// fetchMediaArtifactsBudget 同上，但可指定**整条请求的总预算**（秒，0=不限）。
+//
+// 为什么要传预算进来：视频的 StreamGenerate 本身就要几十秒到数分钟，之后的
+// 产物轮询又要几分钟，两者会叠加。而调用方（new-api 等网关）对整条请求有固定
+// 耐心上限（实测约 9.5 分钟）—— 必须在那个上限前收手，否则做的是白工：客户端
+// 早就断了，我们还在轮询。budget 从请求开始计时，轮询在剩余时间里进行。
+func fetchMediaArtifactsBudget(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, budgetSec int) ([]MediaArtifact, error) {
 	if tool == toolImage {
 		return fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
 	}
 	// 音乐几乎立刻就绪，视频要生成几十秒到几分钟，所以视频轮询给足预算。
 	maxPolls, interval := 6, 2*time.Second
 	if tool == toolVideo {
-		maxPolls, interval = 45, 8*time.Second // 约 6 分钟
+		// ★ 2026-09-17 实测：6 分钟（45×8s）不够 ★
+		// 失败样本显示轮询耗尽时上游仍处于「生成中」：hNvQHb 里是
+		// "I'm generating your video. This could take a few minutes, so check
+		// back..." + 一条 video_gen_chip 占位链，并带渲染任务 ID（r_...）。
+		// 同一 prompt 有时 70 秒就出、有时 6 分钟还在排队，Veo 排队时长波动大。
+		//
+		// 上界由**调用方的耐心**决定：new-api 渠道测试实测最多等约 9.5 分钟
+		// （曾观测 9m8s）。轮询取 8 分钟（60×8s）覆盖长尾；若上游 StreamGenerate
+		// 已耗时较久，budgetSec 会把轮询截得更短（两者共享同一总预算）。
+		maxPolls, interval = 60, 8*time.Second // 约 8 分钟（受 budgetSec 截断）
 	}
-	arts, err := fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime, maxPolls, interval)
+	arts, err := fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime, maxPolls, interval, budgetSec)
 	if err != nil {
 		return arts, err
 	}
@@ -210,15 +229,24 @@ func imageFullResURL(u string) string {
 // fetchDownloadArtifacts 取回音乐/视频：轮询 hNvQHb 等到 response_data 下载链，再下。
 // gg-dl（lh3）和 temp_data 那两种链是预览用的，只有 response_data 那条能下到真字节。
 func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime string,
-	maxPolls int, interval time.Duration) ([]MediaArtifact, error) {
+	maxPolls int, interval time.Duration, budgetSec int) ([]MediaArtifact, error) {
 	if cid == "" {
 		return nil, fmt.Errorf("没拿到会话 id，无法定位产物")
 	}
-	logf("[media] 开始轮询产物 cid=%s maxPolls=%d interval=%s", cid, maxPolls, interval)
+	// 预算截断：轮询最多跑到预算耗尽（留 20 秒给下载产物本身）。
+	deadline := time.Time{}
+	if budgetSec > 0 {
+		deadline = time.Now().Add(time.Duration(budgetSec-20) * time.Second)
+	}
+	logf("[media] 开始轮询产物 cid=%s maxPolls=%d interval=%s budget=%ds", cid, maxPolls, interval, budgetSec)
 	var dlURLs []string
 	var lastBody string
 	var pollErrs int
 	for i := 0; i < maxPolls; i++ {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			logf("[media] 轮询到总预算上限，停止（已轮询 %d/%d）", i, maxPolls)
+			break
+		}
 		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err != nil {
 			pollErrs++
 			lastBody = ""
@@ -239,6 +267,7 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 	if len(dlURLs) == 0 {
 		// 诊断：把最后一轮 hNvQHb 的关键片段计数打出来，便于定位是格式变了
 		// 还是生成根本没完成。仅失败路径，不影响正常请求。
+		stillGenerating := false
 		if lastBody != "" {
 			logf("[media] 轮询耗尽 cid=%s pollErrs=%d bodyLen=%d fragments: response_data=%d contribution=%d usercontent=%d mp4=%d temp_data=%d video=%d",
 				cid, pollErrs, len(lastBody),
@@ -249,8 +278,20 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 				strings.Count(lastBody, "temp_data"),
 				strings.Count(lastBody, "video"))
 			_ = os.WriteFile("/tmp/hnv_last_"+cid+".txt", []byte(lastBody), 0644)
+			// 上游仍在生成中：hNvQHb 里会挂 "I'm generating your video" 文案
+			// 和一条 video_gen_chip 占位链（不是可下载产物）。这跟「真的取不到」
+			// 是两回事 —— 报错要说清是「排队超时」，让调用方知道重试即可。
+			if strings.Contains(lastBody, "I'm generating your video") ||
+				strings.Contains(lastBody, "video_gen_chip") {
+				stillGenerating = true
+			}
 		} else {
 			logf("[media] 轮询耗尽 cid=%s pollErrs=%d（全部轮询都失败，从未拿到响应体）", cid, pollErrs)
+		}
+		if stillGenerating {
+			return nil, fmt.Errorf("视频仍在生成中（上游排队较久，%s 内未产出）。这不是失败，"+
+				"稍等后重试同一 prompt 通常就能拿到；若持续如此请换时段或减少并发",
+				time.Duration(maxPolls)*interval)
 		}
 		return nil, fmt.Errorf("hNvQHb 里没等到可下载的产物链接（response_data）")
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -738,13 +739,26 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			case toolVideo:
 				mime = "video/mp4"
 			}
-			arts, aerr := fetchMediaArtifacts(
+			// 剩余预算 = 媒体总超时 - StreamGenerate 已消耗。视频的生成等待
+			// （StreamGenerate）和产物轮询会叠加，必须共享同一个总预算，否则
+			// 两者相加会超过调用方（new-api 等网关，实测约 9.5 分钟）的耐心上限。
+			remaining := mediaTimeoutSec - int(time.Since(t0).Seconds())
+			if remaining < 30 {
+				remaining = 30 // 至少留一轮的机会，让错误信息更准确
+			}
+			arts, aerr := fetchMediaArtifactsBudget(
 				mc.Tool, string(raw), extractConversationID(string(raw)),
-				cookieStr, sapisid, xsrfToken, proxyURL, mime)
+				cookieStr, sapisid, xsrfToken, proxyURL, mime, remaining)
+			// 诊断采样（2026-09-17）：成功/失败各留一份原始 StreamGenerate 响应。
+			// 「生成成功但取不到产物」是间歇性的（同一 prompt 有时 70 秒成功、
+			// 有时 65 秒就报取不到），只有对比两份原文才能看出产物引用的差异。
+			// 覆盖式写，只保留最近一份，不占空间。
 			if aerr != nil {
-				logf("[media] 取回产物失败: %v", aerr)
+				_ = os.WriteFile("/tmp/media_raw_last_fail.txt", raw, 0644)
+				logf("[media] 取回产物失败: %v（原始响应已存 /tmp/media_raw_last_fail.txt）", aerr)
 				result.MediaErr = aerr.Error()
 			} else {
+				_ = os.WriteFile("/tmp/media_raw_last_ok.txt", raw, 0644)
 				result.Artifacts = arts
 				logf("[media] 取回 %d 份产物", len(arts))
 			}
