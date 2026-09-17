@@ -1,4 +1,4 @@
-# gemini-web2api-go
+# gemini-web2api-go（浏览器登录拓展版）
 
 <img src="docs/banner.svg" alt="gemini-web2api-go" width="100%">
 
@@ -9,6 +9,11 @@
 中文 | [English](README_EN.md)
 
 把 Google Gemini 网页端反代成 OpenAI 兼容 API。**单二进制**，**零账号**（匿名可跑），**Chrome 146 真指纹**，**SQLite 持久化**，自带**中文管理面板**。
+
+> **本仓库是 [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go) 的浏览器登录拓展版。**
+> 在原项目全部功能之上，新增了完整的浏览器登录态供给链路：在浏览器里登录一次
+> Google 账号，Cookie 自动进入池子并持续保活，无需手工从 DevTools 复制粘贴。
+> 详见 [浏览器登录](#浏览器登录拓展版新增) 一节。
 
 ---
 
@@ -56,7 +61,7 @@
 
 ### 下载二进制（最省事）
 
-[Releases](https://github.com/zexadev/gemini-web2api-go/releases) 里挑对应平台的下载，
+[Releases](https://github.com/autumnsentiment/gemini-web2api-go-browser-login/releases) 里挑对应平台的下载，
 不用 Go、不用 Docker，单个文件就是全部：
 
 ```bash
@@ -84,13 +89,13 @@ docker run -d --name gemini-web2api \
   -p 127.0.0.1:8083:8083 \
   -v "$PWD/data:/data" \
   -e ADMIN_TOKEN=your-admin-token \
-  ghcr.io/zexadev/gemini-web2api-go:latest
+  ghcr.io/autumnsentiment/gemini-web2api-go-browser-login:latest
 ```
 
 用 compose 的话把 `docker-compose.yml` 单独下下来就行，也不用 clone：
 
 ```bash
-curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/autumnsentiment/gemini-web2api-go-browser-login/main/docker-compose.yml
 ADMIN_TOKEN=your-admin-token docker compose up -d
 ```
 
@@ -99,8 +104,8 @@ ADMIN_TOKEN=your-admin-token docker compose up -d
 装了 Go 就不必绕 Docker：
 
 ```bash
-git clone https://github.com/zexadev/gemini-web2api-go
-cd gemini-web2api-go
+git clone https://github.com/autumnsentiment/gemini-web2api-go-browser-login
+cd gemini-web2api-go-browser-login
 go build -o gemini-web2api-go .
 ./gemini-web2api-go --port 8083 --admin-token your-admin-token
 ```
@@ -461,6 +466,63 @@ JSON 形式 `{"cookie": "SID=...; ...", "sapisid": "..."}` 也吃。带 `SAPISID
 绑定下来，出口不可用了才换。
 
 **一个号挂了会自动换下一个**，不让整个请求陪葬——否则池子越大越容易踩雷。
+
+## 浏览器登录拓展版新增
+
+本节全部是**本仓库在原项目之上的扩展**：把上面「手工从 DevTools 复制 cookie」
+那一步，变成**在浏览器里登录一次，之后全自动**。
+
+### 它是怎么工作的
+
+```
+你在浏览器登录一次 Google
+    ↓
+浏览器里的 Cookie 被自动抓取（不刷新页面，直接读取）
+    ↓
+写入 Cookie 池 + 用默认模型发一次真实请求校验
+    ↓
+按 cookie 有效期自动保活（到期前 5 分钟重抓，最长间隔 1 小时）
+    ↓
+登录态失效时才刷新页面重抓（日常抓取不打扰页面）
+```
+
+### 两种浏览器接入方式
+
+| 方式 | 适用场景 | 说明 |
+|---|---|---|
+| **服务端 Chromium** | 有 Linux 服务器 / NAS | 每个账号一个隔离的 Chromium profile，通过 VNC 桌面登录。面板「浏览器登录」页管理 |
+| **本机浏览器 + 扩展** | Windows / Mac 桌面用户 | 用你自己电脑上的 Chrome/Edge，装扩展后登录即抓取。面板「初始化引导」页有分步引导 |
+
+面板里有「**初始化引导**」页，会自动识别部署环境（Docker / 系统类型 / 浏览器控制器状态）
+并给出对应路径。
+
+### 关键行为
+
+- **只读抓取优先**：日常抓取直接读现有页面，**不刷新**；只有读到的 cookie 失效才刷新重抓。
+  这是为了降低风控暴露。
+- **抓取后自动校验**：每次抓完 cookie，立刻用**设置里的默认模型**发一次真实请求。
+  校验失败会自动重抓；若返回 302（出口被拦）会先重置代理池再试，仍失败则弹窗给出解决方法。
+- **抓取间隔可配**：设置页「浏览器登录 → 抓取间隔（分钟）」。0 = 自动（按 cookie 有效期），
+  大于 0 则固定间隔。两种模式都受 2 分钟冷却保护。
+- **需要重新登录时保留账号**：Google 要求重新验证（密码/安全确认）时不会删号，
+  面板会提示去 VNC 桌面重新登录，登录后自动恢复。
+
+### 相关配置
+
+```yaml
+environment:
+  # 服务端 Chromium 方案（控制器地址 + CDP 主机 + VNC 桌面入口）
+  BROWSER_CONTROLLER_URL: "http://<宿主机IP>:9280"
+  BROWSER_CDP_HOST: "<宿主机IP>"
+  BROWSER_ACCESS_URL: "http://<宿主机IP>:16100/"
+```
+
+不配 `BROWSER_CONTROLLER_URL` 时该功能关闭，走「本机浏览器 + 扩展」方案（面板可下载扩展）。
+
+### 与手工 cookie 的关系
+
+两条路可以共存：浏览器登录抓到的账号 `source=browser`，手工导入的是 `manual`，
+在同一个池子里轮转。手工导入仍然完全可用。
 
 ## 代理池（白嫖路线核心）
 

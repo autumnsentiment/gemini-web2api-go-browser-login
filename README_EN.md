@@ -1,4 +1,4 @@
-# gemini-web2api-go
+# gemini-web2api-go (browser-login extension edition)
 
 <img src="docs/banner.svg" alt="gemini-web2api-go" width="100%">
 
@@ -9,6 +9,12 @@
 [中文文档](README.md) | English
 
 Turn the Google Gemini web app into an OpenAI-compatible API. **Single binary**, **no account needed** (anonymous works), **real Chrome 146 fingerprint**, **SQLite persistence**, ships with an **admin dashboard**.
+
+> **This repository is the browser-login extension edition of [zexadev/gemini-web2api-go](https://github.com/zexadev/gemini-web2api-go).**
+> On top of all upstream features it adds a complete browser-login cookie supply chain:
+> sign in to Google once in a browser, and the cookies flow into the pool and stay
+> alive automatically — no more copy-pasting from DevTools. See
+> [Browser login](#browser-login-extension) below.
 
 ---
 
@@ -63,7 +69,7 @@ This is not a wrapper around Google's official API ([generativelanguage.googleap
 ### Prebuilt binary (simplest)
 
 Grab the one for your platform from
-[Releases](https://github.com/zexadev/gemini-web2api-go/releases). No Go, no Docker —
+[Releases](https://github.com/autumnsentiment/gemini-web2api-go-browser-login/releases). No Go, no Docker —
 the single file is the whole thing:
 
 ```bash
@@ -91,13 +97,13 @@ docker run -d --name gemini-web2api \
   -p 127.0.0.1:8083:8083 \
   -v "$PWD/data:/data" \
   -e ADMIN_TOKEN=your-admin-token \
-  ghcr.io/zexadev/gemini-web2api-go:latest
+  ghcr.io/autumnsentiment/gemini-web2api-go-browser-login:latest
 ```
 
 For compose, just grab the file — no clone required:
 
 ```bash
-curl -O https://raw.githubusercontent.com/zexadev/gemini-web2api-go/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/autumnsentiment/gemini-web2api-go-browser-login/main/docker-compose.yml
 ADMIN_TOKEN=your-admin-token docker compose up -d
 ```
 
@@ -106,8 +112,8 @@ ADMIN_TOKEN=your-admin-token docker compose up -d
 If you have Go, skip Docker entirely:
 
 ```bash
-git clone https://github.com/zexadev/gemini-web2api-go
-cd gemini-web2api-go
+git clone https://github.com/autumnsentiment/gemini-web2api-go-browser-login
+cd gemini-web2api-go-browser-login
 go build -o gemini-web2api-go .
 ./gemini-web2api-go --port 8083 --admin-token your-admin-token
 ```
@@ -410,6 +416,69 @@ Note that "last success" only means a request involving this cookie succeeded; i
 **Each account is pinned to its own exit.** If the cookie pool and proxy pool rotated independently, one Google account would emit requests from dozens of different IPs, which is exactly what account sharing looks like to Google. An account binds to the first exit it uses and stays there until that exit becomes unusable.
 
 **A dead account no longer kills the request** — the next account in the pool is tried instead. Otherwise a bigger pool would only mean more ways to hit a bad one.
+
+## Browser login extension
+
+Everything in this section is **added by this repository on top of upstream**: it turns
+the "copy cookies from DevTools by hand" step above into **sign in once in a browser,
+everything else is automatic**.
+
+### How it works
+
+```
+You sign in to Google once in a browser
+    ↓
+Cookies are captured automatically (read-only, no page refresh)
+    ↓
+Stored in the cookie pool + verified with one real request using the default model
+    ↓
+Kept alive automatically (re-capture 5 min before expiry, at most 1 h apart)
+    ↓
+The page is refreshed and re-captured only when the session actually dies
+```
+
+### Two ways to attach a browser
+
+| Mode | Best for | Notes |
+|---|---|---|
+| **Server-side Chromium** | Linux server / NAS | One isolated Chromium profile per account, sign in through the VNC desktop. Managed on the "Browser login" page |
+| **Local browser + extension** | Windows / macOS desktop | Use your own Chrome/Edge; the extension captures right after you sign in. Step-by-step guide on the "Setup guide" page |
+
+The dashboard has a **Setup guide** page that detects your deployment (Docker / OS /
+browser-controller status) and shows the matching path.
+
+### Key behaviours
+
+- **Read-only capture first**: day-to-day captures read the existing page **without
+  refreshing**; the page is reloaded only when the captured cookies are dead. This keeps
+  anti-bot exposure low.
+- **Verified after every capture**: each capture is followed by a real request using the
+  **default model from settings**. On failure it re-captures automatically; on HTTP 302
+  (exit blocked) it first resets the proxy pool and retries, and only then shows a dialog
+  with concrete remediation steps.
+- **Configurable capture interval**: Settings → Browser login → capture interval
+  (minutes). 0 = automatic (cookie-expiry driven), > 0 = fixed interval. Both are guarded
+  by a 2-minute cooldown.
+- **Re-login keeps the account**: when Google demands re-verification, the account is not
+  deleted — the panel tells you to re-login on the VNC desktop and recovers afterwards.
+
+### Configuration
+
+```yaml
+environment:
+  # Server-side Chromium mode (controller URL + CDP host + VNC desktop entry)
+  BROWSER_CONTROLLER_URL: "http://<host-ip>:9280"
+  BROWSER_CDP_HOST: "<host-ip>"
+  BROWSER_ACCESS_URL: "http://<host-ip>:16100/"
+```
+
+Without `BROWSER_CONTROLLER_URL` the feature is off and you use the
+"local browser + extension" mode instead (the extension is downloadable from the panel).
+
+### Relationship to manual cookies
+
+Both paths coexist: browser-captured accounts have `source=browser`, manually imported
+ones are `manual`, and they rotate in the same pool. Manual import still works as before.
 
 ## Proxy pool (the core of running this for free)
 
