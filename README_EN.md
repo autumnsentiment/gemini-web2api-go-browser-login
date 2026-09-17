@@ -480,6 +480,36 @@ Without `BROWSER_CONTROLLER_URL` the feature is off and you use the
 Both paths coexist: browser-captured accounts have `source=browser`, manually imported
 ones are `manual`, and they rotate in the same pool. Manual import still works as before.
 
+### Extension setup walkthrough (local-browser mode, tested 2026-09-17)
+
+The dashboard **Setup guide** page shows the same steps per deployment environment,
+each with a "view parameters" dialog. Record from a real Chrome run:
+
+**1. Install the extension**: download the extension zip and unzip → `chrome://extensions`
+→ enable Developer mode → "Load unpacked" and pick the unzipped folder → the card
+"Gemini Cookie Sync 1.1.0" appears.
+
+**2. Configure the extension** (open the toolbar popup):
+
+| Field | Value | Notes |
+|---|---|---|
+| Profile | custom (e.g. `local-pc`) | account appears as `remote:<profile>` |
+| **Push mode** | **Server (recommended)** | ★ default is "Controller" — must be switched manually, the most common pitfall |
+| Target URL | `http://<server-ip>:8083` | this service's port, not the controller's 9280 |
+| Key | the API Key from Settings page | used for server-mode auth |
+| Enable / auto keepalive | checked | keepalive 10 min, sync 30 min by default |
+
+Then click **Save**.
+
+**3. Sign in and push**: sign in to gemini.google.com in the local browser → click
+"Sync now" in the popup → the popup shows "✓ cookie stored and model-verified" and a
+`remote:`-prefixed account appears in the cookie pool. After that it is hands-off:
+the extension auto-syncs every 30 minutes and keepalives every 10.
+
+**Troubleshooting**: `401` = wrong/unsaved API Key; `Failed to fetch` = host/port
+unreachable; `400 bad json` = outdated extension (re-download); "verification failed"
+= usually a blocked egress, retry later.
+
 ## Proxy pool (the core of running this for free)
 
 **Why you need it**: a single IP sending in bursts eventually gets redirected to `google.com/sorry/index`. That threshold is **80-180 requests**, and the wide range is driven by **connection strategy, exit quality and pacing** together:

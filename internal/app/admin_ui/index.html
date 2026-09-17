@@ -713,17 +713,54 @@ const pages = {
     const env = await api('api/browser/env');
     const st = await api('api/browser/status');
     const localBrowsers = detectLocalBrowsers();
-    const isWin = (navigator.userAgent || '').includes('Windows');
     const hasCookie = !!(st && st.profiles && st.profiles.some(p => p.account_id));
     const kind = env.browser_kind || 'none';
-    const step = (n, title, body) => `
+    const step = (n, title, body) => {
+      const bodyHtml = typeof body === 'string' ? body : body.html;
+      const btn = typeof body === 'object' && body.paramBtn
+        ? `<button class="btn muted" style="margin:6px 0" data-guide-params="${body.paramId}">查看本步参数</button>` : '';
+      return `
       <div style="display:flex;gap:12px;margin:14px 0">
         <div style="flex:0 0 26px;height:26px;border-radius:50%;background:var(--nav-on-fg,#0B57D0);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px">${n}</div>
         <div style="flex:1">
           <div style="font-weight:500;margin-bottom:4px">${title}</div>
-          <div style="font-size:13px;line-height:1.7;color:var(--muted)">${body}</div>
+          <div style="font-size:13px;line-height:1.7;color:var(--muted)">${bodyHtml}</div>
+          ${btn}
         </div>
       </div>`;
+    };
+    // 每步的参数表（点「查看本步参数」弹窗展示）。内容来自 2026-09-17 本机 Chrome 实测。
+    const GUIDE_PARAMS = {
+      // 同时喂给弹窗函数（guideShowParams 读 GUIDE_PARAMS_DATA）
+      install: [
+        { k: '地址栏输入', v: 'chrome://extensions', why: '打开扩展管理页' },
+        { k: '开发者模式', v: '右上角开关开启', why: '不开就看不到「加载已解压的扩展程序」' },
+        { k: '加载扩展', v: '点「加载未打包的扩展程序」选解压目录', why: '目录里应有 manifest.json / background.js / popup.html / popup.js' },
+        { k: '确认安装', v: '卡片显示 Gemini Cookie Sync 1.1.0（未打包）', why: '开发者模式需保持开启' },
+      ],
+      config: [
+        { k: 'Profile 标识', v: '自定义（如 本机浏览器）', why: '入池后账号显示为 remote:<标识>' },
+        { k: '推送模式', v: '服务端（远程服务器，推荐）', why: '★ 默认是「控制器」，必须手动切换，否则推送失败 —— 最容易踩的坑' },
+        { k: '目标地址', v: 'http://<服务器IP>:8083', why: '本服务监听端口；不是控制器的 9280' },
+        { k: '密钥', v: '面板「设置」页的 API Key（sk-gemini-...）', why: '服务端模式用它鉴权；控制器模式才用共享密钥' },
+        { k: '启用扩展 / 自动保活', v: '勾选（保活 10 分钟、入池 30 分钟为默认）', why: '' },
+        { k: '保存', v: '填完必须点「保存」', why: '不保存推送仍用旧配置' },
+      ],
+      pool: [
+        { k: '确认登录', v: '本机浏览器打开并登录 gemini.google.com', why: '扩展弹窗顶部应显示「已登录 ✓」' },
+        { k: '立即入池', v: '扩展弹窗点「立即入池」', why: 'cookie 推送到服务端入库，并用默认模型自动校验一次' },
+        { k: '成功标志', v: '弹窗显示「cookie 已入库并完成模型校验」', why: 'Cookie 池出现 remote: 前缀的新账号' },
+        { k: '之后无需再管', v: '每 30 分钟自动入池、每 10 分钟自动保活', why: '抓取优先只读不刷新页面；会话失效才刷新重抓' },
+      ],
+      troubleshoot: [
+        { k: '401', v: 'API Key 不对或没保存', why: '重新粘贴密钥并点「保存」' },
+        { k: 'Failed to fetch', v: '地址或端口不可达', why: '检查服务器 IP、端口 8083、防火墙' },
+        { k: '400 bad json', v: '扩展版本过旧', why: '重新下载扩展并重载' },
+        { k: '校验未通过', v: 'cookie 已入库但模型请求失败', why: '多为出口被 Google 拦（302）；稍后重试或到代理池重置' },
+      ],
+    };
+    // 弹窗函数从这里取参数表（GUIDE_PARAMS_DATA 声明在引导辅助区）
+    GUIDE_PARAMS_DATA = GUIDE_PARAMS;
     let body = '';
     body += step(1, '环境识别',
       `运行平台：<b>${escapeHtml(env.os || 'unknown')}</b> · ` +
@@ -745,25 +782,31 @@ const pages = {
           <button class="btn muted" onclick="guideUseLocalBrowser()">使用我电脑上的浏览器（扩展抓取）</button>
         </div>`;
     }
-    body += step(3, '用你自己电脑上的浏览器（推荐给 Windows）',
-      isWin
-        ? `检测到你在 <b>Windows</b> 上：本机浏览器 ${localBrowsers.length
-            ? localBrowsers.map(b => '<b>' + escapeHtml(b) + '</b>').join(' / ') + ' 可用'
-            : '（未识别到 Chrome/Edge，请确认已安装）'}。` +
-          `步骤：① 下载扩展 → ② 解压后在浏览器「扩展管理 → 开发者模式 → 加载已解压的扩展程序」→ ` +
-          `③ 扩展设置里填本服务地址与 API Key → ④ 打开并登录 gemini.google.com → 扩展会立刻抓取并推送。`
-        : '下载扩展安装到 Chrome/Edge（开发者模式加载解压目录），填入服务地址与 API Key，登录 gemini.google.com 后扩展会立刻抓取并推送。')
-      + `
-        <div style="margin-top:8px"><a class="btn muted" href="api/browser/extension" download>下载抓取扩展（zip）</a></div>`;
-    body += step(4, '完成',
-      hasCookie
+    body += step(3, '安装扩展（本机 Chrome / Edge）', {
+      html: '下载扩展 zip 并解压，然后在浏览器扩展管理页加载。' +
+        '<div style="margin-top:8px"><a class="btn muted" href="api/browser/extension" download>下载抓取扩展（zip）</a></div>',
+      paramId: 'install',
+    });
+    body += step(4, '配置扩展（推送模式 / 地址 / 密钥）', {
+      html: '点浏览器工具栏的扩展图标打开弹窗，按参数表填写并<b>保存</b>。★ 推送模式必须选「服务端」。',
+      paramId: 'config',
+    });
+    body += step(5, '登录 Gemini 并入池', {
+      html: '确保本机浏览器已登录 gemini.google.com，然后点「立即入池」——服务端会用默认模型自动校验一次。',
+      paramId: 'pool',
+    });
+    const troubleshootBtn = hasCookie
+      ? ''
+      : '<button class="btn muted" style="margin:4px 0" data-guide-params="troubleshoot">遇到问题？常见排查</button>';
+    body += step(6, '完成',
+      (hasCookie
         ? 'Cookie 池已有浏览器来源账号，引导完成。'
-        : '抓取成功后 cookie 会自动进入 Cookie 池，并立即用默认模型校验一次。')
+        : '抓取成功后 cookie 会自动进入 Cookie 池，并立即用默认模型校验一次。' + troubleshootBtn)
       + `
         <div style="margin-top:10px">
           <button class="btn" onclick="guideDone()">完成引导</button>
           <button class="btn muted" onclick="switchPage('browser')">去「浏览器登录」</button>
-        </div>`;
+        </div>`);
     return `
       <div class="panel page-fill">
         <h2>初始化引导
@@ -771,10 +814,11 @@ const pages = {
             <span class="badge ${env.guide_completed ? 'ok' : 'warn'}">${env.guide_completed ? '已完成过' : '未完成'}</span>
           </span>
         </h2>
-        <p class="lede">按当前部署环境接入浏览器登录，让 Gemini 的登录态自动进入 Cookie 池。</p>
+        <p class="lede">按当前部署环境接入浏览器登录。每一步的参数细节点「查看本步参数」弹窗查看。</p>
         ${body}
       </div>`;
   },
+
 
   // 浏览器登录：用 Chromium(VNC) 容器里独立 profile 登录 Google/Gemini，
   // 登录态自动抓成 cookie 写入 cookie 池，按「cookie 有效期 - 5 分钟」自动刷新（最长间隔 1 小时）。
@@ -1531,6 +1575,61 @@ async function delCookieAcct(id) {
 }
 
 // 初始化引导辅助 ─────────────────────────────────────────────────────────────
+
+// GUIDE_PARAMS_DATA 是引导页参数表的唯一数据源：页面渲染时把 GUIDE_PARAMS
+// 序列化进来（guide 函数负责赋值），弹窗函数按 id 取用。
+let GUIDE_PARAMS_DATA = {};
+
+// guideShowParams 用弹窗展示某一步的参数表（title + 三列 k/v/why）。
+function guideShowParams(title, paramId) {
+  const rows = GUIDE_PARAMS_DATA[paramId] || [];
+  return new Promise((resolve) => {
+    const el = document.createElement('div');
+    el.className = 'modal-overlay';
+    el.innerHTML = `
+      <div class="modal" style="width:min(640px,94vw)">
+        <h3>${escapeHtml(title)}</h3>
+        <div style="max-height:60vh;overflow:auto;margin-top:10px">
+          <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+            <thead><tr>
+              <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">参数 / 操作</th>
+              <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">填写值</th>
+              <th style="text-align:left;padding:6px 10px;border-bottom:1px solid var(--line)">说明</th>
+            </tr></thead>
+            <tbody>${rows.map(r => `
+              <tr>
+                <td style="padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap"><b>${escapeHtml(r.k)}</b></td>
+                <td style="padding:6px 10px;border-bottom:1px solid var(--line);font-family:ui-monospace,monospace">${escapeHtml(r.v)}</td>
+                <td style="padding:6px 10px;border-bottom:1px solid var(--line);color:var(--muted)">${escapeHtml(r.why || '')}</td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:16px;display:flex;justify-content:flex-end">
+          <button class="btn" data-act="ok">知道了</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    el.addEventListener('click', (e) => {
+      const act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
+      if (act === 'ok' || e.target === el) { el.remove(); resolve(); }
+    });
+  });
+}
+
+// 事件委托：引导页的「查看本步参数」按钮统一在这里接
+document.addEventListener('click', (e) => {
+  const t = e.target && e.target.closest && e.target.closest('[data-guide-params]');
+  if (!t) return;
+  const id = t.getAttribute('data-guide-params');
+  const titles = {
+    install: '第 3 步参数：安装扩展',
+    config: '第 4 步参数：扩展配置',
+    pool: '第 5 步参数：登录并入池',
+    troubleshoot: '常见问题排查',
+  };
+  guideShowParams(titles[id] || '参数', id);
+});
+
 // 探测本机浏览器（用户要求：Windows 环境检测 edge / chrome）。
 // 浏览器不暴露安装清单，只能从 UA / userAgentData 推断当前在用什么；
 // 若当前是 Edge/Chrome，就把它作为「本机可用浏览器」呈现。
