@@ -854,6 +854,9 @@ const pages = {
             : '<span class="badge warn">未抓取</span>'}</td>
         <td class="pre truncate" style="max-width:220px" title="${escapeHtml(a.label || a.name)}">${escapeHtml(a.label || a.name)}</td>
         <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
+        <td class="nw" style="font-size:12px;max-width:200px" title="${escapeHtml(a.last_error || '')}">
+          ${a.last_error ? `<span style="color:var(--danger,#d33)">${escapeHtml(a.last_error.length > 60 ? a.last_error.slice(0, 60) + '…' : a.last_error)}</span>` : '<span class="muted">—</span>'}
+        </td>
         <td class="nw">
           <span class="actions">
             <button class="btn muted" onclick="browserOpenLogin('${escapeHtml(a.name)}', this)">容器内打开</button>
@@ -863,7 +866,7 @@ const pages = {
             <button class="btn danger" onclick="browserDel('${escapeHtml(a.name)}', this)">删除</button>
           </span>
         </td>
-      </tr>`).join('') || '<tr><td colspan="7" class="empty">还没有 profile。点「+ 添加账号」开始。</td></tr>';
+      </tr>`).join('') || '<tr><td colspan="8" class="empty">还没有 profile。点「+ 添加账号」开始。</td></tr>';
 
     return `
       <div class="panel page-fill">
@@ -907,7 +910,7 @@ const pages = {
             </colgroup>
             <thead><tr>
               <th class="nw">状态</th><th>Profile</th><th class="nw">CDP 端口</th>
-              <th class="nw">Cookie 池</th><th>标签 / 账号</th><th class="nw">最近成功</th><th class="nw">操作</th>
+              <th class="nw">Cookie 池</th><th>标签 / 账号</th><th class="nw">最近成功</th><th class="nw">最近错误</th><th class="nw">操作</th>
             </tr></thead>
             <tbody>${rowHtml}</tbody>
           </table>

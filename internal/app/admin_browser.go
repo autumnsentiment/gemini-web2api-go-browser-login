@@ -313,6 +313,14 @@ func findBrowserAccountByProfile(profile string) (*BrowserAccount, error) {
 }
 
 // handleAdminBrowserNow — POST /admin/api/browser/refresh 手动对所有 browser 账号刷新
+//
+// ★ 2026-09-18 修正「失败也报成功」★
+// 旧实现只看 browserRefreshOne 的 error：err 为 nil 就算成功。可 browserRefreshCore
+// 在「未登录」时返回的是 (false, "未登录", errBrowserNotLoggedIn) —— 有 error 还好，
+// 但真正漏掉的是只读路径判失败、刷新路径又判「未登录」却把 nil error 传上来的分支，
+// 以及返回 ok=false 的其它情形。现在统一以 ok 为准，并把每个 profile 的失败原因
+// 原样带给前端；同时失败时写 last_error，面板上看得见（之前这里还会 markAccountResult
+// 无条件标成功，把死号的 last_error 抹掉）。
 func handleAdminBrowserNow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
@@ -326,13 +334,27 @@ func handleAdminBrowserNow(w http.ResponseWriter, r *http.Request) {
 	nOK, nFail := 0, 0
 	var errs []string
 	for _, a := range accts {
-		ok, _, err := browserRefreshOne(a.Label, a.Profile)
-		if err != nil {
-			nFail++
-			errs = append(errs, fmt.Sprintf("%s: %v", a.Profile, err))
+		// remote 来源归扩展负责，容器刷新循环不碰（同 browserAutoRefresh 的规则）
+		if a.Source == "remote" {
 			continue
 		}
-		_ = ok
+		ok, detail, err := browserRefreshOne(a.Label, a.Profile)
+		if err != nil || !ok {
+			nFail++
+			reason := detail
+			if err != nil {
+				reason = err.Error()
+			}
+			if reason == "" {
+				reason = "未知原因"
+			}
+			errs = append(errs, fmt.Sprintf("%s: %s", a.Profile, reason))
+			if a.ID > 0 {
+				_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`,
+					truncate("浏览器抓取失败："+reason, 200), a.ID)
+			}
+			continue
+		}
 		nOK++
 		markAccountResult(a.ID, true, "")
 	}

@@ -58,6 +58,12 @@ var (
 var errBrowserPageUnreachable = errors.New("浏览器页面打不开（网络/代理不可达）")
 
 // errBrowserNotLoggedIn：页面正常打开，但确实没有登录态。
+//
+// ★ 2026-09-18 起刷新路径不再返回它 ★
+// 实测发现「DOM 没 token」几乎总是会话被服务端挂起（页面是缓存的登录界面），
+// 真正的「从未登录」只发生在刚建 profile 时 —— 那种情况也按挂起处理（保留账号、
+// 提示去 VNC 登录）更稳妥：删号会把用户已经配好的 profile 记录一并清掉。
+// 保留这个 error 是给上层判断用的，browserAutoRefresh 仍会识别它。
 var errBrowserNotLoggedIn = errors.New("profile 未登录 gemini（页面里没有 SNlM0e）")
 
 // errBrowserNeedRelogin：Google 在浏览器里弹出了重新验证（密码 challenge /
@@ -73,6 +79,14 @@ var errBrowserNeedRelogin = errors.New("浏览器需要重新登录（Google 要
 // 的话一次会话过期就能在几分钟内触发好几次页面刷新 —— 节点加载本来就慢，多处
 // 刷新叠在一起正是触发 Google 风控的节奏。冷却内的调用一律拒绝，不做导航。
 var errBrowserRefreshCooldown = errors.New("浏览器刷新冷却中")
+
+// errBrowserSessionInvalid：页面自己显示「已登录」，但服务端复验是匿名。
+//
+// 这是 2026-09-18 实测的第三种状态（前两种是「未登录」和「需要重新验证」）：
+// Google 把会话挂起后，SPA 仍会用本地缓存渲染出登录界面、DOM 里甚至还有
+// SNlM0e，但服务端（页面内 fetch('/app') 复验）已经不认这份会话。此时抓到的
+// cookie 是死的，绝不能入库；账号也不能删 —— 用户在 VNC 桌面重新登录即可恢复。
+var errBrowserSessionInvalid = errors.New("浏览器会话已被 Google 挂起（页面显示已登录，服务端复验为匿名），请在 VNC 桌面重新登录该账号")
 
 // ── 抓取节奏（反风控核心参数）────────────────────────────────────────────────
 const (
@@ -815,15 +829,20 @@ func sortStrings(s []string) {
 //	token  —— 页面里有**非空**的 SNlM0e。注意必须是「值非空」：新版前端在匿名 /
 //	          challenge 页也会带上 `"SNlM0e":""` 这个**空**键，老代码只查
 //	          indexOf('SNlM0e') 会被它骗过去，反过来偶尔又因为 DOM 尚未水合漏报。
+//	          2026-09-18 再补一条：会话失效后 /app 返回的**匿名页**上写着
+//	          「登录即可保存活动记录」，而它的 HTML 里也可能带 SNlM0e —— 命中
+//	          匿名文案时 token 一律按 false 处理，否则死会话会被判成活的。
 const pageStateJS = `(function(){
 	var u = String(location.href || '');
 	var h = document.documentElement ? document.documentElement.outerHTML : '';
 	var w = '';
 	try { w = String((typeof WIZ_global_data !== 'undefined' && WIZ_global_data && WIZ_global_data.SNlM0e) || ''); } catch (e) {}
+	var anon = /登录即可保存活动记录|Sign in to save your activity/.test(h);
 	return JSON.stringify({
 		err: u.indexOf('chrome-error://') === 0 || h.indexOf('ERR_CONNECTION') !== -1 || h.indexOf('ERR_PROXY') !== -1 || h.indexOf('ERR_NAME_NOT_RESOLVED') !== -1 || h.indexOf('ERR_TUNNEL_CONNECTION_FAILED') !== -1 || h.indexOf('ERR_TIMED_OUT') !== -1 || h.indexOf('This site can') !== -1,
 		signin: u.indexOf('accounts.google.com') !== -1 && (u.indexOf('/signin') !== -1 || u.indexOf('ServiceLogin') !== -1 || u.indexOf('/challenge/') !== -1 || u.indexOf('/v3/signin') !== -1),
-		token: (/"SNlM0e":"[^"]{10,}"/).test(h) || w.length >= 10
+		anon: anon,
+		token: !anon && (/"SNlM0e":"[^"]{10,}"/).test(h) || (!anon && w.length >= 10)
 	});
 })()`
 
@@ -834,6 +853,14 @@ const pageStateJS = `(function(){
 // 有 SAPISID + __Secure-1PSID 就当已登录」——这正是僵尸 cookie 的来源：Google
 // 强制重验 / 登出的页面上那两项照样在，照单全收就把死 cookie 写进了池子，还覆盖掉
 // 上一份好 cookie。改成页面内 fetch 验证后，只有**服务端真的认这份会话**才入库。
+//
+// ★ 2026-09-18 两个致命细节（实测踩过）★
+//  1. **必须 cache:'no-store'**。会话刚失效时 HTTP 缓存里还躺着上一份「已登录」
+//     的 /app 响应，普通 fetch 直接命中缓存、SNlM0e 看着还在 —— 于是死会话被判
+//     成活的，僵尸 cookie 又一次写进池子。加 no-store 强制回源。
+//  2. **匿名页也要判死**。会话失效后 /app 返回的是匿名版页面（页面上写着
+//     「登录即可保存活动记录 / Sign in to save your activity」），实测它的 HTML
+//     里也可能带 SNlM0e 字段。两个信号取或：命中匿名文案直接判未登录。
 func verifyByInPageFetch(hostPort string) bool {
 	for i := 0; i < 3; i++ {
 		if i > 0 {
@@ -841,9 +868,14 @@ func verifyByInPageFetch(hostPort string) bool {
 		}
 		out, err := cdpEval(hostPort, `(async function(){
 			try {
-				var r = await fetch('/app', {credentials:'include', redirect:'follow'});
+				var r = await fetch('/app', {credentials:'include', cache:'no-store', redirect:'follow'});
 				var t = await r.text();
-				return JSON.stringify({status: r.status, token: (/"SNlM0e":"[^"]{10,}"/).test(t)});
+				var anon = /登录即可保存活动记录|Sign in to save your activity|登录以保存/.test(t);
+				return JSON.stringify({
+					status: r.status,
+					token: !anon && (/"SNlM0e":"[^"]{10,}"/).test(t),
+					anon: anon
+				});
 			} catch (e) {
 				return JSON.stringify({status: 0, token: false, error: String(e)});
 			}
@@ -909,8 +941,14 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 	// ── 第一步：只读抓取（不导航、不刷新）────────────────────────────────
 	// 直接从 Chromium 现有页面读登录态并抓 cookie。页面若停在别的 tab 或
 	// 尚未加载完，这步会判「未登录」，随即进入第二步的刷新路径。
-	if ok, detail := browserTryReadOnly(hostPort, label, profile); ok {
+	//
+	// ★ 2026-09-18：会话被 Google 挂起时，刷新页面是白费的 —— 页面会照常
+	// 加载（缓存/本地渲染），复验依然匿名，只是白白多刷一次（还多一次风控
+	// 暴露）。这种情况直接返回 errBrowserSessionInvalid，等用户去 VNC 重登。
+	if ok, detail, roErr := browserTryReadOnly(hostPort, label, profile); ok {
 		return true, detail, nil
+	} else if errors.Is(roErr, errBrowserSessionInvalid) {
+		return false, detail, roErr
 	} else {
 		logf("[browser] profile %q 只读抓取未成功（%s），刷新页面后重试", profile, detail)
 	}
@@ -970,7 +1008,11 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 			// 一次都没读到页面：CDP/页面本身有问题，别赖登录态
 			return false, "", errBrowserPageUnreachable
 		}
-		return false, "未登录", errBrowserNotLoggedIn
+		// 页面 DOM 里没有 token。两种可能：SPA 没渲染完（真·未登录），或者
+		// Google 挂起了会话（DOM 有缓存渲染、服务端不认）。刷新路径已经导航
+		// 过一次，再判不出 token 就按「会话被挂起」处理 —— 让上层保留账号、
+		// 提示去 VNC 重登，而不是把账号删掉（cookie 本身可能没坏，重登即可）。
+		return false, "未登录", errBrowserSessionInvalid
 	}
 
 	cap, err := cdpCaptureCookies(hostPort)
@@ -1005,42 +1047,69 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 // / SNlM0e，页面不在 gemini 域或 SPA 未渲染完就判「只读失败」，然后走导航
 // 路径，平白多刷新一次页面。改成先抓 cookie：有 SAPISID + 1PSID 就直接入库，
 // 页面检查只作为「cookie 缺项时的二次确认」，绝大多数抓取完全零导航。
-func browserTryReadOnly(hostPort, label, profile string) (bool, string) {
+//
+// ★ 2026-09-18 修「僵尸 cookie 回写」★
+// 「cookie jar 里有 SAPISID + 1PSID」**不等于会话有效**：Google 挂起会话后这两项
+// 照样在（甚至 jar 里还有 1PSIDTS），但服务端已经把你当匿名。旧逻辑只看 cookie
+// 键名就入库，于是每次抓取都把死 cookie 原样回写一遍，还顺手把 fail_count 清零、
+// last_error 抹掉 —— 面板上看着「抓取成功」，实际请求全部 no SNlM0e。实测 acct1：
+// 页面 body 明晃晃写着「登录即可保存活动记录」，只读路径却报成功。
+//
+// 现在的规则：cookie 抓到后必须**页面内 fetch('/app') 复验出非空 SNlM0e** 才入库。
+// 页面在 gemini 域时这一步本来就有（顺带把结果缓存下来，避免重复 fetch）；
+// 页面不在 gemini 域（比如停在 accounts.google.com 的登录页）时，说明这个 profile
+// 当前根本没有活着的 Gemini 会话 —— 直接判只读失败，交给刷新路径导航一次再看。
+func browserTryReadOnly(hostPort, label, profile string) (bool, string, error) {
 	// 第一步：直接抓 cookie jar（与页面所在 tab 无关）
 	cap, err := cdpCaptureCookies(hostPort)
-	if err == nil {
-		cookie := cap.Cookie
-		if extractSAPISID(cookie) != "" && strings.Contains(cookie, "__Secure-1PSID=") {
-			if err := browserStoreCookie(label, profile, cookie); err == nil {
-				browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
-				logf("[browser] profile %q 只读抓取成功（未刷新页面）", profile)
-				return true, "已抓取并入库（未刷新页面）"
-			}
-		}
-	}
+	hasCookie := err == nil && extractSAPISID(cap.Cookie) != "" &&
+		strings.Contains(cap.Cookie, "__Secure-1PSID=")
 
-	// 第二步：cookie 缺项/抓取失败 —— 用页面登录态做二次确认（仍然零导航）。
+	// 第二步：读当前页面地址，判断能不能就地做登录态复验。
 	cur, err := cdpEval(hostPort, `String(location.href || '')`)
 	if err != nil {
-		return false, "读取当前页面地址失败"
+		if hasCookie {
+			// 页面读不到但 cookie 齐全：拿不到页面就没法验活，宁可这次不抓。
+			// 入库一份没验过的 cookie 等于把死号写进池子，代价远大于晚抓一轮。
+			return false, "读取当前页面地址失败（无法复验登录态，暂不入库）", nil
+		}
+		return false, "读取当前页面地址失败", nil
 	}
 	cur = strings.TrimSpace(strings.Trim(strings.TrimSpace(cur), `"`))
-	if !strings.Contains(cur, "gemini.google.com") {
-		return false, "当前页面不在 gemini.google.com（" + truncate(cur, 60) + "）"
+	onGemini := strings.Contains(cur, "gemini.google.com")
+
+	if hasCookie {
+		if !onGemini {
+			// 页面不在 gemini 域：没有可复验的上下文。交给刷新路径导航一次
+			// （刷新路径有完整的 signin / token / 错误页三分支判断）。
+			return false, "当前页面不在 gemini.google.com（" + truncate(cur, 60) + "），无法复验登录态", nil
+		}
+		if verifyByInPageFetch(hostPort) {
+			if err := browserStoreCookie(label, profile, cap.Cookie); err == nil {
+				browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
+				logf("[browser] profile %q 只读抓取成功（未刷新页面，登录态已复验）", profile)
+				return true, "已抓取并入库（未刷新页面，登录态已复验）", nil
+			}
+			return false, "入库失败", nil
+		}
+		logf("[browser] profile %q cookie 齐全但页面内复验不到 SNlM0e，判定会话已被挂起", profile)
+		return false, "cookie 齐全但页面内复验不到 SNlM0e（会话已失效）", errBrowserSessionInvalid
 	}
+
+	// 第三步：cookie 缺项 —— 用页面登录态做二次确认（仍然零导航）。
 	has, err := cdpEval(hostPort, pageStateJS)
 	if err != nil {
-		return false, "读取页面登录态失败"
+		return false, "读取页面登录态失败", nil
 	}
 	s := strings.TrimSpace(has)
 	s = strings.Trim(s, `"`)
 	s = strings.ReplaceAll(s, `\"`, `"`)
 	if strings.Contains(s, `"err":true`) {
-		return false, "页面是错误页"
+		return false, "页面是错误页", nil
 	}
 	if strings.Contains(s, `"signin":true`) {
 		// 重验页：只读路径不处理，交给刷新路径给出「需要重新登录」的明确结论。
-		return false, "页面停在 Google 登录/重验流程"
+		return false, "页面停在 Google 登录/重验流程", nil
 	}
 	if strings.Contains(s, `"token":true`) {
 		// 页面有登录态但 cookie jar 缺项：再抓一次（可能上一轮 jar 读取太早）
@@ -1048,11 +1117,11 @@ func browserTryReadOnly(hostPort, label, profile string) (bool, string) {
 		if err == nil {
 			if err := browserStoreCookie(label, profile, cap2.Cookie); err == nil {
 				browserScheduleNextRefresh(profile, cap2.MinExpiryUnix)
-				return true, "已抓取并入库（未刷新页面，页面确认后重抓）"
+				return true, "已抓取并入库（未刷新页面，页面确认后重抓）", nil
 			}
 		}
 	}
-	return false, "cookie 缺关键项（SAPISID / __Secure-1PSID）"
+	return false, "cookie 缺关键项（SAPISID / __Secure-1PSID）", nil
 }
 
 // browserCDPHost 返回 CDP 要连的主机：控制器和 chromium 同网络时用容器名。
@@ -1228,6 +1297,16 @@ func browserAutoRefresh() {
 				logf("[browser] 账号 #%d (profile %q) 需要重新登录（Google 要求重新验证），已保留，请在 VNC 桌面完成", a.ID, a.Profile)
 				_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`,
 					"浏览器需要重新登录（Google 要求重新验证密码），请在 VNC 桌面完成", a.ID)
+				deferNext(a.Profile, 600)
+				continue
+			}
+			// 会话被 Google 挂起（页面看着已登录、服务端复验为匿名）：与「重验」
+			// 同级别处置 —— 保留账号 + 面板提示，去 VNC 重新登录即可。这里**不删号**：
+			// cookie 本身可能没坏，删了用户还得重建；而且删号还会顺手清掉池记录。
+			if errors.Is(err, errBrowserSessionInvalid) {
+				logf("[browser] 账号 #%d (profile %q) 会话被挂起（服务端复验为匿名），已保留，请在 VNC 桌面重新登录", a.ID, a.Profile)
+				_, _ = getDB().Exec(`UPDATE accounts SET last_error=? WHERE id=?`,
+					"浏览器会话已被 Google 挂起（页面显示已登录、服务端复验为匿名），请在 VNC 桌面重新登录该账号", a.ID)
 				deferNext(a.Profile, 600)
 				continue
 			}
