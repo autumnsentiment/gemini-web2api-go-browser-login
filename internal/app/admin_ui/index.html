@@ -842,9 +842,24 @@ const pages = {
     const rows = (st.profiles || []);
     // 桌面网页地址存服务端（kv），所有访问面板的设备看到同一份配置。
     const accessUrl = (st.access_url || '').trim();
-    const rowHtml = rows.map(a => `
+    // 空闲休眠秒数：0 = 常驻；-1 = 控制器没报（老版本）；>0 = 按需唤醒模式
+    const idleStop = (typeof st.idle_stop === 'number') ? st.idle_stop : -1;
+    const rowHtml = rows.map(a => {
+      // 状态徽标：运行中分「手动挂起（登录中）」和「抓取中/待机」；
+      // 未运行即「已休眠」—— 按需唤醒模式下这是常态，不是故障。
+      let badge;
+      if (a.running) {
+        badge = a.hold
+          ? '<span class="badge warn">唤醒中（登录）</span>'
+          : '<span class="badge ok">唤醒中</span>';
+      } else {
+        badge = idleStop > 0
+          ? '<span class="badge muted">已休眠</span>'
+          : '<span class="badge muted">已停止</span>';
+      }
+      return `
       <tr>
-        <td class="nw"><span class="badge ${a.running ? 'ok' : 'muted'}">${a.running ? '运行中' : '已停止'}</span></td>
+        <td class="nw">${badge}</td>
         <td class="truncate" title="${escapeHtml(a.name)}"><b>${escapeHtml(a.name)}</b>
           ${a.account_id ? `<div class="muted" style="font-size:12px">cookie 池 #${a.account_id}</div>` : ''}
         </td>
@@ -862,11 +877,13 @@ const pages = {
             <button class="btn muted" onclick="browserOpenLogin('${escapeHtml(a.name)}', this)">容器内打开</button>
             ${accessUrl ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
             <button class="btn muted" onclick="browserFetch('${escapeHtml(a.name)}', this)">抓取 cookie</button>
+            ${a.running ? `<button class="btn muted" onclick="browserSleep('${escapeHtml(a.name)}', this)" title="立即休眠：抓完不用等空闲计时，直接收掉浏览器进程">休眠</button>` : ''}
             ${a.account_id ? `<button class="btn muted" onclick="browserAccountInPool(${a.account_id})">池中账号</button>` : ''}
             <button class="btn danger" onclick="browserDel('${escapeHtml(a.name)}', this)">删除</button>
           </span>
         </td>
-      </tr>`).join('') || '<tr><td colspan="8" class="empty">还没有 profile。点「+ 添加账号」开始。</td></tr>';
+      </tr>`;
+    }).join('') || '<tr><td colspan="8" class="empty">还没有 profile。点「+ 添加账号」开始。</td></tr>';
 
     return `
       <div class="panel page-fill">
@@ -889,6 +906,10 @@ const pages = {
             <code>user</code> / 密码），在桌面里点开该账号的 Chromium 窗口完成 Google 登录；
             <br>③ 回到本页点「抓取 cookie」→ 登录态解析成 cookie 写进上方 Cookie 池；
             <br>④ 之后按「cookie 有效期 - 5 分钟」自动抓一次保持新鲜（最长间隔 1 小时）；同一 profile 两次抓取至少隔 2 分钟。
+            <br><br><b>按需唤醒（省 CPU / 内存）</b>：浏览器平时是<b>休眠</b>的（
+            ${idleStop > 0 ? `空闲 ${Math.round(idleStop / 60)} 分钟无抓取流量就自动收掉进程` : '当前为常驻模式（控制器未启用空闲休眠）'}
+            ），只有<b>抓 cookie 时自动唤醒</b>，抓完自动睡回去。
+            手动登录期间会临时挂住不睡（状态列显示「唤醒中（登录）」）；想立刻收掉可点该行「休眠」。
             <br><br><span class="muted">桌面网页地址（上方输入框）默认取自启动参数
             <code>BROWSER_ACCESS_URL</code>；改完后点「保存」会写入服务端数据（所有设备生效），方便你在
             <code>5666/chromium</code> 这类入口之间切换。</span>
@@ -1800,6 +1821,19 @@ function showVerifyDialog(v, detail) {
       if (act === 'ok' || e.target === el) { el.remove(); resolve(); }
     });
   });
+}
+
+// 立即休眠：抓完不想等空闲计时，直接把浏览器进程收掉（省 CPU/内存）。
+async function browserSleep(name, btn) {
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '休眠中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('api/browser/profiles/' + encodeURIComponent(name) + '/stop',
+      { method: 'POST', credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) return flash('休眠失败：' + (j.error || r.status));
+    flash('已休眠（下次抓取会自动唤醒）');
+    await refreshPage();
+  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
 }
 
 // 删除 profile（停实例 + 删池记录）

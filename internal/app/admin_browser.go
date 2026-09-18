@@ -47,20 +47,23 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 
 	// 控制器里实际在跑的 profile
 	ctrlNames := map[string]bool{}
+	ctrlHold := map[string]bool{}
 	ctrlList := []map[string]interface{}{}
 	if enabled {
 		var out struct {
 			Profiles []struct {
 				Name string `json:"name"`
 				Port int    `json:"port"`
+				Hold bool   `json:"hold"`
 			} `json:"profiles"`
 		}
 		code, err := browserHTTP(http.MethodGet, browserControllerURL()+"/profiles", nil, &out)
 		if err == nil && code == 200 {
 			for _, p := range out.Profiles {
 				ctrlNames[p.Name] = true
+				ctrlHold[p.Name] = p.Hold
 				ctrlList = append(ctrlList, map[string]interface{}{
-					"name": p.Name, "port": p.Port,
+					"name": p.Name, "port": p.Port, "hold": p.Hold,
 				})
 			}
 		}
@@ -96,6 +99,7 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 			"name":       name,
 			"port":       0,
 			"running":    ctrlNames[name],
+			"hold":       ctrlHold[name],
 			"account_id": 0,
 			"label":      name,
 			"status":     "",
@@ -131,7 +135,24 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 		"profiles":   items,
 		"ctrl":       ctrlList,
 		"access_url": browserAccessURL(),
+		"idle_stop":  browserIdleStopSec(),
 	})
+}
+
+// browserIdleStopSec 返回控制器的空闲休眠秒数（0 = 常驻不休眠）。
+// 面板据此显示「已休眠 / 唤醒中」这类状态文案；控制器不可达时返回 -1。
+func browserIdleStopSec() int {
+	if !browserEnabled() {
+		return -1
+	}
+	var out struct {
+		IdleStopSec *int `json:"idle_stop_sec"`
+	}
+	code, err := browserHTTP(http.MethodGet, browserControllerURL()+"/healthz", nil, &out)
+	if err != nil || code != 200 || out.IdleStopSec == nil {
+		return -1
+	}
+	return *out.IdleStopSec
 }
 
 // browserAccessURL 返回当前生效的桌面网页地址：服务端 kv 里用户保存过的优先，
@@ -199,11 +220,15 @@ func handleAdminBrowserProfiles(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	// 新建 profile = 用户马上要在 VNC 里登录：挂住别让它空闲睡掉。
+	if err := browserHoldProfile(p.Name, true); err != nil {
+		logf("[browser] profile %q 挂起失败（不影响创建）: %v", p.Name, err)
+	}
 	// 打开登录页方便 VNC 手输（best-effort）
 	_ = browserOpenLogin(p.Name)
 	writeJSON(w, 200, map[string]interface{}{
 		"name": p.Name, "port": port, "ok": true,
-		"detail": "profile 已就绪，请在 Chromium VNC 桌面（:3000/:3001）登录该账号",
+		"detail": "profile 已就绪，请在 Chromium VNC 桌面登录该账号（登录期间保持唤醒，抓取后自动休眠）",
 	})
 }
 
@@ -235,11 +260,28 @@ func handleAdminBrowserProfileAction(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		switch action {
+		case "stop":
+			// 立即休眠：不等空闲计时，直接把浏览器进程收掉（省 CPU/内存）。
+			// 下次抓取会自动唤醒；cookie 早已落盘，休眠不影响登录态。
+			if err := browserStopProfile(name); err != nil {
+				writeJSON(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+			logf("[browser] profile %q 已手动休眠", name)
+			writeJSON(w, 200, map[string]interface{}{
+				"ok": true, "detail": "已休眠，下次抓取会自动唤醒",
+			})
 		case "open":
-			// 先确保实例在跑，再导航到登录页
+			// 先确保实例在跑（唤醒），再导航到登录页。
+			// ★ 同时挂住（hold）：用户要在 VNC 里手动输账号密码，可能几分钟，
+			// 期间没有 CDP 流量 —— 不挂住的话控制器会把浏览器当空闲收掉，
+			// 登录做到一半页面就没了。抓取时会自动解除 hold。
 			if _, err := ensureBrowserProfile(name); err != nil {
 				writeJSON(w, 400, map[string]string{"error": err.Error()})
 				return
+			}
+			if err := browserHoldProfile(name, true); err != nil {
+				logf("[browser] profile %q 挂起失败（不影响打开）: %v", name, err)
 			}
 			if err := browserOpenLogin(name); err != nil {
 				writeJSON(w, 400, map[string]string{"error": err.Error()})
@@ -247,9 +289,13 @@ func handleAdminBrowserProfileAction(w http.ResponseWriter, r *http.Request) {
 			}
 			writeJSON(w, 200, map[string]interface{}{
 				"ok":     true,
-				"detail": "已在对应 Chromium 窗口打开 gemini.google.com，请在 VNC 桌面登录",
+				"detail": "已在对应 Chromium 窗口打开 gemini.google.com，请在 VNC 桌面登录（登录期间浏览器保持唤醒，抓取后自动休眠）",
 			})
 		case "fetch":
+			// 抓取前先解除挂起：抓完让控制器按空闲计时自动休眠。
+			if err := browserHoldProfile(name, false); err != nil {
+				logf("[browser] profile %q 解除挂起失败（不影响抓取）: %v", name, err)
+			}
 			// 立即抓 cookie 入库，随后用默认模型做一次真实请求校验
 			// （用户要求：抓取后必须验证这条链路真能用）。
 			acct, _ := findBrowserAccountByProfile(name)
@@ -405,17 +451,17 @@ func handleAdminBrowserEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, map[string]interface{}{
-		"in_docker":         inDocker,
-		"os":                runtime.GOOS,
-		"has_controller":    hasController,
-		"controller_ok":     controllerHealthy,
-		"running_profiles":  runningProfiles,
-		"browser_kind":      kind,
-		"controller_url":    browserControllerURL(),
-		"access_url":        browserAccessURL(),
-		"extension_ready":   true, // 扩展源码内嵌在本二进制里，见 handleAdminBrowserExtension
-		"pool_has_cookie":   hasCookie(),
-		"guide_completed":   kvGet(kvBrowserGuideDone) == "1",
+		"in_docker":        inDocker,
+		"os":               runtime.GOOS,
+		"has_controller":   hasController,
+		"controller_ok":    controllerHealthy,
+		"running_profiles": runningProfiles,
+		"browser_kind":     kind,
+		"controller_url":   browserControllerURL(),
+		"access_url":       browserAccessURL(),
+		"extension_ready":  true, // 扩展源码内嵌在本二进制里，见 handleAdminBrowserExtension
+		"pool_has_cookie":  hasCookie(),
+		"guide_completed":  kvGet(kvBrowserGuideDone) == "1",
 	})
 }
 

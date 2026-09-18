@@ -54,9 +54,13 @@ def cmd_upsert():
         return 2
     con = connect()
     try:
+        # 2026-09-17: dedupe by profile globally, not per-source.
+        # Same profile may be pushed by both the remote extension (source=remote)
+        # and the server controller (source=browser) - same login, two paths,
+        # not two accounts. Newest write wins; other rows for this profile merge.
         row = con.execute(
-            "SELECT id FROM accounts WHERE source=? AND profile=? "
-            "ORDER BY id DESC LIMIT 1", (source, profile)).fetchone()
+            "SELECT id FROM accounts WHERE profile=? "
+            "ORDER BY id DESC LIMIT 1", (profile,)).fetchone()
         t = now()
         if row:
             aid = row[0]
@@ -76,8 +80,8 @@ def cmd_upsert():
         # 清掉同一 profile 的其它历史记录：每次抓取只保留最新一条，
         # 否则池子里会堆一串同账号的旧 cookie（有的已失效），轮询到就报错。
         removed = con.execute(
-            "DELETE FROM accounts WHERE source=? AND profile=? AND id<>?",
-            (source, profile, aid)).rowcount
+            "DELETE FROM accounts WHERE profile=? AND id<>?",
+            (profile, aid)).rowcount
         print(json.dumps({"id": aid, "action": action, "profile": profile,
                           "cookie_len": len(cookie), "ts": t, "removed": removed}))
         return 0

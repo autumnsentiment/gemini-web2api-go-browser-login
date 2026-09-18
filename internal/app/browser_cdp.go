@@ -242,35 +242,45 @@ func browserHealth() (bool, int, string) {
 // 所以这里做两层：拿到端口后**扫一遍控制器里该 profile 的实际端口**，
 // 以实际可连的那个为准。
 func ensureBrowserProfile(name string) (int, error) {
+	port, _, err := ensureBrowserProfileWoke(name)
+	return port, err
+}
+
+// ensureBrowserProfileWoke 同 ensureBrowserProfile，但额外告诉调用方这次是不是
+// 「真唤醒」（冷启动拉起）。冷启动时页面还在加载，调用方需要多等一会儿 ——
+// 否则会在 about:blank 上判「不在 gemini 域」而白白多导航一次（多一次页面
+// 加载开销，正是用户要省掉的）。
+func ensureBrowserProfileWoke(name string) (int, bool, error) {
 	if !browserEnabled() {
-		return 0, fmt.Errorf("浏览器登录未启用：请配置 BROWSER_CONTROLLER_URL")
+		return 0, false, fmt.Errorf("浏览器登录未启用：请配置 BROWSER_CONTROLLER_URL")
 	}
 	var out struct {
-		Name string `json:"name"`
-		Port int    `json:"port"`
+		Name     string `json:"name"`
+		Port     int    `json:"port"`
+		Launched bool   `json:"launched"`
 	}
 	body, _ := json.Marshal(map[string]string{"name": name})
 	code, err := browserHTTP(http.MethodPost, browserControllerURL()+"/profiles", body, &out)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if code != 200 {
-		return 0, fmt.Errorf("控制器返回 HTTP %d", code)
+		return 0, false, fmt.Errorf("控制器返回 HTTP %d", code)
 	}
 	// 端口扫描：控制器 /profiles 列出的才是实际在跑的端口
 	if real := browserScanProfilePort(name); real > 0 && real != out.Port {
 		logf("[browser] profile %q 控制器返回端口 %d，实际监听 %d，采用实际端口", name, out.Port, real)
-		return real, nil
+		return real, out.Launched, nil
 	}
 	if out.Port <= 0 {
 		// 控制器没返回端口：扫一遍看有没有在跑的
 		if real := browserScanProfilePort(name); real > 0 {
 			logf("[browser] 控制器未返回端口，扫描到 profile %q 实际监听 %d", name, real)
-			return real, nil
+			return real, out.Launched, nil
 		}
-		return 0, fmt.Errorf("控制器未返回 CDP 端口")
+		return 0, false, fmt.Errorf("控制器未返回 CDP 端口")
 	}
-	return out.Port, nil
+	return out.Port, out.Launched, nil
 }
 
 // browserScanProfilePort 扫描控制器里某 profile 的实际 CDP 端口，取可连通的那个。
@@ -307,12 +317,65 @@ func browserScanProfilePort(name string) int {
 	return 0
 }
 
+// browserWaitPageReady 等被唤醒的 Chromium 把启动页加载出来。
+//
+// 为什么需要：按需唤醒模式下 Chromium 是冷启动的（进程拉起 → X 连接 →
+// 加载启动页）。启动瞬间 /json/list 里的页面 URL 还是 about:blank，
+// 此时若直接判「不在 gemini 域」，就会白走一遍导航 —— 多一次整页加载，
+// 正是要省掉的开销。
+//
+// ★ 判据必须是「gemini 页出现了」而不是「有页面就行」★
+// 2026-09-18 实测踩过：写成「没有 gemini 就返回」时，冷启动那一瞬
+// 页面 URL 是 about:blank，函数立刻返回 true，等待等于没做。
+//
+// 返回是否等到了就绪的页面。超时不报错 —— 让后续流程自己去发现并报真实原因。
+func browserWaitPageReady(hostPort string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if ws, err := cdpListPages(hostPort); err == nil && ws != "" {
+			// 页面已出现；再确认它就是 gemini 页且已加载完。
+			out, err := cdpEval(hostPort,
+				`(function(){return String(location.href||'')+'|'+String(document.readyState||'')})()`)
+			if err == nil {
+				s := strings.TrimSpace(strings.Trim(strings.TrimSpace(out), `"`))
+				if strings.Contains(s, "gemini.google.com") && strings.Contains(s, "|complete") {
+					return true
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(1200 * time.Millisecond)
+	}
+}
+
 // browserStopProfile 让控制器关掉某个 profile 的实例。
 func browserStopProfile(name string) error {
 	if !browserEnabled() {
 		return nil
 	}
 	code, err := browserHTTP(http.MethodDelete, browserControllerURL()+"/profiles/"+name, nil, nil)
+	if err != nil {
+		return err
+	}
+	if code != 200 && code != 404 {
+		return fmt.Errorf("控制器返回 HTTP %d", code)
+	}
+	return nil
+}
+
+// browserHoldProfile 让控制器把某 profile 挂住（不自动空闲休眠）。
+//
+// 用户在 VNC 桌面手动登录时用：登录可能要几分钟，期间没有 CDP 流量，
+// 不挂住的话空闲计时器会把浏览器收掉、登录做到一半页面就没了。
+func browserHoldProfile(name string, hold bool) error {
+	if !browserEnabled() {
+		return nil
+	}
+	body, _ := json.Marshal(map[string]bool{"hold": hold})
+	code, err := browserHTTP(http.MethodPost,
+		browserControllerURL()+"/profiles/"+name+"/hold", body, nil)
 	if err != nil {
 		return err
 	}
@@ -927,12 +990,39 @@ func browserRefreshOne(label, profile string) (bool, string, error) {
 
 // browserRefreshCore 是抓取主体（不含闸门），供 browserRefreshOne（带闸门）
 // 与 browserRefreshOneForce（校验失败后的强制重抓）共用。
+//
+// ★ 按需唤醒（2026-09-18 用户要求）★
+// 浏览器平时是**休眠**的（控制器空闲 IDLE_STOP_SEC 后自动优雅关闭 Chromium），
+// 只有抓取时才唤醒：
+//  1. 解除 hold（用户手动登录期间挂住的才需要，抓取完要让它能睡回去）；
+//  2. ensureBrowserProfile → 控制器 POST /profiles 唤醒（已睡着就拉起，
+//     还醒着就复用，不会新建窗口）；
+//  3. 唤醒是**冷启动**：Chromium 起来 + 页面加载要几秒到十几秒，所以
+//     等 CDP 就绪 + 等页面出现，最多等 browserWakeWaitSec；
+//  4. 抓完什么都不用做，控制器空闲计时到点自动睡（不用发 stop，避免把
+//     用户正开着的窗口收掉）。
 func browserRefreshCore(label, profile string) (bool, string, error) {
-	port, err := ensureBrowserProfile(profile)
+	// 抓取开始就解除挂起：让浏览器抓完能按空闲计时睡回去。
+	// （用户登录期间 hold=1，若不解，浏览器会一直醒着。）
+	if err := browserHoldProfile(profile, false); err != nil {
+		logf("[browser] profile %q 解除挂起失败（忽略）: %v", profile, err)
+	}
+	port, woke, err := ensureBrowserProfileWoke(profile)
 	if err != nil {
 		return false, "", err
 	}
 	hostPort := fmt.Sprintf("%s:%d", browserCDPHost(), port)
+
+	// 冷启动等待：被唤醒的实例启动页是 gemini，但加载要几秒 —— 页面还没
+	// 到位就判「不在 gemini 域」，会白走一遍导航（多一次整页加载）。
+	// 这里按需等待：真唤醒给足时间，已常驻的立刻返回。
+	wait := 6 * time.Second
+	if woke {
+		wait = 25 * time.Second
+	}
+	if !browserWaitPageReady(hostPort, wait) {
+		logf("[browser] profile %q 等待页面就绪超时（%s），继续尝试抓取", profile, wait)
+	}
 
 	// 顺手清理残留空白页：历史版本开过的 about:blank 会一直挂在 CDP 目标
 	// 列表里（反复新建页面问题的遗留），每次抓取前收一遍。

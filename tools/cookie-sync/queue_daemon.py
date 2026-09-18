@@ -39,6 +39,10 @@ ERR_THRESHOLD = int(os.environ.get("GW2A_502_THRESHOLD", "2") or 2)   # 累计�
 # 所以默认只留 60s；真正防连环刷新的是 refresh.py 里的 MIN_GAP_SEC。
 ERR_COOLDOWN_SEC = int(os.environ.get("GW2A_502_COOLDOWN_SEC", "60") or 60)
 JOB_TIMEOUT = int(os.environ.get("GW2A_JOB_TIMEOUT", "480") or 480)
+# 会话保活看门狗：定期探「页面里还有没有 SNlM0e」，没了就自动重登。
+# 只看 cookie 名字是没用的 —— 注销后名字仍然齐全（踩过）。
+SESSION_CHECK_SEC = int(os.environ.get("GW2A_SESSION_CHECK_SEC", "300") or 300)
+RELOGIN_PY = os.environ.get("GW2A_RELOGIN_PY", "/opt/gw2a-cookie-sync/relogin.py")
 
 # 只看「cookie 失效」这类 502 更精准；默认 all 表示任何 502 都算（用户要求）。
 ERR_MODE = (os.environ.get("GW2A_502_MODE", "all") or "all").strip().lower()
@@ -141,11 +145,20 @@ _browser_missing_since = 0.0
 
 
 def ensure_browser_alive():
-    """浏览器必须常驻：Google 的 RotateCookiesPage iframe 只在页面存活时
-    才会把 __Secure-1PSIDTS 轮转下去。浏览器一关，会话立刻停止轮转，随后
-    服务端把会话判成匿名（/app 无 SNlM0e），池子里的 cookie 全变废。
+    """按需唤醒：浏览器平时**休眠**，只在抓取时唤醒。
 
-    这里每分钟检查一次，不在就拉起；连续拉起失败只记日志，不中断队列。
+    ★ 2026-09-18 语义反转（用户要求「不抓取就休眠，省 CPU」）★
+    旧版这里每分钟把 profile 拉起来「保活常驻」，理由是 RotateCookiesPage
+    iframe 只在页面存活时轮转 __Secure-1PSIDTS。现在轮转改由服务端
+    POST /accounts.google.com/RotateCookies 完成（不经过浏览器，见 rotate.go），
+    浏览器常驻不再是会话新鲜的前提 —— 而常驻代价是 12 个进程 / 约 1.9GB 内存
+    / 约 30% CPU 空转。
+
+    现在的规则：
+      * 不在运行 → **什么都不做**（休眠是正常状态，不是故障）；
+      * 在运行 → 返回 True（调用方可以安全地去探会话/抓取）。
+    需要浏览器时由 refresh.py 自己 ensure_browser（POST /profiles 唤醒），
+    抓完控制器空闲计时到点自动收掉。
     """
     global _browser_missing_since
     try:
@@ -153,22 +166,17 @@ def ensure_browser_alive():
         names = [p.get("name") for p in (d.get("profiles") or [])]
         if PROFILE in names:
             if _browser_missing_since:
-                log("浏览器已恢复（profile=%s）" % PROFILE)
+                log("浏览器已唤醒（profile=%s）" % PROFILE)
                 _browser_missing_since = 0.0
             return True
+        # 休眠中：这是正常状态。只记录一次，不再拉起。
+        if not _browser_missing_since:
+            _browser_missing_since = time.time()
+            log("profile=%s 休眠中（按需唤醒模式，等抓取任务唤醒）" % PROFILE)
+        return False
     except Exception as e:
         log("保活：查询控制器失败（忽略）:", e)
         return False
-    if not _browser_missing_since:
-        _browser_missing_since = time.time()
-        log("保活：profile=%s 不在运行，尝试拉起" % PROFILE)
-    try:
-        r = ctrl_json("/profiles", "POST", {"name": PROFILE})
-        log("保活：已拉起 profile=%s port=%s pid=%s"
-            % (PROFILE, r.get("port"), r.get("pid")))
-    except Exception as e:
-        log("保活：拉起失败（下次再试）:", e)
-    return False
 
 
 # ---------------------------------------------------------------- job
@@ -219,6 +227,49 @@ def run_refresh(reason):
         return False, str(e)
 
 
+# ------------------------------------------------------- session watchdog
+
+def session_check():
+    """跑 relogin.py --check-only。返回 True=会话有效。"""
+    try:
+        p = subprocess.run([PY, RELOGIN_PY, PROFILE, "--check-only"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        out = p.stdout.decode("utf-8", "replace")
+        log("会话探针 exit=%d: %s" % (p.returncode, out.strip().splitlines()[-1][:160]
+                                     if out.strip() else ""))
+        return p.returncode == 0
+    except Exception as e:
+        log("会话探针异常（忽略）:", e)
+        return True   # 探不了就别乱动
+
+
+def session_relogin():
+    """自动重新登录（用 profile 保存的密码）。返回 True=恢复成功。"""
+    try:
+        p = subprocess.run([PY, RELOGIN_PY, PROFILE],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+        out = p.stdout.decode("utf-8", "replace")
+        for line in out.strip().splitlines()[-8:]:
+            log("  relogin| " + line[:200])
+        ok = p.returncode in (0, 1)
+        log("自动重登 %s" % ("成功" if ok else "失败（可能需要人工 2FA/验证码）"))
+        return ok
+    except Exception as e:
+        log("自动重登异常:", e)
+        return False
+
+
+def check_marker(name):
+    return os.path.exists(os.path.join(STATE_DIR, name))
+
+
+def clear_marker(name):
+    try:
+        os.unlink(os.path.join(STATE_DIR, name))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -257,6 +308,7 @@ def main():
     # 启动即确认浏览器在跑（常驻是 cookie 轮转的前提）
     ensure_browser_alive()
     last_keepalive_check = time.time()
+    last_session_check = 0.0
 
     while True:
         try:
@@ -298,11 +350,34 @@ def main():
                 last_keepalive_check = now
                 ensure_browser_alive()
 
+            # ── 触发源 4：会话有效性看门狗（页面还有没有 SNlM0e）──────
+            # 只在队列空闲时探，避免和抓取任务抢浏览器标签页。
+            if now - last_session_check >= SESSION_CHECK_SEC and not queue:
+                last_session_check = now
+                if ensure_browser_alive() and not session_check():
+                    log("★ 会话已被判匿名 → 入队自动重登")
+                    seq += 1
+                    queue.append({"seq": seq, "type": "relogin", "at": now,
+                                  "detail": "会话失效自动重登"})
+                    persist()
+
             # ── 执行队列（串行，一次一个）───────────────────────────
             if queue:
                 job = queue.pop(0)
                 persist()
-                ok, detail = run_refresh(job["type"])
+                if job.get("type") == "relogin":
+                    ok = session_relogin()
+                    detail = "自动重登 " + ("成功" if ok else "失败")
+                    if ok:
+                        # 重登成功 → 立刻跟一轮抓取（这次一定能拿到有效 cookie）
+                        seq += 1
+                        queue.insert(0, {"seq": seq, "type": "error", "at": time.time(),
+                                         "detail": "重登后补抓"})
+                        persist()
+                    else:
+                        save_state(needsRelogin=True, needsReloginAt=time.time())
+                else:
+                    ok, detail = run_refresh(job["type"])
                 job["doneAt"] = time.time()
                 job["ok"] = ok
                 job["result"] = detail

@@ -23,6 +23,10 @@
  *   GW2A_DISPLAY       默认 :13
  *   GW2A_GPU_DISPLAY   默认空；设为 ':1' 后新 profile 默认用 GPU Xorg（virgl）
  *   GW2A_RUN_USER      默认 fygo-browser
+ *   GW2A_IDLE_STOP_SEC 默认 180；profile 空闲这么久没有 CDP 流量就自动休眠
+ *                      （优雅 SIGTERM，cookie 正常落盘）。0 = 关闭自动休眠。
+ *                      抓取前由调用方 POST /profiles 唤醒，抓完自动睡 —— 平时
+ *                      不占 CPU/内存。用户要手动登录时先 POST /profiles/<n>/hold。
  */
 'use strict';
 
@@ -48,6 +52,13 @@ const BROWSER_HOME = '/vol2/@appdata/gw2a-browser/home';
 const BROWSER_RUN = '/vol2/@appdata/gw2a-browser/run';
 const LD_LIB = RT + '/usr/lib/x86_64-linux-gnu:' + RT + '/usr/lib:' + RT + '/usr/lib/chromium';
 
+// 启动页：直接开 Gemini（而不是 about:blank）。
+//
+// ★ 2026-09-18 ★ 配合「按需唤醒」：浏览器平时休眠，被唤醒就是为了抓 cookie，
+// 启动页直接落在 gemini.google.com 的话，抓取脚本一上来就能走「只读抓取」
+// （不导航、不刷新页面），省掉一次整页加载 —— 既快又少一次风控暴露。
+const START_URL = process.env.GW2A_START_URL || 'https://gemini.google.com/';
+
 const CHROME_FLAGS = [
   '--no-first-run',
   '--no-default-browser-check',
@@ -55,7 +66,6 @@ const CHROME_FLAGS = [
   '--test-type',
   '--disable-infobars',
   '--ignore-gpu-blocklist',
-  '--disable-backgrounding-occluded-windows',
   '--password-store=basic',
   '--use-mock-keychain',
   '--disable-dev-shm-usage',
@@ -64,6 +74,21 @@ const CHROME_FLAGS = [
   '--disable-sync',
   '--no-service-autorun',
   '--remote-allow-origins=*',
+  // ── 资源限制（2026-09-18 用户要求：平时别常驻一堆浏览器内核进程）──────
+  // renderer 数量上限：页面数量受控后 2 个够用（gemini 页 + 空白页），
+  // 历史遗留的僵尸标签页不会再各占一个 renderer。
+  '--renderer-process-limit=2',
+  // 用不到的后台服务全部关掉：每个都是常驻进程，白吃 CPU 与内存。
+  '--disable-component-update',
+  '--disable-domain-reliability',
+  '--disable-client-side-phishing-detection',
+  '--disable-crash-reporter',
+  '--no-crashpad',
+  '--disable-breakpad',
+  '--metrics-recording-only',
+  '--mute-audio',
+  // 显式保留「后台标签页降频」：默认就是开的，这里写明是为了防止
+  // 后续有人加上 --disable-background-timer-throttling 把 CPU 吃回去。
 ];
 
 // Browser egress proxy (empty = direct). On dual-stack networks an
@@ -362,9 +387,44 @@ function call(type) {
 
 const MAX_PROFILES = 12;
 
+// ── 按需唤醒 / 空闲休眠（2026-09-18 用户要求）────────────────────────────
+// 「只有抓 cookie 时才唤醒浏览器，抓完就睡」：Chromium 常驻时 12 个进程
+// ~1.9GB 内存 + ~30% CPU（其中 renderer 16% + gpu-process 11% 都是空转），
+// 而真正需要它的只有每次抓取那几十秒。
+//
+// 生命周期：POST /profiles（抓取前的唤醒）→ 抓取（CDP 流量）→ 空闲 IDLE_STOP_SEC
+// 无任何 CDP 流量 → 优雅 SIGTERM 收工（cookie 正常落盘）。用户手动登录期间
+// 由 POST /profiles/<name>/hold 挂住，不自动睡。
+//
+// IDLE_STOP_SEC=0 关闭自动休眠（回到常驻行为）。
+const IDLE_STOP_SEC = (() => {
+  const v = parseInt(process.env.GW2A_IDLE_STOP_SEC || '180', 10);
+  return Number.isFinite(v) && v >= 0 ? v : 180;
+})();
+
 const state = {
-  profiles: new Map(), // name -> { name, port, pid, userDataDir, startedAt }
+  profiles: new Map(), // name -> { name, port, pid, userDataDir, startedAt, lastUsedAt, hold }
 };
+
+function touchProfile(rec) {
+  if (rec) rec.lastUsedAt = Date.now();
+}
+
+// sweepIdle 把空闲超时的 profile 优雅停掉。每 30s 跑一次。
+function sweepIdle() {
+  if (!IDLE_STOP_SEC) return;
+  const now = Date.now();
+  for (const [name, rec] of state.profiles) {
+    if (rec.hold) continue;
+    const idle = now - (rec.lastUsedAt || rec.startedAt || now);
+    if (idle < IDLE_STOP_SEC * 1000) continue;
+    console.log('[gw2a-ctrl] idle', Math.round(idle / 1000) + 's, stopping profile', name);
+    try { stopProfile(name, { reason: 'idle' }); } catch (e) {
+      console.log('[gw2a-ctrl] idle stop failed', name, e.message);
+    }
+  }
+}
+setInterval(sweepIdle, 30000).unref();
 
 function safeName(name) {
   const s = String(name || '').trim().replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40);
@@ -417,6 +477,11 @@ function runUserCreds() {
 
 
 // 启动时收养仍在跑的 profile chromium（控制器重启不丢登录窗口）
+//
+// 收养来的实例**照常参与空闲休眠**（hold=false，计时从现在起算）——
+// 「不抓取就休眠」是稳态要求，控制器重启不该让浏览器永久常驻。
+// 万一用户正在 VNC 里手动登录时控制器崩了：重新点一次「容器内打开」即可
+// 再次挂住（那一步会显式 hold=true）。
 function adoptRunning() {
   try {
     const out = sh(`ps -eo pid=,args= | grep -F -- '--user-data-dir=${PROFILE_BASE}/' | grep -v grep || true`, 8000);
@@ -434,6 +499,7 @@ function adoptRunning() {
       state.profiles.set(name, {
         name, port: parseInt(portM[1], 10), pid,
         userDataDir: dirM[1], startedAt: Date.now(),
+        lastUsedAt: Date.now(), hold: false,
       });
     }
     if (state.profiles.size) console.log('[gw2a-ctrl] adopted', state.profiles.size, 'running profile(s)');
@@ -470,7 +536,9 @@ function launchProfile(name, opts) {
     '--user-data-dir=' + dir,
     '--window-size=1200,700',
     '--window-position=0,0',
-    'about:blank',
+    // 单页面启动：抓取脚本只会复用这一个页面，不会开新窗口。
+    // 启动页直接是 Gemini（见 START_URL 注释），唤醒即可只读抓取。
+    START_URL,
   ];
   const env = {
     PATH: RT + '/usr/bin:' + RT + '/usr/sbin:' + RT + '/bin:/usr/bin:/bin',
@@ -489,10 +557,15 @@ function launchProfile(name, opts) {
     gid: creds.gid,
   });
   child.unref();
-  const rec = { name: sname, port, pid: child.pid, userDataDir: dir, startedAt: Date.now() };
+  const rec = {
+    name: sname, port, pid: child.pid, userDataDir: dir,
+    startedAt: Date.now(), lastUsedAt: Date.now(),
+    hold: !!(opts && opts.hold), // hold=1 时用户要手动登录，空闲也不睡
+  };
   state.profiles.set(sname, rec);
   console.log('[gw2a-ctrl] launch', sname, 'pid', child.pid, 'port', port,
-      'ext', (extArgs.length ? EXT_DIR : '(none)'));
+      'ext', (extArgs.length ? EXT_DIR : '(none)'),
+      'hold', rec.hold ? 1 : 0);
   return rec;
 }
 
@@ -517,7 +590,7 @@ function killTree(pid, graceMs) {
   }
 }
 
-function stopProfile(name) {
+function stopProfile(name, opts) {
   const sname = safeName(name);
   const rec = state.profiles.get(sname);
   if (!rec) return { error: 'profile 不存在或未在运行', running: false };
@@ -531,6 +604,7 @@ function stopProfile(name) {
   // Give Chromium a moment to flush Cookies, then sweep any leftover child.
   try { sh(`sleep 1; pkill -KILL -f -- ${JSON.stringify('--user-data-dir=' + dir)} || true`, 8000); } catch (e) {}
   state.profiles.delete(sname);
+  console.log('[gw2a-ctrl] stop', sname, 'reason', (opts && opts.reason) || 'manual');
   return { ok: true, port: rec.port };
 }
 
@@ -540,6 +614,8 @@ function listProfiles() {
     items.push({
       name, port: rec.port, pid: rec.pid,
       user_data_dir: rec.userDataDir, started_at: rec.startedAt,
+      last_used_at: rec.lastUsedAt || 0, hold: !!rec.hold,
+      idle_sec: Math.round((Date.now() - (rec.lastUsedAt || rec.startedAt || Date.now())) / 1000),
     });
   }
   return items;
@@ -576,8 +652,20 @@ function knownPort(port) {
   return portInUse(port);
 }
 
+// recByPort 找到该 CDP 端口对应的 profile 记录（用于刷新 lastUsedAt）。
+function recByPort(port) {
+  port = parseInt(port, 10);
+  for (const rec of state.profiles.values()) if (rec.port === port) return rec;
+  return null;
+}
+
 // HTTP 反向代理：/cdp/<port><restWithQuery> → http://127.0.0.1:<port><restWithQuery>
+//
+// ★ 每次 CDP 流量都刷新 lastUsedAt ★ —— 这就是「抓取中」的信号：
+// 抓取脚本（refresh.py / gemini-web2api 容器）全程走这个隧道，抓完不再有流量，
+// 空闲计时器到点就把 Chromium 收掉。
 function cdpHTTPProxy(req, res, port, restWithQuery) {
+  touchProfile(recByPort(port));
   const upReq = http.request({
     host: '127.0.0.1',
     port: port,
@@ -597,6 +685,7 @@ function cdpHTTPProxy(req, res, port, restWithQuery) {
 
 // WebSocket 反向隧道
 function cdpWSTunnel(req, socket, head, port, pathname) {
+  touchProfile(recByPort(port));
   const upReq = http.request({
     host: '127.0.0.1',
     port: port,
@@ -644,6 +733,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, profiles: listProfiles().length, port: PORT,
         cookie_sync: true, api: GW2A_API, pool_py: POOL_PY, ext_id: EXT_ID,
         ext_dir: EXT_DIR,
+        idle_stop_sec: IDLE_STOP_SEC,
         ext_present: fs.existsSync(path.join(EXT_DIR, 'manifest.json')) });
     }
     if (p === '/profiles' && req.method === 'GET') {
@@ -674,17 +764,55 @@ const server = http.createServer(async (req, res) => {
       const name = body.name;
       if (!name) return send(res, 400, { error: '缺少 name' });
       if (state.profiles.size >= MAX_PROFILES) return send(res, 400, { error: 'profile 数量超限' });
-      const rec = launchProfile(name, { display: body.display });
+      const existing = state.profiles.get(safeName(name));
+      const launched = !(existing && pidAlive(existing.pid));
+      const rec = launchProfile(name, { display: body.display, hold: body.hold });
       if (rec.error) return send(res, 400, rec);
-      return send(res, 200, rec);
+      touchProfile(rec);
+      // launched 告诉调用方「这次是真唤醒」——它需要多等几秒 CDP 就绪；
+      // 已常驻的实例则立即可用（复用现有窗口，不新建页面）。
+      return send(res, 200, Object.assign({}, rec, {
+        launched, idle_stop_sec: IDLE_STOP_SEC,
+      }));
     }
     const delM = p.match(/^\/profiles\/([^/]+)$/);
     if (delM && req.method === 'DELETE') {
-      return send(res, 200, stopProfile(decodeURIComponent(delM[1])));
+      return send(res, 200, stopProfile(decodeURIComponent(delM[1]), { reason: 'delete' }));
     }
     const stopM = p.match(/^\/profiles\/([^/]+)\/stop$/);
     if (stopM && req.method === 'POST') {
-      return send(res, 200, stopProfile(decodeURIComponent(stopM[1])));
+      return send(res, 200, stopProfile(decodeURIComponent(stopM[1]), { reason: 'manual' }));
+    }
+    // hold：用户要在 VNC 里手动登录 → 挂住不自动睡；解除后照常空闲休眠。
+    const holdM = p.match(/^\/profiles\/([^/]+)\/hold$/);
+    if (holdM && req.method === 'POST') {
+      const name = safeName(decodeURIComponent(holdM[1]));
+      const body = await readJSON(req);
+      const on = !(body && body.hold === false);
+      const rec = state.profiles.get(name);
+      if (!rec) return send(res, 404, { error: 'profile 不存在或未在运行' });
+      rec.hold = on;
+      touchProfile(rec);
+      console.log('[gw2a-ctrl] hold', name, on ? 'on' : 'off');
+      return send(res, 200, { ok: true, name, hold: on });
+    }
+    // 一次性抓取：唤醒 → 等 CDP 就绪 → 交给调用方。抓完不用管，
+    // 空闲 IDLE_STOP_SEC 后自动睡。
+    if (p === '/profiles/wake' && req.method === 'POST') {
+      const body = await readJSON(req);
+      const name = body.name;
+      if (!name) return send(res, 400, { error: '缺少 name' });
+      let rec = state.profiles.get(safeName(name));
+      const launched = !(rec && pidAlive(rec.pid));
+      if (launched) {
+        if (state.profiles.size >= MAX_PROFILES) return send(res, 400, { error: 'profile 数量超限' });
+        rec = launchProfile(name, { display: body.display, hold: body.hold });
+        if (rec.error) return send(res, 400, rec);
+      }
+      touchProfile(rec);
+      return send(res, 200, Object.assign({}, rec, {
+        launched, idle_stop_sec: IDLE_STOP_SEC,
+      }));
     }
     return send(res, 404, { error: 'not found', path: p });
   } catch (e) {
