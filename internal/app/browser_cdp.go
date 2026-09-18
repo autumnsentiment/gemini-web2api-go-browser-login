@@ -220,6 +220,13 @@ func browserHealth() (bool, int, string) {
 }
 
 // ensureBrowserProfile 让控制器保证某个 profile 的 Chromium 实例在跑，返回 CDP 端口。
+//
+// ★ 端口扫描兜底（2026-09-17 用户要求）★
+// 控制器可能在「返回的端口」与实际监听端口不一致的情况下运行（profile 被
+// 重启后换了端口、控制器自己重启过、配置漂移等）。此时按返回端口连过去会
+// 失败，上层只能报「CDP 端口上没有 page 目标」这类看不清原因的错误。
+// 所以这里做两层：拿到端口后**扫一遍控制器里该 profile 的实际端口**，
+// 以实际可连的那个为准。
 func ensureBrowserProfile(name string) (int, error) {
 	if !browserEnabled() {
 		return 0, fmt.Errorf("浏览器登录未启用：请配置 BROWSER_CONTROLLER_URL")
@@ -236,10 +243,54 @@ func ensureBrowserProfile(name string) (int, error) {
 	if code != 200 {
 		return 0, fmt.Errorf("控制器返回 HTTP %d", code)
 	}
+	// 端口扫描：控制器 /profiles 列出的才是实际在跑的端口
+	if real := browserScanProfilePort(name); real > 0 && real != out.Port {
+		logf("[browser] profile %q 控制器返回端口 %d，实际监听 %d，采用实际端口", name, out.Port, real)
+		return real, nil
+	}
 	if out.Port <= 0 {
+		// 控制器没返回端口：扫一遍看有没有在跑的
+		if real := browserScanProfilePort(name); real > 0 {
+			logf("[browser] 控制器未返回端口，扫描到 profile %q 实际监听 %d", name, real)
+			return real, nil
+		}
 		return 0, fmt.Errorf("控制器未返回 CDP 端口")
 	}
 	return out.Port, nil
+}
+
+// browserScanProfilePort 扫描控制器里某 profile 的实际 CDP 端口，取可连通的那个。
+//
+// 数据源是控制器 GET /profiles（它的 state 里记着实例真实端口），
+// 再用 GET /cdp/<port>/json/version 验证端口确实可连 —— 只信「列出来且连得上」
+// 的端口，避免拿到已死实例的端口号。
+func browserScanProfilePort(name string) int {
+	var out struct {
+		Profiles []struct {
+			Name string `json:"name"`
+			Port int    `json:"port"`
+		} `json:"profiles"`
+	}
+	code, err := browserHTTP(http.MethodGet, browserControllerURL()+"/profiles", nil, &out)
+	if err != nil || code != 200 {
+		return 0
+	}
+	for _, p := range out.Profiles {
+		if p.Name != name || p.Port <= 0 {
+			continue
+		}
+		// 验证端口可连（/json/version 是 CDP 的探活端点）
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(cdpTunnelBase(p.Port) + "/json/version")
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			return p.Port
+		}
+	}
+	return 0
 }
 
 // browserStopProfile 让控制器关掉某个 profile 的实例。
@@ -429,6 +480,58 @@ func cdpListPages(hostPort string) (string, error) {
 		return fallback, nil
 	}
 	return "", fmt.Errorf("CDP 端口上没有 page 目标")
+}
+
+// cleanupBlankTabs 关掉多余的 about:blank 空白页（保留至多一个）。
+//
+// ★ 2026-09-17 用户反馈「一直新建页面」★
+// 历史版本的 cdpNavigate 在 /json/list 瞬时失败时会 cdpOpenTab，这些页面
+// 若没被导航走就留在 about:blank —— 桌面上、CDP 目标列表里越堆越多
+// （实测 acct1 里就挂着一个残留 about:blank）。每次抓取前顺手清理，
+// 保持「一个 profile 一个 Gemini 页 + 至多一个空白页」的干净状态。
+func cleanupBlankTabs(hostPort string) int {
+	port, err := cdpPortOfHostPort(hostPort)
+	if err != nil {
+		return 0
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Get(cdpTunnelBase(port) + "/json/list")
+	if err != nil {
+		return 0
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var list []struct {
+		ID   string `json:"id"`
+		Type string `json:"type"`
+		URL  string `json:"url"`
+	}
+	if json.Unmarshal(body, &list) != nil {
+		return 0
+	}
+	closed := 0
+	seenBlank := 0
+	for _, t := range list {
+		if t.Type != "page" || !strings.HasPrefix(t.URL, "about:") {
+			continue
+		}
+		seenBlank++
+		// 留第一个空白页（Chromium 总需要一个可用的初始 page），其余关掉
+		if seenBlank == 1 || t.ID == "" {
+			continue
+		}
+		cr, err := client.Get(cdpTunnelBase(port) + "/json/close/" + t.ID)
+		if err == nil {
+			cr.Body.Close()
+			if cr.StatusCode == 200 {
+				closed++
+			}
+		}
+	}
+	if closed > 0 {
+		logf("[browser] 清理了 %d 个残留空白页", closed)
+	}
+	return closed
 }
 
 // cdpOpenTab 开一个新 tab 并导航，返回该 page 的（隧道）ws url。
@@ -798,6 +901,10 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 		return false, "", err
 	}
 	hostPort := fmt.Sprintf("%s:%d", browserCDPHost(), port)
+
+	// 顺手清理残留空白页：历史版本开过的 about:blank 会一直挂在 CDP 目标
+	// 列表里（反复新建页面问题的遗留），每次抓取前收一遍。
+	cleanupBlankTabs(hostPort)
 
 	// ── 第一步：只读抓取（不导航、不刷新）────────────────────────────────
 	// 直接从 Chromium 现有页面读登录态并抓 cookie。页面若停在别的 tab 或
