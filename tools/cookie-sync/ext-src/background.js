@@ -55,7 +55,9 @@ const DEFAULTS = {
 const ALARM_KEEPALIVE = 'gw2a-keepalive';
 const ALARM_SYNC = 'gw2a-sync';
 const GEMINI_URL = 'https://gemini.google.com/app';
-const GEMINI_URL_RE = /^https:\/\/gemini\.google\.com\//;
+// 尾部斜杠可选（https://gemini.google.com 不带斜杠也常出现），
+// 否则会对「已存在的 Gemini 页」判 false，转去 tabs.update 甚至新建。
+const GEMINI_URL_RE = /^https:\/\/gemini\.google\.com(\/|$)/;
 
 // 被 Google 风控拦下时的落地页（www.google.com/sorry/...）。这种页面同样是
 // 「本 profile 的那个 Gemini 标签页」，必须复用而不是另开新页。
@@ -239,25 +241,26 @@ function isLoggedIn(map) {
 
 // ---------------------------------------------------------------- tabs
 
-/** 找一个 gemini 标签页；没有则返回 null（不创建）。 */
-async function findGeminiTab() {
-  let tabs = [];
-  try {
-    tabs = await chrome.tabs.query({ url: ['https://gemini.google.com/*'] });
-  } catch (e) {
-    return null;
-  }
-  if (!tabs.length) return null;
-  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-  return tabs[0];
-}
-/**
- * 找到「本 profile 的那个 Gemini 标签页」，没有则返回 null（不创建）。
+// GEMINI_ANY_RE 匹配所有「该算作 Gemini 会话页」的 URL：正式站点、以及被
+// Google 风控重定向后的落地页。
+var GEMINI_ANY_RE = /^https:\/\/(gemini\.google\.com|(www\.)?google\.com\/sorry)\//;
 
- * 关键点：chrome.tabs.query({url:'https://gemini.google.com/*'}) 匹配不到被
- * Google 风控重定向后的 www.google.com/sorry 页，旧代码因此会误判为「没有
- * Gemini 页」而 chrome.tabs.create() 再开一个 —— 这正是风控的来源。所以这里
- * 依次尝试：① 上次记录的 tabId；② URL 含 gemini.google.com；③ google.com/sorry 页。
+/**
+ * 找到「本 profile 的那个 Gemini 标签页」，没有则返回 null（**不创建**）。
+ *
+ * ★ 2026-09-17 修复「一直新建页面而不是刷新」★
+ *
+ * 旧实现用 chrome.tabs.query({url:['https://gemini.google.com/*']}) —— 这个
+ * URL 过滤有两个致命陷阱，都会让它查不到明明存在的 Gemini 标签页：
+ *   1. 标签页正在加载时（status=loading）URL 尚未确定，过滤匹配不上；
+ *   2. 页面被风控重定向到 www.google.com/sorry 后不再匹配 gemini 域。
+ * 查不到 → 判成「没有 Gemini 页」→ chrome.tabs.create() 又开一个 —— 每次
+ * 刷新都多一个窗口，这正是用户看到的「一直创建新页面」。
+ *
+ * 新实现不用 URL 过滤：查**全部**标签页再本地正则匹配，并依次尝试
+ * ① 上次记录的 tabId（最可靠，无论停在哪个 URL 都认）
+ * ② URL 匹配 gemini 域或 sorry 落地页
+ * ③ 兜底：任何 url 为空的标签页（正在加载的新页也可能属于我们）
  */
 async function findGeminiTab() {
   const c = await cfg();
@@ -269,20 +272,15 @@ async function findGeminiTab() {
       if (t && t.id != null) return t;
     } catch (e) { /* 已被关掉 */ }
   }
-  let tabs = [];
-  try {
-    tabs = await chrome.tabs.query({ url: ['https://gemini.google.com/*'] });
-  } catch (e) { tabs = []; }
-  // ② 风控落地页（www.google.com/sorry/...）也要认，否则又会新建页面
-  if (!tabs.length) {
-    try {
-      const all = await chrome.tabs.query({});
-      tabs = all.filter((t) => SORRY_URL_RE.test(t.url || ''));
-    } catch (e) { tabs = []; }
+  // ② 查全部标签页本地匹配（避免 URL 过滤在 loading 状态下漏判）
+  let all = [];
+  try { all = await chrome.tabs.query({}); } catch (e) { return null; }
+  const matched = all.filter((t) => t && t.id != null && GEMINI_ANY_RE.test(t.url || ''));
+  if (matched.length) {
+    matched.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    return matched[0];
   }
-  if (!tabs.length) return null;
-  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-  return tabs[0];
+  return null;
 }
 /** 等某个标签页加载完成（或超时）。 */
 function waitTabComplete(tabId, timeoutMs) {
@@ -321,11 +319,26 @@ async function refreshGeminiTab(force) {
   let tab = await findGeminiTab();
   let created = false;
   if (!tab) {
+    // ★ 2026-09-17：创建前再做一次「宽口径」检查 ★
+    // 只有确认整个浏览器里**一个标签页都没有**（全新窗口）时才创建；
+    // 只要有任何标签页，就复用它导航到 gemini —— 用户看到的是「页面跳转」
+    // 而不是「又开一个窗口」。这是「一直新建页面」的最后一道保险：
+    // findGeminiTab 依赖 URL 匹配，而 URL 在 loading 状态下可能为空。
+    let anyTab = null;
     try {
-      tab = await chrome.tabs.create({ url: GEMINI_URL, active: false, pinned: true });
-      created = true;
-    } catch (e) {
-      return { refreshed: false, error: '创建标签页失败: ' + e.message };
+      const all = await chrome.tabs.query({});
+      anyTab = (all || []).find((t) => t && t.id != null) || null;
+    } catch (e) { /* ignore */ }
+    if (anyTab) {
+      tab = anyTab;
+      created = false; // 复用现有标签页，只是把 URL 指过去
+    } else {
+      try {
+        tab = await chrome.tabs.create({ url: GEMINI_URL, active: false, pinned: true });
+        created = true;
+      } catch (e) {
+        return { refreshed: false, error: '创建标签页失败: ' + e.message };
+      }
     }
   }
 
@@ -334,6 +347,8 @@ async function refreshGeminiTab(force) {
 
   try {
     if (!created) {
+      // 已经在 Gemini 页（含无尾斜杠、含 /app 子路径）→ reload；
+      // 否则导航过去（同一标签页，不新开窗口）。
       if (GEMINI_URL_RE.test(tab.url || '')) await chrome.tabs.reload(tab.id);
       else await chrome.tabs.update(tab.id, { url: GEMINI_URL });
     }
