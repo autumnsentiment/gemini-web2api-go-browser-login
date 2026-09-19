@@ -33,6 +33,16 @@ type CookieAccount struct {
 	Profile string `json:"profile"`
 }
 
+// browserManagedCookie 判断这条账号的会话是否由浏览器侧独家管理。
+//
+// __Secure-1PSIDTS 是一次性轮换票。同一个 Google 会话如果在浏览器和服务端
+// 各轮换一次，后轮换的一方会让前一方手里的票失效，最终把整个会话推成匿名。
+// 因此 browser/remote 来源只允许浏览器抓取链路写回 cookie，服务端的所有
+// 轮换入口都必须绕开。手工导入的 manual 账号不受影响。
+func browserManagedCookie(a CookieAccount) bool {
+	return a.Source == "browser" || a.Source == "remote"
+}
+
 // splitCookiePairs 把 "k=v; k=v" 拆成键值对。
 //
 // 按 ";" 切再逐段 TrimSpace，不按 "; " 切：从 DevTools 复制出来的串不一定带空格，
@@ -542,9 +552,9 @@ type CookieCheck struct {
 // 只抓页面，不发对话，不消耗生成配额。
 //
 // 本地增强（上游是单发判定，失败直接记 fail_count）：
-//   1. 「票旧了」先自动续票复检 —— __Secure-1PSIDTS 是短命票，票旧不等于号死；
-//   2. 续不回来且账号来自浏览器登录，走浏览器重抓自愈；
-//   3. 只有确凿的 401/403（且非票旧症状）才累加 fail_count。
+//  1. 「票旧了」先自动续票复检 —— __Secure-1PSIDTS 是短命票，票旧不等于号死；
+//  2. 续不回来且账号来自浏览器登录，走浏览器重抓自愈；
+//  3. 只有确凿的 401/403（且非票旧症状）才累加 fail_count。
 func checkAccountCookie(a CookieAccount) CookieCheck {
 	t0 := time.Now()
 	picked, ok, err := acquireSlot(a.ProxyID)
@@ -562,7 +572,7 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	invalidateXSRF(a.Cookie)
 	_, err = getXSRF(a.Cookie, proxyURL)
 	needRelogin := false
-	if err != nil && looksLikeStaleSession(err) {
+	if err != nil && looksLikeStaleSession(err) && !browserManagedCookie(a) {
 		// 第一步：哨兵续票（POST /RotateCookies 换发 1PSIDTS，最便宜，不动浏览器）。
 		if _, refreshed, rerr := tryRotate1PSIDTS(a.ID, a.Cookie, proxyURL); rerr == nil && len(refreshed) > 0 {
 			if fresh := accountByID(a.ID); fresh != nil {

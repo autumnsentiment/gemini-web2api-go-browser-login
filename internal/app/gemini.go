@@ -404,18 +404,22 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		// 轮转会换发 __Secure-1PSIDTS（约 30 分钟过期的那张票）并合并 *SIDCC。
 		// 只是票过期、持久身份还在的号，这一步能救回来；救不回来再换号。
 		// 只试一次，且只在这一轮。
+		// browser/remote 账号的票由浏览器链路独家更新；服务端再轮换一次
+		// 会让浏览器手里的 1PSIDTS 作废，表现为“web 已登录但抓回来就匿名”。
 		if !rotatedOnce[acct.ID] {
 			rotatedOnce[acct.ID] = true
-			if _, _, rerr := rotateAccount(*acct); rerr == nil {
-				if fresh := accountByID(acct.ID); fresh != nil {
-					if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
-						logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
-						acct = fresh
-						cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
-						if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
-							bindAccountProxy(fresh.ID, picked.ID)
+			if !browserManagedCookie(*acct) {
+				if _, _, rerr := rotateAccount(*acct); rerr == nil {
+					if fresh := accountByID(acct.ID); fresh != nil {
+						if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
+							logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
+							acct = fresh
+							cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
+							if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
+								bindAccountProxy(fresh.ID, picked.ID)
+							}
+							break
 						}
-						break
 					}
 				}
 			}

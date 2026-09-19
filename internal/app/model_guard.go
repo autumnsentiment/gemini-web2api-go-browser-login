@@ -103,23 +103,25 @@ func modelGuardRefetch(accountID int64, model, upstream string) {
 	if a == nil {
 		return
 	}
-	// 票据续新优先（最便宜，不打扰浏览器）：上游 #25 的哨兵流程换发
-	// __Secure-1PSIDTS（约 30 分钟过期的那张短命票），很多时候票只是旧了没死，
-	// 续完就恢复。rotateAccount 失败时 refreshes 为空，fallback 走浏览器重抓。
+	// 票据续新优先（最便宜，不打扰浏览器）：只有手工导入账号走服务端
+	// 哨兵续票。browser/remote 的 1PSIDTS 由浏览器侧独家管理，服务端再轮换
+	// 一次会让浏览器手里的票立即失效。
 	proxyURL := ""
 	if a.ProxyID > 0 {
 		proxyURL = proxyURLByID(a.ProxyID)
 	}
-	_, refreshed, rerr := tryRotate1PSIDTS(a.ID, a.Cookie, proxyURL)
-	if rerr == nil && len(refreshed) > 0 {
-		if fresh := accountByID(a.ID); fresh != nil && fresh.Cookie != a.Cookie {
-			invalidateXSRF(fresh.Cookie)
-			logf("[model-guard] 账号 #%d 已续票（%s），待后续请求验证恢复", accountID, strings.Join(refreshed, ", "))
-			return
+	if !browserManagedCookie(*a) {
+		_, refreshed, rerr := tryRotate1PSIDTS(a.ID, a.Cookie, proxyURL)
+		if rerr == nil && len(refreshed) > 0 {
+			if fresh := accountByID(a.ID); fresh != nil && fresh.Cookie != a.Cookie {
+				invalidateXSRF(fresh.Cookie)
+				logf("[model-guard] 账号 #%d 已续票（%s），待后续请求验证恢复", accountID, strings.Join(refreshed, ", "))
+				return
+			}
 		}
-	}
-	if rerr != nil {
-		logf("[model-guard] 账号 #%d 续票失败（%v），转浏览器重抓", accountID, rerr)
+		if rerr != nil {
+			logf("[model-guard] 账号 #%d 续票失败（%v），转浏览器重抓", accountID, rerr)
+		}
 	}
 	// 续不了（401/400）或没换出新值：会话可能真死了，走浏览器重抓。
 	// browserRefreshOne 自带冷却闸门；拿不到锁/冷却中会直接返回错误，不强抢。
