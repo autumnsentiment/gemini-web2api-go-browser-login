@@ -50,6 +50,8 @@ const DEFAULTS = {
   lastRefreshDetail: '',
   lastTabId: 0,          // 复用的 Gemini 标签页（含被重定向到 sorry 页的情况）
   lastTabUrl: '',
+  lastReadPageAt: 0,     // 最近一次「读取当前页面」的时间
+  lastReadPageDetail: '', // 最近一次「读取当前页面」的结果摘要
 };
 
 const ALARM_KEEPALIVE = 'gw2a-keepalive';
@@ -240,6 +242,117 @@ function isLoggedIn(map) {
 }
 
 // ---------------------------------------------------------------- tabs
+
+/**
+ * 读取 cookie jar 当前活跃账号（非页面身份）。
+ *
+ * 关键背景：chrome.cookies 是整个 profile 一份 jar，Google 多账号登录时
+ * jar 里存放的是「UI 里最后活跃的那个账号」的会话。所以光看 cookie 永远
+ * 无法知道「页面当前显示的是哪个账号」，只能用 Google 自己的 ListAccounts
+ * 端点查询：它返回 cookie 会话当前绑定的账号列表（含活跃位标记）。
+ *
+ * 扩展有 host_permissions *.google.com，SW 里 fetch 会自动带上 cookie。
+ * 返回 { active, list, error }。
+ */
+async function fetchCookieJarAccounts() {
+  try {
+    const r = await fetch('https://accounts.google.com/ListAccounts?json=standard', {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'Accept': 'application/json' },
+    });
+    if (!r.ok) return { active: null, list: [], error: 'HTTP ' + r.status };
+    const text = await r.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) { return { active: null, list: [], error: 'non-json response' }; }
+    const arr = (data && Array.isArray(data[0])) ? data[0] : (Array.isArray(data) ? data : []);
+    const list = arr.map((row, i) => {
+      const email = typeof row[3] === 'string' ? row[3] : '';
+      const name = typeof row[2] === 'string' ? row[2] : '';
+      const isActive = row[0] === 1 || row[0] === true;
+      return { idx: i, email, name, active: isActive };
+    }).filter((x) => x.email);
+    const active = list.find((x) => x.active) || list[0] || null;
+    return { active, list, error: null };
+  } catch (e) {
+    return { active: null, list: [], error: String((e && e.message) || e) };
+  }
+}
+
+/**
+ * 读取绑定页的「页面身份」：URL 的 /u/N + 右上角账号 chip 的邮箱。
+ * 只读 findGeminiTab() 返回的那一个标签页，绝不枚举所有账号。
+ * 返回 { tab_id, url, authuser, email, account_id }。
+ */
+async function readBoundPageIdentity() {
+  const tab = await findGeminiTab();
+  if (!tab) return { tab_id: null, url: '', authuser: null, email: '', account_id: '', error: '没有绑定的 Gemini 标签页' };
+  let url = '';
+  try { const t = await chrome.tabs.get(tab.id); url = (t && t.url) || ''; } catch (e) {}
+  const m = (url || '').match(/[?&]authuser=(\d+)/) || (url || '').match(/\/u\/(\d+)(?:\/|$)/);
+  const authuser = m ? parseInt(m[1], 10) : 0;
+  let probe = null;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        // 1) 明确的账户标志（旧 UI 偶尔会有 data 属性）
+        let email = '';
+        try {
+          const el = document.querySelector('a[aria-label*="@"], img[aria-label*="@"]');
+          if (el) {
+            const al = el.getAttribute('aria-label') || '';
+            const em = al.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+            if (em) email = em[0];
+          }
+        } catch (e) {}
+        // 2) WAAPI / 片段里的账户 ID
+        let account_id = '';
+        try {
+          const html = document.documentElement.innerHTML || '';
+          let m2 = html.match(/WIZ_global_data\\\s*=\\\s*\{[^}]*?"oPEP7c"\\\s*:\\s*"([^"\\]+(?:\\.[^"\\]*)*)"/) || html.match(/"oPEP7c"\\\s*:\\s*"([^"\\]+(?:\\.[^"\\]*)*)"/);
+          if (m2) {
+            try { account_id = JSON.parse('"' + m2[1] + '"'); } catch (e) { account_id = m2[1]; }
+          }
+        } catch (e) {}
+        return { email, account_id, title: document.title || '' };
+      },
+    });
+    probe = res && res[0] && res[0].result;
+  } catch (e) {
+    probe = { email: '', account_id: '', error: String((e && e.message) || e) };
+  }
+  return { tab_id: tab.id, url, authuser, email: (probe && probe.email) || '', account_id: (probe && probe.account_id) || '', title: (probe && probe.title) || '', error: (probe && probe.error) || null };
+}
+
+/**
+ * 「读取当前页面」主入口：页面身份 + cookie jar 身份 + 对齐判定。
+ * 绝不枚举账号、绝不额外开页面、绝不导航。
+ */
+async function readCurrentPage() {
+  const page = await readBoundPageIdentity();
+  const jar = await fetchCookieJarAccounts();
+  const cookieMap = await readGoogleCookies();
+  const logged = isLoggedIn(cookieMap);
+  const pageEmail = (page.email || '').toLowerCase();
+  const jarEmail = (jar.active && jar.active.email || '').toLowerCase();
+  const aligned = !!pageEmail && !!jarEmail
+    ? pageEmail === jarEmail
+    : null;  // 任一侧未知 → 无法判定
+  const detail = aligned === null
+    ? '无法判定对齐（' + (pageEmail ? '页面有邮箱、jar 无' : '页面无邮箱、jar ' + (jarEmail || '无')) + '）'
+    : (aligned ? '对齐 ✓' : '不对齐 ✗（页面显示 A、cookie 实际是 B）');
+  const out = {
+    ok: true,
+    page, jar_active: jar.active, jar_list_count: (jar.list || []).length,
+    jar_error: jar.error,
+    logged_in: logged,
+    cookie_count: cookieMap.size,
+    aligned, detail,
+  };
+  await setCfg({ lastReadPageAt: Date.now(), lastReadPageDetail: detail });
+  return out;
+}
 
 // GEMINI_ANY_RE 匹配所有「该算作 Gemini 会话页」的 URL：正式站点、以及被
 // Google 风控重定向后的落地页。
@@ -546,6 +659,21 @@ async function sync(reason, _internal) {
       map = await readGoogleCookies();
     }
 
+    // ── 身份核对（2026-09-25，修复「读到前一个账号」）─────────────────
+    // cookie jar 只有「最后活跃账号」的会话；页面显示的可能是另一个账号。
+    // 入池前比对：页面身份 ≠ jar 身份 → 拒绝入池，避免把 B 账号的 cookie
+    // 挂到 A 账号的 profile 名下（幽灵账号）。
+    const page = await readBoundPageIdentity();
+    const jar = await fetchCookieJarAccounts();
+    const pageEmail = (page.email || '').toLowerCase();
+    const jarEmail = (jar.active && jar.active.email || '').toLowerCase();
+    const aligned = (pageEmail && jarEmail) ? (pageEmail === jarEmail) : null;
+    if (aligned === false) {
+      const detail = '身份不对齐，拒绝入池：页面显示 ' + pageEmail + '，cookie 实际是 ' + jarEmail + '。请先在浏览器里切回 ' + pageEmail + ' 再试。';
+      await setCfg({ lastSyncAt: Date.now(), lastSyncOk: false, lastSyncDetail: detail });
+      return { ok: false, detail };
+    }
+
     const { header } = buildCookieHeader(map);
     const sapisid = (map.get('SAPISID') || {}).value || '';
     const ts = Math.floor(Date.now() / 1000);
@@ -555,7 +683,15 @@ async function sync(reason, _internal) {
       : '';
     const profile = await profileName();
 
+    const identity = {
+      page_email: pageEmail || null,
+      jar_email: jarEmail || null,
+      aligned: aligned,
+      page_authuser: (page && page.authuser != null) ? page.authuser : null,
+    };
+
     const payload = {
+      identity,
       profile,
       reason: reason || 'auto',
       url: GEMINI_URL,
@@ -567,7 +703,7 @@ async function sync(reason, _internal) {
       logged_in: true,
       user_agent: navigator.userAgent,
       summary: cookieSummary(map),
-      client: 'gw2a-ext/1.0.5',
+      client: 'gw2a-ext/1.0.6',
     };
 
     // ── 推送目标（两种模式，2026-09-17 新增远程模式）────────────────────
@@ -705,6 +841,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'keepalive':
           sendResponse(await keepalive(true));
           break;
+        case 'readPage':
+          sendResponse(await readCurrentPage());
+          break;
         case 'sync':
           sendResponse(await sync('manual'));
           break;
@@ -729,10 +868,13 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
       if (cfgPatch) await setCfg(cfgPatch);
       switch (msg && msg.type) {
         case 'ping':
-          sendResponse({ ok: true, pong: true, client: 'gw2a-ext/1.0.5' });
+          sendResponse({ ok: true, pong: true, client: 'gw2a-ext/1.0.6' });
           break;
         case 'keepalive':
           sendResponse(await keepalive(true));
+          break;
+        case 'readPage':
+          sendResponse(await readCurrentPage());
           break;
         case 'sync':
           sendResponse(await sync('host'));

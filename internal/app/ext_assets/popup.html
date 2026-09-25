@@ -66,9 +66,18 @@
     <button id="btnSave" class="sec">保存</button>
     <button id="btnKa" class="sec">立即保活</button>
     <button id="btnSync">立即入池</button>
+    <button id="btnReadPage" class="sec">读取当前页面</button>
   </div>
   <div class="hint">「服务端」模式直推 gemini-web2api（端点 /api/browser/ingest，用 API Key 鉴权），适合浏览器在你电脑、服务在远端服务器；「控制器」模式推给同机/同网的 Chromium 控制器。抓取优先只读，会话失效时才刷新页面。</div>
 
   <script src="popup.js"></script>
 </body>
 </html>
+  <div class="card" id="pageCard" style="display:none">
+    <div class="row"><span class="k">页面账号</span><span class="v mono" id="pageEmail">—</span></div>
+    <div class="row"><span class="k">Cookie 账号</span><span class="v mono" id="jarEmail">—</span></div>
+    <div class="row"><span class="k">对齐</span><span class="v" id="align">—</span></div>
+    <div class="row"><span class="k">页面 /u/N</span><span class="v mono" id="pageAuth">—</span></div>
+  </div>
+
+  <div class="card">
