@@ -11,10 +11,24 @@ function fmtTs(ms) {
 
 function send(type, extra) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(Object.assign({ type }, extra || {}), (r) => {
-      if (chrome.runtime.lastError) resolve({ ok: false, detail: chrome.runtime.lastError.message });
-      else resolve(r || { ok: false, detail: 'no response' });
-    });
+    const once = (attempt) => {
+      chrome.runtime.sendMessage(Object.assign({ type }, extra || {}), (r) => {
+        const err = chrome.runtime.lastError && chrome.runtime.lastError.message;
+        if (err) {
+          // MV3 已知问题：SW 冷启动时第一条消息可能报
+          // "Receiving end does not exist"。等 400ms 重试一次，
+          // 第二次再失败才把错误交给 UI（否则弹窗一打开就「读取失败」）。
+          if (attempt === 0 && /Receiving end does not exist|message port closed/i.test(err)) {
+            setTimeout(() => once(1), 400);
+            return;
+          }
+          resolve({ ok: false, detail: err });
+        } else {
+          resolve(r || { ok: false, detail: 'no response' });
+        }
+      });
+    };
+    once(0);
   });
 }
 
@@ -23,7 +37,7 @@ function send(type, extra) {
 // （2026-09-17 线上事故：渲染循环把「推送模式」每次都打回存储值，根本配不了）。
 let editingSince = 0;
 const EDITABLE_IDS = ['profile', 'pushMode', 'controller', 'token',
-  'keepalivePeriodMin', 'autoSyncMin', 'refreshCooldownSec'];
+  'keepalivePeriodMin', 'autoSyncMin', 'statusPeriodMin', 'refreshCooldownSec'];
 
 for (const id of EDITABLE_IDS) {
   const el = document.getElementById(id);
@@ -52,6 +66,21 @@ async function render() {
   $('lastka').textContent = fmtTs(c.lastKeepaliveAt) + (c.lastKeepaliveDetail ? ' · ' + c.lastKeepaliveDetail : '');
   $('lastsync').textContent = fmtTs(c.lastSyncAt);
   $('syncdetail').textContent = (c.lastSyncOk ? '✓ ' : '✗ ') + (c.lastSyncDetail || '—');
+  $('laststatsync').textContent = fmtTs(c.lastStatusSyncAt);
+  $('statsyncdetail').textContent = (c.lastStatusSyncOk ? '✓ ' : '✗ ') + (c.lastStatusSyncDetail || '—');
+
+  // 固定抓取页状态：只写状态文本，不重建列表（列表有自己的刷新时机，
+  // 否则 15 秒一次的周期渲染会把用户正在看的列表滚动位置打乱）。
+  const pinId = Number(c.pinnedTabId) || 0;
+  $('pinned').textContent = pinId
+    ? ('已固定 · ' + (c.pinnedAccount ? ('账号槽位 ' + c.pinnedAccount) : '默认账号'))
+    : '未固定（自动选择）';
+  // 多账号固定到 /u/N/ 时入池标识会自动带 -uN 后缀（不同账号要占池子里不同行）
+  const base = (c.profile || 'browser1');
+  const slot = String(c.pinnedAccount || '').trim();
+  $('effprofile').textContent = slot
+    ? (base.endsWith('-u' + slot) ? base : (base + '-u' + slot))
+    : base;
 
   // 表单字段只在「用户不在编辑中」时回填，避免覆盖输入
   if (formFrozen()) return;
@@ -64,6 +93,7 @@ async function render() {
   $('autoKeepalive').checked = !!c.autoKeepalive;
   $('keepalivePeriodMin').value = c.keepalivePeriodMin || 10;
   $('autoSyncMin').value = c.autoSyncMin || 30;
+  $('statusPeriodMin').value = c.statusPeriodMin || 5;
   $('refreshCooldownSec').value = c.refreshCooldownSec || 120;
 }
 
@@ -78,6 +108,7 @@ async function save() {
       autoKeepalive: $('autoKeepalive').checked,
       keepalivePeriodMin: Number($('keepalivePeriodMin').value) || 10,
       autoSyncMin: Number($('autoSyncMin').value) || 30,
+      statusPeriodMin: Number($('statusPeriodMin').value) || 5,
       refreshCooldownSec: Number($('refreshCooldownSec').value) || 120,
     },
   });
@@ -98,8 +129,96 @@ $('btnSync').addEventListener('click', async () => {
   $('btnSync').disabled = false; $('btnSync').textContent = '立即入池';
   await render();
 });
+$('btnStatusSync').addEventListener('click', async () => {
+  $('btnStatusSync').disabled = true; $('btnStatusSync').textContent = '同步中…';
+  await send('statusSync');
+  $('btnStatusSync').disabled = false; $('btnStatusSync').textContent = '同步状态';
+  await render();
+});
+// 枚举本机所有已登录的 Google 账号槽位，逐个入池（第二个账号落 -u1 行）。
+$('btnSyncAll').addEventListener('click', async () => {
+  $('btnSyncAll').disabled = true; $('btnSyncAll').textContent = '抓取中…';
+  const r = await send('syncAll');
+  $('btnSyncAll').disabled = false; $('btnSyncAll').textContent = '抓取全部账号';
+  await render();
+  await renderTabs();
+});
+
+// ---- 固定抓取页 / 读取当前页 -------------------------------------------
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function renderTabs() {
+  const box = $('tabs');
+  box.innerHTML = '<div class="empty">读取中…</div>';
+  const r = await send('listTabs');
+  const tabs = (r && r.tabs) || [];
+  const cfgNow = await send('status');
+  const pinId = Number((cfgNow.config || {}).pinnedTabId) || 0;
+  if (!tabs.length) {
+    box.innerHTML = '<div class="empty">没有打开 Gemini 页面。先在本机浏览器打开 gemini.google.com 并登录。</div>';
+    return;
+  }
+  box.innerHTML = tabs.map((t) => {
+    const pinned = t.tabId === pinId;
+    const state = t.logged_in
+      ? '<span class="pill ok">已登录</span>'
+      : '<span class="pill bad">未登录</span>';
+    const pinPill = pinned ? '<span class="pill pin">已固定</span>' : '';
+    return `
+      <div class="tab ${pinned ? 'pinned' : ''}">
+        <div class="info">
+          <div class="t1">
+            <b>${esc(t.account_label)}</b>
+            ${state}${pinPill}${t.active ? '<span class="pill">当前窗口</span>' : ''}
+          </div>
+          <div class="t2" title="${esc(t.url)}">${esc(t.title || t.url)} · ${t.cookie_count} 个 cookie</div>
+        </div>
+        <button class="pick" data-read="${t.tabId}">读取此页</button>
+        <button class="pick" data-pin="${t.tabId}">${pinned ? '重新固定' : '固定'}</button>
+      </div>`;
+  }).join('');
+}
+
+$('tabs').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const readId = btn.getAttribute('data-read');
+  const pinId = btn.getAttribute('data-pin');
+  const old = btn.textContent;
+  btn.disabled = true;
+  try {
+    if (readId) {
+      btn.textContent = '读取中…';
+      const r = await send('readPage', { tabId: Number(readId) });
+      btn.textContent = r && r.ok ? '已入池 ✓' : '失败';
+      setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 1600);
+    } else if (pinId) {
+      btn.textContent = '固定中…';
+      const r = await send('pinTab', { tabId: Number(pinId) });
+      btn.textContent = r && r.ok ? '已固定 ✓' : '失败';
+      setTimeout(async () => { await renderTabs(); await render(); }, 900);
+    }
+  } finally {
+    if (readId) { /* 上面已恢复 */ } else { setTimeout(() => { btn.disabled = false; }, 900); }
+  }
+});
+
+$('btnRefreshTabs').addEventListener('click', renderTabs);
+$('btnUnpin').addEventListener('click', async () => {
+  $('btnUnpin').disabled = true;
+  await send('pinTab', { tabId: 0 });
+  await renderTabs();
+  await render();
+  $('btnUnpin').disabled = false;
+});
 
 render();
+renderTabs();
 // 状态区刷新周期。15 秒足够（Cookie 数/登录态变化很慢），也更少打扰。
 // 渲染函数自身有表单冻结保护，不会覆盖用户正在编辑的字段。
 setInterval(render, 15000);

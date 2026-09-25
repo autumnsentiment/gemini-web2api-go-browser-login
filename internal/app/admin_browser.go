@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -71,16 +72,25 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 
 	// 关联账号（source=browser）
 	browserAccts := browserAccounts()
+	// 键带上槽位：同一 profile 的不同 /u/N/ 槽位是不同账号（Google 多账号共用
+	// 一份 cookie，靠 URL 切号）。扩展已把槽位落成 browser1-u1 这类独立 profile，
+	// 这里再按 (profile, authuser) 兜一层，避免同 profile 多槽位互相覆盖。
 	acctByProfile := map[string]BrowserAccount{}
+	acctKey := func(profile string, authuser int) string {
+		if authuser <= 0 {
+			return profile
+		}
+		return profile + "-u" + strconv.Itoa(authuser)
+	}
 	for _, a := range browserAccts {
-		acctByProfile[a.Profile] = a
+		acctByProfile[acctKey(a.Profile, a.AuthUser)] = a
 	}
 
 	// 并集：DB 里有记录的 profile + 控制器里在跑的 profile
 	profileSet := map[string]bool{}
 	for _, a := range browserAccts {
 		if a.Profile != "" {
-			profileSet[a.Profile] = true
+			profileSet[acctKey(a.Profile, a.AuthUser)] = true
 		}
 	}
 	for n := range ctrlNames {
@@ -125,6 +135,13 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 				view["label"] = a.Label
 			}
 		}
+		ext := browserExtStatus(name)
+		view["ext_mode"] = ext.Mode
+		view["ext_state"] = ext.State
+		view["ext_logged_in"] = ext.LoggedIn
+		view["ext_cookie_count"] = ext.CookieCount
+		view["ext_last_seen"] = ext.LastSeenAt
+		view["ext_detail"] = ext.LastDetail
 		items = append(items, view)
 	}
 

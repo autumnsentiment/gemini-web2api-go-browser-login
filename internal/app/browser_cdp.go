@@ -84,7 +84,7 @@ var errBrowserRefreshCooldown = errors.New("浏览器刷新冷却中")
 //
 // 这是 2026-09-18 实测的第三种状态（前两种是「未登录」和「需要重新验证」）：
 // Google 把会话挂起后，SPA 仍会用本地缓存渲染出登录界面、DOM 里甚至还有
-// SNlM0e，但服务端（页面内 fetch('/app') 复验）已经不认这份会话。此时抓到的
+// SNlM0e，但服务端（页面内 fetch('/app')) 复验）已经不认这份会话。此时抓到的
 // cookie 是死的，绝不能入库；账号也不能删 —— 用户在 VNC 桌面重新登录即可恢复。
 var errBrowserSessionInvalid = errors.New("浏览器会话已被 Google 挂起（页面显示已登录，服务端复验为匿名），请在 VNC 桌面重新登录该账号")
 
@@ -909,7 +909,7 @@ const pageStateJS = `(function(){
 	});
 })()`
 
-// verifyByInPageFetch 兜底验证：直接在页面里 fetch('/app')（带浏览器自己的
+// verifyByInPageFetch 兜底验证：直接在页面里 fetch('/app'))（带浏览器自己的
 // cookie 和出口），看响应 HTML 里有没有非空 SNlM0e。
 //
 // 为什么要这一步：SPA 渲染慢时 DOM 里可能还没有 token，而旧的兜底是「cookie 里
@@ -924,14 +924,16 @@ const pageStateJS = `(function(){
 //  2. **匿名页也要判死**。会话失效后 /app 返回的是匿名版页面（页面上写着
 //     「登录即可保存活动记录 / Sign in to save your activity」），实测它的 HTML
 //     里也可能带 SNlM0e 字段。两个信号取或：命中匿名文案直接判未登录。
-func verifyByInPageFetch(hostPort string) bool {
+func verifyByInPageFetch(hostPort string, authuser int) bool {
+	authPath := geminiURLPrefix(authuser) + "/app"
 	for i := 0; i < 3; i++ {
 		if i > 0 {
 			time.Sleep(2 * time.Second)
 		}
 		out, err := cdpEval(hostPort, `(async function(){
 			try {
-				var r = await fetch('/app', {credentials:'include', cache:'no-store', redirect:'follow'});
+				var p = '` + authPath + `';
+				var r = await fetch(p, {credentials:'include', cache:'no-store', redirect:'follow'});
 				var t = await r.text();
 				var anon = /登录即可保存活动记录|Sign in to save your activity|登录以保存/.test(t);
 				return JSON.stringify({
@@ -1044,8 +1046,10 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 	}
 
 	// ── 第二步：导航刷新后重抓 ──────────────────────────────────────────
-	// 导航到 gemini.google.com 并等加载
-	if err := cdpNavigate(hostPort, "https://gemini.google.com/"); err != nil {
+	// 导航到 gemini.google.com 并等加载。
+	// 带槽位的 profile（browser1-u1）要导航到 /u/1/app，否则页面渲染的是
+	// 默认账号，登录态复验（SNlM0e 与槽位绑定）会拿到别的账号的 token。
+	if err := cdpNavigate(hostPort, geminiPageURL(authUserFromProfile(profile))); err != nil {
 		return false, "", err
 	}
 	// 必须把三种状态分开，它们的处置完全不同：
@@ -1086,10 +1090,10 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 		return false, "", errBrowserNeedRelogin
 	}
 	if !loggedIn {
-		// 页面能读但没有非空 SNlM0e：SPA 有时还没渲染完，用页面内 fetch('/app')
+		// 页面能读但没有非空 SNlM0e：SPA 有时还没渲染完，用页面内 fetch('/app'))
 		// 再验证一次。验证不通过就老实报未登录 —— 宁可漏抓一次，也不把 Google
 		// 重验页上的死 cookie 当成登录态写进池子（2026-09-13 实测踩过）。
-		if verifyByInPageFetch(hostPort) {
+		if verifyByInPageFetch(hostPort, authUserFromProfile(profile)) {
 			loggedIn = true
 		}
 	}
@@ -1145,7 +1149,7 @@ func browserRefreshCore(label, profile string) (bool, string, error) {
 // last_error 抹掉 —— 面板上看着「抓取成功」，实际请求全部 no SNlM0e。实测 acct1：
 // 页面 body 明晃晃写着「登录即可保存活动记录」，只读路径却报成功。
 //
-// 现在的规则：cookie 抓到后必须**页面内 fetch('/app') 复验出非空 SNlM0e** 才入库。
+// 现在的规则：cookie 抓到后必须**页面内 fetch('/app')) 复验出非空 SNlM0e** 才入库。
 // 页面在 gemini 域时这一步本来就有（顺带把结果缓存下来，避免重复 fetch）；
 // 页面不在 gemini 域（比如停在 accounts.google.com 的登录页）时，说明这个 profile
 // 当前根本没有活着的 Gemini 会话 —— 直接判只读失败，交给刷新路径导航一次再看。
@@ -1174,7 +1178,7 @@ func browserTryReadOnly(hostPort, label, profile string) (bool, string, error) {
 			// （刷新路径有完整的 signin / token / 错误页三分支判断）。
 			return false, "当前页面不在 gemini.google.com（" + truncate(cur, 60) + "），无法复验登录态", nil
 		}
-		if verifyByInPageFetch(hostPort) {
+		if verifyByInPageFetch(hostPort, authUserFromProfile(profile)) {
 			if err := browserStoreCookie(label, profile, cap.Cookie); err == nil {
 				browserScheduleNextRefresh(profile, cap.MinExpiryUnix)
 				logf("[browser] profile %q 只读抓取成功（未刷新页面，登录态已复验）", profile)
@@ -1234,42 +1238,59 @@ func browserCDPHost() string {
 
 // browserStoreCookie 把抓到的 cookie 写进 accounts 表（容器抓取路径，source=browser）。
 func browserStoreCookie(label, profile, cookie string) error {
-	return browserStoreCookieSource(label, profile, cookie, "browser")
+	return browserStoreCookieSourceAuthUser(label, profile, cookie, "browser", authUserFromProfile(profile))
 }
 
-// browserStoreCookieSource 把 cookie 写进 accounts 表。
+// browserStoreCookieSource 兼容入口：无槽位时按 profile 名推断。
+func browserStoreCookieSource(label, profile, cookie, source string) error {
+	return browserStoreCookieSourceAuthUser(label, profile, cookie, source, authUserFromProfile(profile))
+}
+
+// browserStoreCookieSourceAuthUser 把 cookie 写进 accounts 表。
 //
-// ★ 去重按 profile 全局（2026-09-17 线上实测修正）★
+// ★ 去重按 (profile, authuser)（2026-09-24 多账号修正）★
 // 同一个 Gemini 登录可能被两条路径写入：服务器 Chromium 抓取（source=browser）
 // 和本机扩展推送（source=remote）。这是**同一个账号的两条供给路**，不是两个
 // 账号 —— 按 (source, profile) 去重会让池子里出现 browser:browser1 和
 // remote:browser1 两行，同一个号被轮转两份、配额算两遍。改为按 profile 全局
 // 去重：最新写入获胜（source 跟随最新来源），同 profile 其它行合并删除
 // （与服务器侧 pool.py 的策略一致）。
-func browserStoreCookieSource(label, profile, cookie, source string) error {
+//
+// 但 profile 去重要带上槽位：Google 多账号共用同一份 cookie，靠 URL 的
+// /u/N/ 切号，同一 profile 的不同槽位是**不同账号**。若只按 profile 去重，
+// 固定到 /u/1/ 抓回来的新账号会把默认账号那行覆盖掉（反之亦然），
+// 池子里永远只剩最后一个抓的槽位 —— 这正是「固定抓取页后没抓新账号」的
+// 表现之一。扩展侧已把槽位落成 browser1 / browser1-u1 这类不同 profile，
+// 这里再按 (profile, authuser) 兜一层，两条路径都不会互相踩。
+func browserStoreCookieSourceAuthUser(label, profile, cookie, source string, authuser int) error {
 	if source == "" {
 		source = "browser"
 	}
 	var id int64
 	var prevSource string
+	var prevAuthUser int
 	err := getDB().QueryRow(
-		`SELECT id, source FROM accounts WHERE profile=? ORDER BY id DESC LIMIT 1`,
-		profile).Scan(&id, &prevSource)
+		`SELECT id, source, authuser FROM accounts
+		 WHERE profile=? AND authuser=? ORDER BY id DESC LIMIT 1`,
+		profile, authuser).Scan(&id, &prevSource, &prevAuthUser)
 	if err == nil && id > 0 {
 		// 更新 cookie，并清错误/失败；source 跟随最新写入的来源
 		_, e := getDB().Exec(
 			`UPDATE accounts SET cookie=?, label=?, note=CASE WHEN ?<>'' THEN note ELSE note END,
-			     last_ok_at=?, last_error='', fail_count=0, source=?,
+			     last_ok_at=?, last_error='', fail_count=0, source=?, authuser=?,
 			     last_used_at=last_used_at
 			 WHERE id=?`,
-			cookie, strings.TrimSpace(label), "", time.Now().Unix(), source, id)
+			cookie, strings.TrimSpace(label), "", time.Now().Unix(), source, authuser, id)
 		if e != nil {
 			return e
 		}
-		logf("[browser] profile %q cookie 已刷新 -> 账号 #%d（source=%s，原 %s）", profile, id, source, prevSource)
-		// 合并同 profile 的其它历史行（比如两条路径各自建过一行）
+		logf("[browser] profile %q（%s）cookie 已刷新 -> 账号 #%d（source=%s，原 %s）",
+			profile, authUserLabel(authuser), id, source, prevSource)
+		// 合并同 profile 同槽位的其它历史行（比如两条路径各自建过一行）。
+		// 不带 authuser 一起删：同 profile 的其它槽位是别的账号，删了会丢号。
 		if _, e := getDB().Exec(
-			`DELETE FROM accounts WHERE profile=? AND id<>?`, profile, id); e != nil {
+			`DELETE FROM accounts WHERE profile=? AND authuser=? AND id<>?`,
+			profile, authuser, id); e != nil {
 			logf("[browser] 合并 profile %q 旧记录失败: %v", profile, e)
 		}
 		return nil
@@ -1279,17 +1300,22 @@ func browserStoreCookieSource(label, profile, cookie, source string) error {
 	if source == "remote" {
 		note = "远程浏览器扩展导入"
 	}
+	if authuser > 0 {
+		note += "（" + authUserLabel(authuser) + "）"
+	}
 	if label == "" {
 		label = profile
 	}
 	nid, e := insertID(
-		`INSERT INTO accounts(label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile)
-		 VALUES (?,?,'enabled',?,?,?,'',0,0,0,?,?)`,
-		strings.TrimSpace(label), cookie, note, time.Now().Unix(), time.Now().Unix(), source, profile)
+		`INSERT INTO accounts(label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile, authuser)
+		 VALUES (?,?,'enabled',?,?,?,'',0,0,0,?,?,?)`,
+		strings.TrimSpace(label), cookie, note, time.Now().Unix(), time.Now().Unix(),
+		source, profile, authuser)
 	if e != nil {
 		return e
 	}
-	logf("[browser] profile %q cookie 已入库 -> 新账号 #%d（source=%s）", profile, nid, source)
+	logf("[browser] profile %q（%s）cookie 已入库 -> 新账号 #%d（source=%s）",
+		profile, authUserLabel(authuser), nid, source)
 	return nil
 }
 
@@ -1302,7 +1328,7 @@ func browserDeleteByProfile(profile string) {
 func browserAccounts() []BrowserAccount {
 	rows, err := getDB().Query(
 		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at,
-		        last_error, fail_count, proxy_id, profile, source
+		        last_error, fail_count, proxy_id, profile, source, authuser
 		 FROM accounts WHERE source IN ('browser','remote') ORDER BY id`)
 	if err != nil {
 		return nil
@@ -1314,7 +1340,7 @@ func browserAccounts() []BrowserAccount {
 		var prof, src string
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
 			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError,
-			&a.FailCount, &a.ProxyID, &prof, &src); err != nil {
+			&a.FailCount, &a.ProxyID, &prof, &src, &a.AuthUser); err != nil {
 			continue
 		}
 		a.Profile = prof

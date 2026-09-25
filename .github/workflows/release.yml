@@ -50,6 +50,24 @@ jobs:
           done
           cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
+      # 扩展 zip 作为独立 Release 资产：初始化引导里的「下载抓取扩展」指向
+      # releases/latest/download/gw2a-cookie-sync-extension-1.1.2.zip。
+      - name: Package browser extension
+        run: |
+          cd tools/cookie-sync/ext-src
+          python3 - <<'PY'
+          import pathlib, zipfile
+          files = ["background.js", "manifest.json", "popup.html", "popup.js"]
+          out = pathlib.Path("../../../dist/gw2a-cookie-sync-extension-1.1.2.zip")
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+              for f in files:
+                  z.write(f, f)
+          print("packed", out.resolve())
+          PY
+          cd ../../../dist
+          sha256sum gw2a-cookie-sync-extension-1.1.2.zip >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       # 从 CHANGELOG.md 抽出本 tag 对应的那一节，拼进 Release 说明。
       # 抽法：从 `## <版本号>` 那行的下一行起，到下一个 `## ` 之前。
       # 抽不到（没写 CHANGELOG）就留空，靠下面 generate_release_notes 的提交列表兜底。

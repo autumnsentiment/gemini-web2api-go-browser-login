@@ -31,6 +31,10 @@ type CookieAccount struct {
 	Source string `json:"source"`
 	// Profile 是 browser 来源对应的 Chromium profile 名。
 	Profile string `json:"profile"`
+	// AuthUser 是 Google 多账号槽位（/u/N/ 里的 N，0=默认账号）。
+	// 2026-09-24：Google 多账号共用同一份 cookie，切换账号靠 URL 路径，
+	// 所以同一份 cookie 可以同时供多个槽位用。
+	AuthUser int `json:"authuser"`
 }
 
 // browserManagedCookie 判断这条账号的会话是否由浏览器侧独家管理。
@@ -139,20 +143,27 @@ func accountAdopt(label, cookie, note string) (int64, error) {
 	return accountInsert(label, cookie, note)
 }
 
+// accountInsertAuthUser 是带账号槽位的插入。authuser 非 0 表示这条 cookie
+// 对应 Google 多账号里的 /u/N/ 槽位（同一份 cookie 不同槽位是不同账号）。
 func accountInsert(label, cookie, note string) (int64, error) {
+	return accountInsertAuthUser(label, cookie, note, 0)
+}
+
+// accountInsertAuthUser 往池里插一条并指定账号槽位。
+func accountInsertAuthUser(label, cookie, note string, authuser int) (int64, error) {
 	cookie = strings.TrimSpace(cookie)
 	if cookie == "" {
 		return 0, fmt.Errorf("cookie 不能为空")
 	}
 	return insertID(
-		`INSERT INTO accounts(label, cookie, status, note, created_at) VALUES (?,?,?,?,?)`,
-		strings.TrimSpace(label), cookie, "enabled", strings.TrimSpace(note), time.Now().Unix())
+		`INSERT INTO accounts(label, cookie, status, note, created_at, authuser) VALUES (?,?,?,?,?,?)`,
+		strings.TrimSpace(label), cookie, "enabled", strings.TrimSpace(note), time.Now().Unix(), authuser)
 }
 
 // accountList 返回池里全部账号，按 id 升序。
 func accountList() []CookieAccount {
 	rows, err := getDB().Query(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile, authuser
 		 FROM accounts ORDER BY id`)
 	if err != nil {
 		return nil
@@ -163,7 +174,7 @@ func accountList() []CookieAccount {
 		var a CookieAccount
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
 			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID,
-			&a.Source, &a.Profile); err != nil {
+			&a.Source, &a.Profile, &a.AuthUser); err != nil {
 			continue
 		}
 		out = append(out, a)
@@ -178,11 +189,11 @@ func accountList() []CookieAccount {
 func accountByID(id int64) *CookieAccount {
 	var a CookieAccount
 	err := getDB().QueryRow(
-		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile
+		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile, authuser
 		 FROM accounts WHERE id=?`, id).
 		Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
 			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError, &a.FailCount, &a.ProxyID,
-			&a.Source, &a.Profile)
+			&a.Source, &a.Profile, &a.AuthUser)
 	if err != nil {
 		return nil
 	}
@@ -569,16 +580,16 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 	}
 
 	// 先作废缓存，否则可能拿到几分钟前的旧结论，检测就没意义了
-	invalidateXSRF(a.Cookie)
-	_, err = getXSRF(a.Cookie, proxyURL)
+	invalidateXSRF(a.Cookie, a.AuthUser)
+	_, err = getXSRF(a.Cookie, proxyURL, a.AuthUser)
 	needRelogin := false
 	if err != nil && looksLikeStaleSession(err) && !browserManagedCookie(a) {
 		// 第一步：哨兵续票（POST /RotateCookies 换发 1PSIDTS，最便宜，不动浏览器）。
 		if _, refreshed, rerr := tryRotate1PSIDTS(a.ID, a.Cookie, proxyURL); rerr == nil && len(refreshed) > 0 {
 			if fresh := accountByID(a.ID); fresh != nil {
 				a.Cookie = fresh.Cookie
-				invalidateXSRF(fresh.Cookie)
-				if tok, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil && tok != "" {
+				invalidateXSRF(fresh.Cookie, fresh.AuthUser)
+				if tok, err2 := getXSRF(fresh.Cookie, proxyURL, fresh.AuthUser); err2 == nil && tok != "" {
 					logf("[cookie] 账号 #%d 检测时续票成功，恢复可用", a.ID)
 					err = nil
 				} else {
@@ -596,8 +607,8 @@ func checkAccountCookie(a CookieAccount) CookieCheck {
 			if ok2 && berr == nil {
 				if fresh := accountByID(a.ID); fresh != nil && fresh.Cookie != "" {
 					a.Cookie = fresh.Cookie
-					invalidateXSRF(fresh.Cookie)
-					if tok, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil && tok != "" {
+					invalidateXSRF(fresh.Cookie, fresh.AuthUser)
+					if tok, err2 := getXSRF(fresh.Cookie, proxyURL, fresh.AuthUser); err2 == nil && tok != "" {
 						logf("[cookie] 账号 #%d 浏览器刷新后恢复可用", a.ID)
 						err = nil
 					} else {

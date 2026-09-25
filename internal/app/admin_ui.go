@@ -10,6 +10,7 @@ import (
 var adminUIFS embed.FS
 
 func handleAdminUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-cache")
 	sub, err := fs.Sub(adminUIFS, "admin_ui")
 	if err != nil {
 		http.Error(w, "embed error", 500)
