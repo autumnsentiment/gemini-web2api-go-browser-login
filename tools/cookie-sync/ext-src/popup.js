@@ -92,23 +92,6 @@ $('btnKa').addEventListener('click', async () => {
   $('btnKa').disabled = false; $('btnKa').textContent = '立即保活';
   await render();
 });
-$('btnReadPage').addEventListener('click', async () => {
-  const b = $('btnReadPage');
-  b.disabled = true; b.textContent = '读取中…';
-  try {
-    const r = await send('readPage');
-    if (!r.ok) { $('align').textContent = '读取失败: ' + (r.detail || r.error || ''); }
-    else {
-      $('pageCard').style.display = '';
-      $('pageEmail').textContent = (r.page && r.page.email) || '（无法读取）';
-      $('jarEmail').textContent = (r.jar_active && r.jar_active.email) || '（无法读取）';
-      $('pageAuth').textContent = (r.page && r.page.authuser != null) ? '/u/' + r.page.authuser : '—';
-      $('align').textContent = r.detail || '—';
-      $('align').style.color = r.aligned === true ? 'var(--ok)' : (r.aligned === false ? 'var(--bad)' : 'var(--warn)');
-    }
-  } finally { b.disabled = false; b.textContent = '读取当前页面'; }
-});
-
 $('btnSync').addEventListener('click', async () => {
   $('btnSync').disabled = true; $('btnSync').textContent = '入池中…';
   await send('sync');
