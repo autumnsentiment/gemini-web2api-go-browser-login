@@ -365,6 +365,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	if mc.Tool > 0 && !rtCfg().MediaUseAutoBL {
 		bl = currentBLPinned()
 	}
+	endpoint := fmt.Sprintf(
+		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+		bl, reqid,
+	)
 
 	// 取 XSRF token。一个 cookie 失效不该让整个请求失败：当前号取不到就换下一个，
 	// 最多试 maxCookieTries 个。不这么做的话，池子里 2 个号坏 1 个就会让大约一半
@@ -372,9 +376,6 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	//
 	// 换号**不换出口**：出口已经按第一个号的绑定选定了，同一个请求里再换出口没道理。
 	cookieStr, sapisid, xsrfToken := "", "", ""
-	// authUser 是这次请求的 Google 账号槽位（/u/N/）。多账号共用一份 cookie，
-	// 靠 URL 路径切号（见 authuser.go）。挑中哪个号就用它的槽位。
-	authUser := 0
 	var lastCookieErr error
 	tried := map[int64]bool{}
 	// 每个号只给一次「轮转后重试」的机会，避免在一个请求里反复打 accounts.google.com
@@ -383,10 +384,9 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		tried[acct.ID] = true
 		// 归属先记上：这一轮失败了也留痕，面板上看得出是哪个号在坏
 		cookieID, cookieLabel = acct.ID, accountDisplayName(acct)
-		tok, err := getXSRF(acct.Cookie, proxyURL, acct.AuthUser)
+		tok, err := getXSRF(acct.Cookie, proxyURL)
 		if err == nil {
 			cookieStr, sapisid, xsrfToken = acct.Cookie, extractSAPISID(acct.Cookie), tok
-			authUser = acct.AuthUser
 			// 只在「还没绑过」或「绑的出口已经没了」时写绑定。
 			//
 			// 绝不因为"这次走的是别的出口"就覆盖：出口是按**本次第一个挑中的号**
@@ -411,11 +411,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			if !browserManagedCookie(*acct) {
 				if _, _, rerr := rotateAccount(*acct); rerr == nil {
 					if fresh := accountByID(acct.ID); fresh != nil {
-						if tok2, err2 := getXSRF(fresh.Cookie, proxyURL, fresh.AuthUser); err2 == nil {
+						if tok2, err2 := getXSRF(fresh.Cookie, proxyURL); err2 == nil {
 							logf("[cookie] 账号 #%d 轮转后恢复可用", acct.ID)
 							acct = fresh
 							cookieStr, sapisid, xsrfToken = fresh.Cookie, extractSAPISID(fresh.Cookie), tok2
-							authUser = fresh.AuthUser
 							if fresh.ProxyID == 0 || !proxyUsableByID(fresh.ProxyID) {
 								bindAccountProxy(fresh.ID, picked.ID)
 							}
@@ -443,16 +442,6 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		logf("[cookie] 试过的 %d 个账号都不可用，本次降级匿名（能力会退化到匿名档）", len(tried))
 		cookieID, cookieLabel = 0, ""
 	}
-	// endpoint 要等挑完号才能拼：账号槽位（/u/N/）是 URL 路径的一部分，
-	// 多账号共用同一份 cookie 时靠它切号（见 authuser.go）。
-	// 匿名（cookieStr==""）槽位恒为 0，跟以前一样。
-	if cookieStr == "" {
-		authUser = 0
-	}
-	endpoint := fmt.Sprintf(
-		"https://gemini.google.com%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		geminiURLPrefix(authUser), bl, reqid,
-	)
 	// 图片附件：上传要 cookie，而且必须走跟正式请求同一个出口，所以排在这里。
 	if len(pending) > 0 {
 		if cookieStr == "" {
@@ -462,7 +451,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		nImg, nVid := 0, 0
 		for _, u := range pending {
-			ref, uerr := uploadBytes(cookieStr, proxyURL, authUser, u.Data, u.Name)
+			ref, uerr := uploadBytes(cookieStr, proxyURL, u.Data, u.Name)
 			if uerr != nil {
 				return attrib(fmt.Errorf("上传附件 %s 失败: %w", u.Name, uerr))
 			}
@@ -479,7 +468,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// prompt 超长时转成文本附件。要等挑完号和出口才能做：上传要 cookie，
 	// 而且必须走跟正式请求同一个出口。
 	budget := rtCfg().MaxPromptBytes
-	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL, authUser); ferr != nil {
+	if p, f, used, ferr := prepareContextFile(prompt, latest, budget, cookieStr, proxyURL); ferr != nil {
 		return attrib(ferr)
 	} else if used {
 		prompt = p
@@ -584,7 +573,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	modelHeader := buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
 	sessionHeader := fmt.Sprintf(`["%s",1]`, reqUUID)
 
-	geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID, authUser)
+	geminiHeaders := buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 	geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
 	geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
 	var lastErr error
@@ -678,10 +667,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			// 这种自愈不算进重试预算，否则一次过期就吃掉全部重试。
 			if statusCode == 400 && isXSRFError(string(raw)) && cookieStr != "" && !xsrfRetried {
 				xsrfRetried = true
-				invalidateXSRF(cookieStr, authUser)
-				if tok, e := getXSRF(cookieStr, proxyURL, authUser); e == nil {
+				invalidateXSRF(cookieStr)
+				if tok, e := getXSRF(cookieStr, proxyURL); e == nil {
 					body = buildBody(tok)
-					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID, authUser)
+					geminiHeaders = buildGeminiHeaders(cookieStr, sapisid, mc.HexID)
 					geminiHeaders["x-goog-ext-525001261-jspb"] = modelHeader
 					geminiHeaders["x-goog-ext-525005358-jspb"] = sessionHeader
 					attempt--
@@ -763,7 +752,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 			}
 			arts, aerr := fetchMediaArtifactsBudget(
 				mc.Tool, string(raw), extractConversationID(string(raw)),
-				cookieStr, sapisid, xsrfToken, proxyURL, mime, authUser, remaining)
+				cookieStr, sapisid, xsrfToken, proxyURL, mime, remaining)
 			// 诊断采样（2026-09-17）：成功/失败各留一份原始 StreamGenerate 响应。
 			// 「生成成功但取不到产物」是间歇性的（同一 prompt 有时 70 秒成功、
 			// 有时 65 秒就报取不到），只有对比两份原文才能看出产物引用的差异。
@@ -782,7 +771,7 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
 		if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
 			if cid := extractConversationID(string(raw)); cid != "" {
-				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL, authUser)
+				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL)
 			}
 		}
 		return result, nil
@@ -830,18 +819,15 @@ func buildModelHeader(hexID string, mode, think int, uuid string) string {
 
 // buildGeminiHeaders 准备 StreamGenerate 必需的应用层 header。
 // hexID 决定服务端用哪个模型；留空则服务端一律回落到 3.5 Flash-Lite。
-//
-// authuser 是账号槽位（0=默认账号）。实测切号靠 URL 里的 /u/N/ 路径，这个头
-// 不影响结果，但浏览器两个都发，保持一致（见 authuser.go）。
-func buildGeminiHeaders(cookieStr, sapisid, hexID string, authuser int) map[string]string {
+func buildGeminiHeaders(cookieStr, sapisid, hexID string) map[string]string {
 	h := map[string]string{
 		"Accept":          "*/*",
 		"Accept-Language": "en-US,en;q=0.9",
 		"Content-Type":    "application/x-www-form-urlencoded;charset=UTF-8",
 		"Origin":          "https://gemini.google.com",
-		"Referer":         geminiPageURL(authuser),
+		"Referer":         "https://gemini.google.com/app",
 		"X-Same-Domain":   "1",
-		"X-Goog-AuthUser": authUserHeaderValue(authuser),
+		"X-Goog-AuthUser": "0",
 		// 这两个浏览器每次都发，值是固定的。
 		"x-goog-ext-73010989-jspb": "[0]",
 		"x-goog-ext-73010990-jspb": "[0,0,0]",
@@ -1155,20 +1141,20 @@ func probeGemini(prompt, proxyURL string) ProbeResult {
 	body := form.Encode()
 
 	reqid := time.Now().Unix() % 1000000
+	// probe 走普通对话载荷，用自动 bl 即可（媒体请求的钉死值见 streamGenerateWithFiles）。
+	endpoint := fmt.Sprintf(
+		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+		currentBL(proxyURL), reqid,
+	)
+
 	// probe 是旁路探测，不回写 cookie 健康度：它的失败原因跟 cookie 无关。
 	// 但 at 必须带——否则挂了 cookie 之后连通性探测会一直报 400，假报故障。
-	cookieStr, sapisid, authUser := loadCookie()
-	// probe 走普通对话载荷，用自动 bl 即可（媒体请求的钉死值见 streamGenerateWithFiles）。
-	// endpoint 带上挑中那个号的槽位，否则多账号下探测的是别的账号（见 authuser.go）。
-	endpoint := fmt.Sprintf(
-		"https://gemini.google.com%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		geminiURLPrefix(authUser), currentBL(proxyURL), reqid,
-	)
-	if tok, e := getXSRF(cookieStr, proxyURL, authUser); e == nil && tok != "" {
+	cookieStr, sapisid := loadCookie()
+	if tok, e := getXSRF(cookieStr, proxyURL); e == nil && tok != "" {
 		form.Set("at", tok)
 		body = form.Encode()
 	}
-	headers := buildGeminiHeaders(cookieStr, sapisid, probeModel.HexID, authUser)
+	headers := buildGeminiHeaders(cookieStr, sapisid, probeModel.HexID)
 
 	// 复用主流程同款 client 选择规则:有代理走 stdlib，没代理走 tls-client。
 	// 但 probe 需要看 302 的 Location header,所以这里直接发不用 doGeminiRequest。

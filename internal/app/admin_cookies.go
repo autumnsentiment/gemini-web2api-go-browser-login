@@ -53,9 +53,6 @@ func cookieAcctView(a CookieAccount) map[string]interface{} {
 	return map[string]interface{}{
 		"id":           a.ID,
 		"label":        a.Label,
-		"profile":      a.Profile,
-		"source":       a.Source,
-		"authuser":     a.AuthUser,
 		"status":       a.Status,
 		"health":       health,
 		"note":         a.Note,

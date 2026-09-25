@@ -33,7 +33,7 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(origin, "chrome-extension://") {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-GW2A-Ext-Mode")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 	}
 	if r.Method == http.MethodOptions {
@@ -50,16 +50,13 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p struct {
-		Profile   string `json:"profile"`
-		Cookie    string `json:"cookie"`
-		LoggedIn  *bool  `json:"logged_in"`
-		Label     string `json:"label"`
-		Note      string `json:"note"`
-		UserAgent string `json:"user_agent"`
-		Client    string `json:"client"`
-		// Account 是扩展上报的 Google 账号槽位（'' / '0' = 默认账号，'1' = /u/1/…）。
-		// 多账号共用同一份 cookie，靠 URL 路径切号（见 authuser.go）。
-		Account string `json:"account"`
+		Profile   string          `json:"profile"`
+		Cookie    string          `json:"cookie"`
+		LoggedIn  *bool           `json:"logged_in"`
+		Label     string          `json:"label"`
+		Note      string          `json:"note"`
+		UserAgent string          `json:"user_agent"`
+		Client    string          `json:"client"`
 		// Summary 扩展发的是对象（{SID:{len,expires},...}），用 RawMessage
 		// 接住再序列化成字符串存 note，避免类型不匹配 400（2026-09-17 实测）。
 		Summary json.RawMessage `json:"summary"`
@@ -73,19 +70,6 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		profile = "remote1"
 	}
 	profile = sanitizeProfileName(profile)
-	// 扩展每次回传都带推送模式头；面板据此自动显示/隐藏「在我的浏览器打开
-	// 授权页」按钮（service = 用户自己的浏览器，controller = 服务器浏览器）。
-	if mode := normalizeExtMode(r.Header.Get("X-GW2A-Ext-Mode")); mode != "" {
-		// 从 summary JSON 对象中统计 cookie 数量，避免硬编码 0 覆盖心跳值
-		ingestCount := 0
-		if len(p.Summary) > 0 && p.Summary[0] == '{' {
-			var sm map[string]json.RawMessage
-			if json.Unmarshal(p.Summary, &sm) == nil {
-				ingestCount = len(sm)
-			}
-		}
-		saveBrowserExtReport(profile, mode, p.LoggedIn != nil && *p.LoggedIn, ingestCount, "cookie 回传")
-	}
 	cookie := strings.TrimSpace(p.Cookie)
 	if cookie == "" {
 		writeJSON(w, 400, map[string]string{"error": "cookie 为空"})
@@ -117,20 +101,12 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		note += " · summary=" + truncate(string(p.Summary), 400)
 	}
 
-	// 账号槽位：优先用扩展显式上报的 account，没带就从 profile 名推断
-	// （扩展把多账号落成 browser1 / browser1-u1 / browser1-u2…）。
-	authUser := parseAuthUser(p.Account)
-	if authUser == 0 {
-		authUser = authUserFromProfile(profile)
-	}
-
 	// 入库（与容器路径同一套存储逻辑，source 标 remote 以示区分）
-	if err := browserStoreCookieSourceAuthUser(label, profile, cookie, "remote", authUser); err != nil {
+	if err := browserStoreCookieSource(label, profile, cookie, "remote"); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	logf("[ingest] 远程 profile %q cookie 已入库（%d 字节, 槽位 %s, client=%s）",
-		profile, len(cookie), authUserLabel(authUser), truncate(p.Client, 30))
+	logf("[ingest] 远程 profile %q cookie 已入库（%d 字节, client=%s）", profile, len(cookie), truncate(p.Client, 30))
 
 	// 抓取后模型校验（与容器路径一致：502 重抓提示 / 302 重置代理池）
 	vr := browserVerifyAfterFetch(label, profile, false)

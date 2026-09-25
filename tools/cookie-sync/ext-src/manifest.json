@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Cookie Sync",
-  "version": "1.1.3",
-  "description": "读取已登录 Gemini 会话的 Cookie 并推送到 gemini-web2api（控制器或服务端 ingest）。支持多账号同时登录时固定某个 Gemini 页面作为抓取源，按该页面的账号槽位精确取值；可一键读取当前页并立即入池。",
+  "version": "1.1.0",
+  "description": "读取已登录 Gemini 会话的 Cookie 并推送到 gemini-web2api（控制器或服务端 ingest）。支持本机浏览器直连远程服务器，抓取前不刷新页面，仅在会话失效时刷新。",
   "minimum_chrome_version": "110",
   "permissions": [
     "cookies",

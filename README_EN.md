@@ -485,17 +485,9 @@ ones are `manual`, and they rotate in the same pool. Manual import still works a
 The dashboard **Setup guide** page shows the same steps per deployment environment,
 each with a "view parameters" dialog. Record from a real Chrome run:
 
-**1. Install the extension**: download the extension zip from the Setup guide and unzip → `chrome://extensions`
+**1. Install the extension**: download the extension zip and unzip → `chrome://extensions`
 → enable Developer mode → "Load unpacked" and pick the unzipped folder → the card
-"Gemini Cookie Sync 1.1.2" appears. The Setup guide link points to
-`gw2a-cookie-sync-extension-1.1.2.zip` in this repository's Release assets.
-
-**1a. Pin a scrape page when several accounts are signed in** (v1.1.2+): when one browser has
-multiple Google accounts signed in, Google separates them by cookie path (default account `/`,
-second `/u/1/`, third `/u/2/`, ...). The extension popup lists every open Gemini page with its
-account slot, sign-in state, and cookie count. "Read this page" scrapes only that account and
-submits it immediately; "Pin" makes keepalive and scheduled submits use only that page, so cookies
-from different accounts are never mixed. Closing the pinned page clears the pin automatically.
+"Gemini Cookie Sync 1.1.0" appears.
 
 **2. Configure the extension** (open the toolbar popup):
 
@@ -507,12 +499,7 @@ from different accounts are never mixed. Closing the pinned page clears the pin 
 | Key | the API Key from Settings page | used for server-mode auth |
 | Enable / auto keepalive | checked | keepalive 10 min, sync 30 min by default |
 
-Then click **Save**. The extension reports its current push mode with every heartbeat,
-and the dashboard uses it to decide whether to show "Open authorization page in my
-browser": hidden in server mode, shown in controller mode.
-
-The Browser Login page also has a **Sync extension status** button for an active
-online/sleeping probe. The extension popup has a matching **Sync status** button.
+Then click **Save**.
 
 **3. Sign in and push**: sign in to gemini.google.com in the local browser → click
 "Sync now" in the popup → the popup shows "✓ cookie stored and model-verified" and a
@@ -684,3 +671,4 @@ MIT — see [LICENSE](LICENSE)
 - [LINUX DO](https://linux.do) — the community where this project is shared
 
 [![LinuxDo](https://img.shields.io/badge/%E7%A4%BE%E5%8C%BA-LinuxDo-blue?style=for-the-badge)](https://linux.do/)
+

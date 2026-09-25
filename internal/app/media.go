@@ -128,8 +128,8 @@ func filterDownloadCookies(cookie string) string {
 // 图片和音乐取回路径不同：图片走 lh3 CDN（链在 StreamGenerate 响应里，302 跟随），
 // 音乐/视频走 contribution.usercontent.google.com/download（链在 hNvQHb 历史里，单次
 // 200）。按 tool 分流。
-func fetchMediaArtifacts(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, error) {
-	return fetchMediaArtifactsBudget(tool, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser, 0)
+func fetchMediaArtifacts(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, error) {
+	return fetchMediaArtifactsBudget(tool, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, 0)
 }
 
 // fetchMediaArtifactsBudget 同上，但可指定**整条请求的总预算**（秒，0=不限）。
@@ -138,9 +138,9 @@ func fetchMediaArtifacts(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, de
 // 产物轮询又要几分钟，两者会叠加。而调用方（new-api 等网关）对整条请求有固定
 // 耐心上限（实测约 9.5 分钟）—— 必须在那个上限前收手，否则做的是白工：客户端
 // 早就断了，我们还在轮询。budget 从请求开始计时，轮询在剩余时间里进行。
-func fetchMediaArtifactsBudget(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser, budgetSec int) ([]MediaArtifact, error) {
+func fetchMediaArtifactsBudget(tool int, raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, budgetSec int) ([]MediaArtifact, error) {
 	if tool == toolImage {
-		return fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser)
+		return fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime)
 	}
 	// 音乐几乎立刻就绪，视频要生成几十秒到几分钟，所以视频轮询给足预算。
 	maxPolls, interval := 6, 2*time.Second
@@ -156,7 +156,7 @@ func fetchMediaArtifactsBudget(tool int, raw, cid, cookie, sapisid, xsrf, proxyU
 		// 已耗时较久，budgetSec 会把轮询截得更短（两者共享同一总预算）。
 		maxPolls, interval = 60, 8*time.Second // 约 8 分钟（受 budgetSec 截断）
 	}
-	arts, err := fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime, authuser, maxPolls, interval, budgetSec)
+	arts, err := fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime, maxPolls, interval, budgetSec)
 	if err != nil {
 		return arts, err
 	}
@@ -176,11 +176,11 @@ func fetchMediaArtifactsBudget(tool int, raw, cid, cookie, sapisid, xsrf, proxyU
 
 // fetchImageArtifacts 取回生成的图片。链在 StreamGenerate 响应里就有，抠不到再退回轮询
 // hNvQHb。下载走 mediaGetFollow（跟随 302 并每跳重发 cookie）。
-func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int) ([]MediaArtifact, error) {
+func fetchImageArtifacts(raw, cid, cookie, sapisid, xsrf, proxyURL, defaultMime string) ([]MediaArtifact, error) {
 	urls := collectImageURLs(raw)
 	if len(urls) == 0 {
 		for i := 0; i < 6; i++ {
-			if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, authuser); err == nil {
+			if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err == nil {
 				if u := collectImageURLs(body); len(u) > 0 {
 					urls = u
 					break
@@ -228,7 +228,7 @@ func imageFullResURL(u string) string {
 
 // fetchDownloadArtifacts 取回音乐/视频：轮询 hNvQHb 等到 response_data 下载链，再下。
 // gg-dl（lh3）和 temp_data 那两种链是预览用的，只有 response_data 那条能下到真字节。
-func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime string, authuser int,
+func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime string,
 	maxPolls int, interval time.Duration, budgetSec int) ([]MediaArtifact, error) {
 	if cid == "" {
 		return nil, fmt.Errorf("没拿到会话 id，无法定位产物")
@@ -247,7 +247,7 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 			logf("[media] 轮询到总预算上限，停止（已轮询 %d/%d）", i, maxPolls)
 			break
 		}
-		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL, authuser); err != nil {
+		if body, err := pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL); err != nil {
 			pollErrs++
 			lastBody = ""
 			logf("[media] 轮询 %d/%d 失败: %v", i+1, maxPolls, err)
@@ -576,7 +576,7 @@ func looksLikeMP4(d []byte) bool {
 }
 
 // pollHistoryRaw 调一次 hNvQHb 取会话历史，返回原始响应体。
-func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (string, error) {
+func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string) (string, error) {
 	inner, _ := json.Marshal([]interface{}{cid, 10, nil, 1, []interface{}{0}, []interface{}{4}, nil, 1})
 	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"hNvQHb", string(inner), nil, "generic"}}})
 	form := url.Values{}
@@ -586,11 +586,11 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (
 	}
 	reqid := time.Now().UnixNano() % 1000000
 	endpoint := fmt.Sprintf(
-		"https://gemini.google.com%s/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&bl=%s&hl=en&_reqid=%d&rt=c",
-		geminiURLPrefix(authuser), currentBL(proxyURL), reqid)
+		"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&bl=%s&hl=en&_reqid=%d&rt=c",
+		currentBL(proxyURL), reqid)
 
 	// batchexecute 不带模型 header，其余（cookie / SAPISIDHASH / x-same-domain）跟主请求同款。
-	headers := buildGeminiHeaders(cookie, sapisid, "", authuser)
+	headers := buildGeminiHeaders(cookie, sapisid, "")
 	delete(headers, "x-goog-ext-525001261-jspb")
 
 	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
@@ -611,7 +611,7 @@ func pollHistoryRaw(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) (
 //
 // 只登录态可用（匿名没有 XSRF、会话也没落到账号里）。best-effort：删失败只记日志，
 // 不影响已经返给客户端的响应。
-func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string, authuser int) {
+func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string) {
 	inner, _ := json.Marshal([]interface{}{cid})
 	freq, _ := json.Marshal([]interface{}{[]interface{}{[]interface{}{"GzXR5e", string(inner), nil, "generic"}}})
 	form := url.Values{}
@@ -619,9 +619,9 @@ func deleteConversation(cid, cookie, sapisid, xsrf, proxyURL string, authuser in
 	form.Set("at", xsrf)
 	reqid := time.Now().UnixNano() % 1000000
 	endpoint := fmt.Sprintf(
-		"https://gemini.google.com%s/_/BardChatUi/data/batchexecute?rpcids=GzXR5e&bl=%s&hl=en&_reqid=%d&rt=c",
-		geminiURLPrefix(authuser), currentBL(proxyURL), reqid)
-	headers := buildGeminiHeaders(cookie, sapisid, "", authuser)
+		"https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=GzXR5e&bl=%s&hl=en&_reqid=%d&rt=c",
+		currentBL(proxyURL), reqid)
+	headers := buildGeminiHeaders(cookie, sapisid, "")
 	delete(headers, "x-goog-ext-525001261-jspb")
 	status, _, body, err := uploadPost(endpoint, headers, []byte(form.Encode()), proxyURL)
 	if err != nil {

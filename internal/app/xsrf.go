@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,33 +44,28 @@ var pushIDRe = regexp.MustCompile(`"qKIAYe":"([^"]{4,400})"`)
 var pctxRe = regexp.MustCompile(`"Ylro7b":"([^"]{4,400})"`)
 
 // cookieKey 用 cookie 的短摘要当缓存键，避免把整串凭证塞进 map key。
-//
-// ★ 2026-09-24：必须把账号槽位并进键 ★
-// 多账号共用同一份 cookie（见 authuser.go），但 SNlM0e 是**按槽位签发**的 ——
-// 同一个 cookie 打 /app 和 /u/1/app 拿到两个不同的 token，拿错的那个去请求
-// 对应端点上游直接回 400。只用 cookie 当键会让两个槽位互相命中对方的 token。
-func cookieKey(cookie string, authuser int) string {
+func cookieKey(cookie string) string {
 	sum := sha1.Sum([]byte(cookie))
-	return hex.EncodeToString(sum[:8]) + "|u" + strconv.Itoa(authuser)
+	return hex.EncodeToString(sum[:8])
 }
 
 // invalidateXSRF 丢掉某个 cookie 的缓存 token，下次取会重新抓页面。
-func invalidateXSRF(cookie string, authuser int) {
+func invalidateXSRF(cookie string) {
 	if cookie == "" {
 		return
 	}
 	xsrfMu.Lock()
-	delete(xsrfCache, cookieKey(cookie, authuser))
+	delete(xsrfCache, cookieKey(cookie))
 	xsrfMu.Unlock()
 }
 
 // getXSRF 取该 cookie 对应的 XSRF token；命中缓存且没过期就直接返回。
 // cookie 为空（匿名）时返回空串——匿名请求不需要这个字段。
-func getXSRF(cookie, proxyURL string, authuser int) (string, error) {
+func getXSRF(cookie, proxyURL string) (string, error) {
 	if cookie == "" {
 		return "", nil
 	}
-	key := cookieKey(cookie, authuser)
+	key := cookieKey(cookie)
 
 	xsrfMu.Lock()
 	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
@@ -80,7 +74,7 @@ func getXSRF(cookie, proxyURL string, authuser int) (string, error) {
 	}
 	xsrfMu.Unlock()
 
-	e, err := fetchAppTokens(cookie, proxyURL, authuser)
+	e, err := fetchAppTokens(cookie, proxyURL)
 	if err != nil {
 		return "", err
 	}
@@ -91,8 +85,8 @@ func getXSRF(cookie, proxyURL string, authuser int) (string, error) {
 }
 
 // getUploadTokens 取上传要用的 Push-ID / X-Client-Pctx，跟 XSRF token 同一份缓存。
-func getUploadTokens(cookie, proxyURL string, authuser int) (pushID, pctx string, err error) {
-	key := cookieKey(cookie, authuser)
+func getUploadTokens(cookie, proxyURL string) (pushID, pctx string, err error) {
+	key := cookieKey(cookie)
 
 	xsrfMu.Lock()
 	if e, ok := xsrfCache[key]; ok && time.Since(e.fetched) < xsrfTTL {
@@ -101,7 +95,7 @@ func getUploadTokens(cookie, proxyURL string, authuser int) (pushID, pctx string
 	}
 	xsrfMu.Unlock()
 
-	e, err := fetchAppTokens(cookie, proxyURL, authuser)
+	e, err := fetchAppTokens(cookie, proxyURL)
 	if err != nil {
 		return "", "", err
 	}
@@ -111,21 +105,15 @@ func getUploadTokens(cookie, proxyURL string, authuser int) (pushID, pctx string
 	return e.pushID, e.pctx, nil
 }
 
-// fetchAppPage 抓 gemini.google.com 对应账号槽位的 HTML。
+// fetchAppPage 抓 gemini.google.com/app 的 HTML。
 // 走跟主请求相同的出口：配了代理走 stdlib，没配走 tls-client，
 // 免得页面里取到的 token 和后续请求来自两个不同 IP。
 // cookie 传空串就是匿名抓（页面照样返回，只是没有登录态字段）。
-//
-// ★ 2026-09-24：authuser 是账号槽位 ★
-// 多账号共用同一份 cookie（authuser.go 有完整说明），但 /u/N/app 页面拿到的
-// SNlM0e 跟默认 /app 页面**不同**，且不能互换（换着用上游回 400）。所以页面
-// URL 必须跟请求端点同一槽位。
-func fetchAppPage(cookie, proxyURL string, authuser int) ([]byte, error) {
-	pageURL := geminiPageURL(authuser)
+func fetchAppPage(cookie, proxyURL string) ([]byte, error) {
+	const pageURL = "https://gemini.google.com/app"
 	headers := map[string]string{
 		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 		"Accept-Language": "en-US,en;q=0.9",
-		"X-Goog-AuthUser": authUserHeaderValue(authuser),
 	}
 	if cookie != "" {
 		headers["Cookie"] = cookie
@@ -177,9 +165,9 @@ func fetchAppPage(cookie, proxyURL string, authuser int) ([]byte, error) {
 	return body, nil
 }
 
-// fetchAppTokens 抓一次对应槽位的 /app 页面，把三个 token 一起抠出来。
-func fetchAppTokens(cookie, proxyURL string, authuser int) (xsrfEntry, error) {
-	body, err := fetchAppPage(cookie, proxyURL, authuser)
+// fetchAppTokens 抓一次 /app 页面，把三个 token 一起抠出来。
+func fetchAppTokens(cookie, proxyURL string) (xsrfEntry, error) {
+	body, err := fetchAppPage(cookie, proxyURL)
 	if err != nil {
 		return xsrfEntry{}, err
 	}

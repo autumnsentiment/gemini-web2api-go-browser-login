@@ -121,7 +121,6 @@ var (
 // 为什么单独给：视频（Veo）生成比普通对话慢得多。实测数据（2026-09-16/17）：
 //   - 180 秒超时：视频 StreamGenerate 撞墙（182.9s 被砍）
 //   - 300 秒超时：仍然不够（310.7s 被砍）
-//
 // 视频生成的 StreamGenerate 是**同步等待**上游把视频做完才回，队列繁忙时
 // 需要数分钟。全局 180 秒是为普通对话调的，媒体请求必须给足预算。
 //
@@ -171,19 +170,19 @@ func getStdlibClient(proxyURL string) *http.Client {
 }
 
 // loadCookie reads the cookie file (Netscape one-line format or JSON).
-// loadCookie 返回 (cookie 串, SAPISID, authuser)。只有旁路探测在用 —— 正式
-// 请求那条路在 streamGenerate 里自己挑号，因为它还要挨个换号和绑定出口。
+// loadCookie 返回 (cookie 串, SAPISID)。只有旁路探测在用 —— 正式请求那条路
+// 在 streamGenerate 里自己挑号，因为它还要挨个换号和绑定出口。
 //
 // cookie 只有 cookie 池一个来源：挑一个 enabled 账号（最久未用优先，自动轮转
 // 分散单 IP 上限）。池空 = 匿名。原来那条「池空回落单 cookie」的路径已经取消，
 // 它的值在启动时被 seedCookiesFromConfig 并进池子了。
 //
-// authuser 是挑中那个号的账号槽位（/u/N/），旁路探测要按它拼 URL / 取 XSRF。
-func loadCookie() (cookie, sapisid string, authuser int) {
+// 第三个返回值是池里那条记录的 ID，请求结束后拿它调 markCookieByStatus 回写健康度。
+func loadCookie() (cookie, sapisid string) {
 	if a, ok := pickCookieAccount(); ok {
-		return a.Cookie, extractSAPISID(a.Cookie), a.AuthUser
+		return a.Cookie, extractSAPISID(a.Cookie)
 	}
-	return "", "", 0
+	return "", ""
 }
 
 func makeSAPISIDHash(sapisid string) string {

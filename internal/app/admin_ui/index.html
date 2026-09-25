@@ -452,7 +452,7 @@ const pages = {
                     title="本地 RPH 限额 ${limit}"></div>` : ''}
                 </div>
                 <div class="slot-note ${noteCls}">${note} · 并发 ${u.inflight}/${u.limit_concurrent || '∞'}
-                  · RPM ${u.rpm}/${u.limit_rpm || '∞'} · RPH ${rph}/${u.limit_rph || '∞'}</div>
+                  · RPM ${u.rpm}/${u.limit_rpm || '∞'}</div>
               </div>`;
             }).join('') || '<div class="empty">还没有任何请求经过</div>'}
           </div>
@@ -674,7 +674,7 @@ const pages = {
             <tbody>${items.map(a => `
               <tr class="${a.health === 'dead' ? 'row-dead' : ''}">
                 <td class="num nw">${a.id}</td>
-                <td class="truncate" title="${escapeHtml(a.label || '')}${a.profile ? ' · profile=' + escapeHtml(a.profile) : ''}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}${a.authuser > 0 ? ' <span class="badge" title="Google 多账号槽位 /u/' + a.authuser + '/（同一份 cookie，靠 URL 路径切号）">/u/' + a.authuser + '</span>' : ''}</td>
+                <td class="truncate" title="${escapeHtml(a.label || '')}">${a.label ? escapeHtml(a.label) : '<span class="badge muted">未命名</span>'}</td>
                 <td class="nw">${
                   a.health === 'dead' ? '<span class="badge fail" title="鉴权在失败，多半 cookie 过期了，建议用 Firefox 重新导出">疑似失效</span>'
                   : a.health === 'disabled' ? '<span class="badge muted">禁用</span>'
@@ -736,7 +736,7 @@ const pages = {
         { k: '地址栏输入', v: 'chrome://extensions', why: '打开扩展管理页' },
         { k: '开发者模式', v: '右上角开关开启', why: '不开就看不到「加载已解压的扩展程序」' },
         { k: '加载扩展', v: '点「加载未打包的扩展程序」选解压目录', why: '目录里应有 manifest.json / background.js / popup.html / popup.js' },
-        { k: '确认安装', v: '卡片显示 Gemini Cookie Sync 1.1.2（未打包）', why: '开发者模式需保持开启' },
+        { k: '确认安装', v: '卡片显示 Gemini Cookie Sync 1.1.0（未打包）', why: '开发者模式需保持开启' },
       ],
       config: [
         { k: 'Profile 标识', v: '自定义（如 本机浏览器）', why: '入池后账号显示为 remote:<标识>' },
@@ -784,7 +784,7 @@ const pages = {
     }
     body += step(3, '安装扩展（本机 Chrome / Edge）', {
       html: '下载扩展 zip 并解压，然后在浏览器扩展管理页加载。' +
-        '<div style="margin-top:8px"><a class="btn" href="https://github.com/autumnsentiment/gemini-web2api-go-browser-login/releases/latest/download/gw2a-cookie-sync-extension-1.1.2.zip" target="_blank" download>下载抓取扩展 v1.1.2（Release）</a> <a class="btn muted" href="api/browser/extension" download>服务器内置副本</a></div>',
+        '<div style="margin-top:8px"><a class="btn muted" href="api/browser/extension" download>下载抓取扩展（zip）</a></div>',
       paramId: 'install',
     });
     body += step(4, '配置扩展（推送模式 / 地址 / 密钥）', {
@@ -845,14 +845,10 @@ const pages = {
     // 空闲休眠秒数：0 = 常驻；-1 = 控制器没报（老版本）；>0 = 按需唤醒模式
     const idleStop = (typeof st.idle_stop === 'number') ? st.idle_stop : -1;
     const rowHtml = rows.map(a => {
-      // 状态徽标：service 模式的浏览器在用户本机，容器 Chromium 永远不会运行，
-      // 因此以插件心跳为准；controller 模式才看容器内 Chromium 是否运行。
+      // 状态徽标：运行中分「手动挂起（登录中）」和「抓取中/待机」；
+      // 未运行即「已休眠」—— 按需唤醒模式下这是常态，不是故障。
       let badge;
-      if (a.ext_mode === 'service') {
-        badge = a.ext_state === 'online'
-          ? '<span class="badge ok">插件在线</span>'
-          : '<span class="badge muted">插件休眠</span>';
-      } else if (a.running) {
+      if (a.running) {
         badge = a.hold
           ? '<span class="badge warn">唤醒中（登录）</span>'
           : '<span class="badge ok">唤醒中</span>';
@@ -879,9 +875,8 @@ const pages = {
         <td class="nw">
           <span class="actions">
             <button class="btn muted" onclick="browserOpenLogin('${escapeHtml(a.name)}', this)">容器内打开</button>
-            ${accessUrl && a.ext_mode !== 'service' ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
+            ${accessUrl ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
             <button class="btn muted" onclick="browserFetch('${escapeHtml(a.name)}', this)">抓取 cookie</button>
-            <span class="muted" style="font-size:11px;white-space:nowrap">插件：${a.ext_state === 'online' ? '<span style="color:var(--ok,#188038)">在线</span>' : '<span style="color:var(--fail,#d93025)">休眠</span>'} <span style="color:var(--muted)">${a.ext_mode || '—'}</span></span>
             ${a.running ? `<button class="btn muted" onclick="browserSleep('${escapeHtml(a.name)}', this)" title="立即休眠：抓完不用等空闲计时，直接收掉浏览器进程">休眠</button>` : ''}
             ${a.account_id ? `<button class="btn muted" onclick="browserAccountInPool(${a.account_id})">池中账号</button>` : ''}
             <button class="btn danger" onclick="browserDel('${escapeHtml(a.name)}', this)">删除</button>
@@ -895,7 +890,6 @@ const pages = {
         <h2>浏览器登录（独立 Chromium profile）
           <span class="controls">
             <span class="badge ${ok ? 'ok' : 'fail'}">${ok ? '控制器在线' : '控制器离线'}</span>
-            <button class="btn muted" onclick="browserExtSync(this)">同步插件状态</button>
             <button class="btn" onclick="browserAdd()">+ 添加账号</button>
             <button class="btn" onclick="browserRefreshAll(this)">全部刷新</button>
           </span>
@@ -1159,7 +1153,7 @@ const RT_GROUPS = [
       { k: 'per_ip_rpm', label: 'RPM', type: 'int', min: 0, max: 10000,
         hint: '滚动 60 秒窗口上限，0=不限' },
       { k: 'per_ip_rph', label: 'RPH', type: 'int', min: 0, max: 100000,
-        hint: '滚动 1 小时上限，0=不限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
+        hint: '滚动 1 小时上限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
     ],
   },
   {
@@ -1869,19 +1863,6 @@ async function browserRefreshAll(btn) {
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) return flash('刷新失败：' + (j.error || r.status));
     flash(j.detail || '刷新完成');
-    await refreshPage();
-  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
-}
-
-// 同步插件状态：对所有 profile 探测一遍扩展是否存活（CDP / 心跳）
-async function browserExtSync(btn) {
-  const old = btn && btn.textContent; if (btn) { btn.textContent = '同步中…'; btn.disabled = true; }
-  try {
-    const r = await api('api/browser/extension-sync', { method: 'POST' });
-    if (!r || r.error) return flash('同步失败：' + ((r && r.error) || '未知错误'));
-    const items = r.items || [];
-    const online = items.filter(i => i.state === 'online').length;
-    flash('状态同步完成：' + online + '/' + items.length + ' 在线');
     await refreshPage();
   } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
 }

@@ -114,7 +114,7 @@ func modelGuardRefetch(accountID int64, model, upstream string) {
 		_, refreshed, rerr := tryRotate1PSIDTS(a.ID, a.Cookie, proxyURL)
 		if rerr == nil && len(refreshed) > 0 {
 			if fresh := accountByID(a.ID); fresh != nil && fresh.Cookie != a.Cookie {
-				invalidateXSRF(fresh.Cookie, fresh.AuthUser)
+				invalidateXSRF(fresh.Cookie)
 				logf("[model-guard] 账号 #%d 已续票（%s），待后续请求验证恢复", accountID, strings.Join(refreshed, ", "))
 				return
 			}

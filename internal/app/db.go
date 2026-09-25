@@ -115,8 +115,7 @@ CREATE TABLE IF NOT EXISTS kv (
 	    fail_count    INTEGER NOT NULL DEFAULT 0,     -- 连续失败次数（成功归零）
 	    proxy_id      INTEGER NOT NULL DEFAULT 0,     -- 绑定的出口，0 = 还没绑
 	    source        TEXT NOT NULL DEFAULT 'manual', -- manual | browser（浏览器登录导入）
-	    profile       TEXT NOT NULL DEFAULT '',       -- browser 来源对应的 Chromium profile 名
-	    authuser      INTEGER NOT NULL DEFAULT 0      -- Google 账号槽位（/u/N/）：0=默认账号
+	    profile       TEXT NOT NULL DEFAULT ''        -- browser 来源对应的 Chromium profile 名
 	);
 CREATE INDEX IF NOT EXISTS idx_accounts_pick ON accounts(status, last_used_at);
 `
@@ -173,14 +172,6 @@ func getDB() *dbx {
 			// 浏览器登录来源（本地增强）：manual | browser + 对应的 Chromium profile
 			_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'`)
 			_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN profile TEXT NOT NULL DEFAULT ''`)
-			_, _ = conn.Exec(`ALTER TABLE accounts ADD COLUMN authuser INTEGER NOT NULL DEFAULT 0`)
-			// 老库回填槽位：扩展把多账号落成 browser1 / browser1-u1 / browser1-u2
-			// 这类 profile 名，后缀 -uN 就是 Google 的 /u/N/ 槽位。ALTER 加列时
-			// 默认全是 0，不回填的话升级后所有行仍然按默认账号请求上游 ——
-			// 表现就是「固定到第二个账号的页面抓取，结果还是请求第一个账号」。
-			_, _ = conn.Exec(`UPDATE accounts SET authuser=CAST(substr(profile, instr(profile, '-u')+2) AS INTEGER)
-				WHERE authuser=0 AND profile LIKE '%-u%'
-				  AND substr(profile, instr(profile, '-u')+2) GLOB '[0-9]*'`)
 			_, _ = conn.Exec(`ALTER TABLE requests DROP COLUMN prompt_preview`)
 			_, _ = conn.Exec(`ALTER TABLE requests DROP COLUMN response_preview`)
 		}
