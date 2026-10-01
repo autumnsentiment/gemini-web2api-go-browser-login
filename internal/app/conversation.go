@@ -26,6 +26,7 @@ type convState struct {
 	sapisid               string // 登录态算 SAPISIDHASH 用；匿名为空
 	isLogin               bool
 	accountID             int64
+	authuser              int // 账号槽位（/u/N/），随会话固定；匿名 0
 	proxyID               int64
 	proxyURL              string
 	updated               time.Time
@@ -272,7 +273,7 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	// 登录态每轮要带 at（XSRF）；匿名不要。
 	xsrf := ""
 	if conv.isLogin && conv.cookie != "" {
-		if tok, err := getXSRF(conv.cookie, proxyURL); err == nil {
+		if tok, err := getXSRF(conv.cookie, proxyURL, conv.authuser); err == nil {
 			xsrf = tok
 		} else {
 			return &StreamResult{ProxyID: p.ID, ProxyName: p.Name, AccountID: conv.accountID},
@@ -330,14 +331,14 @@ func streamGenerateConv(prompt string, mc ModelConfig, conv *convState,
 	if mc.Thinking {
 		thinkVal = thinkingExtended
 	}
-	geminiHeaders := buildGeminiHeaders(conv.cookie, conv.sapisid, mc.HexID)
+	geminiHeaders := buildGeminiHeaders(conv.cookie, conv.sapisid, mc.HexID, conv.authuser)
 	geminiHeaders["x-goog-ext-525001261-jspb"] = buildModelHeader(mc.HexID, mc.Mode, thinkVal, uuid.NewString())
 	geminiHeaders["x-goog-ext-525005358-jspb"] = fmt.Sprintf(`["%s",1]`, reqUUID)
 
 	reqid := time.Now().UnixNano() % 1000000
 	endpoint := fmt.Sprintf(
-		"https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
-		currentBL(proxyURL), reqid)
+		"https://gemini.google.com%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=%s&hl=en&_reqid=%d&rt=c",
+		geminiURLPrefix(conv.authuser), currentBL(proxyURL), reqid)
 
 	tracker := &deltaTracker{}
 	rtracker := &deltaTracker{}
@@ -447,6 +448,7 @@ func callGeminiConv(messages []map[string]interface{}, mc ModelConfig,
 				conv.sapisid = extractSAPISID(a.Cookie)
 				conv.isLogin = true
 				conv.accountID = a.ID
+				conv.authuser = a.AuthUser
 				conv.proxyID = a.ProxyID
 			}
 		}

@@ -9,11 +9,41 @@ function fmtTs(ms) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+function authLabel(n) {
+  const v = Number(n) || 0;
+  return v > 0 ? '/u/' + v : '默认账号 /u/0';
+}
+
+function renderCookieSummary(summary) {
+  if (!summary || typeof summary !== 'object') return '—';
+  return Object.keys(summary).map((name) => {
+    const x = summary[name] || {};
+    return `${name}: ${x.len || 0}`;
+  }).join(' · ') || '—';
+}
+
 function send(type, extra) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(Object.assign({ type }, extra || {}), (r) => {
       if (chrome.runtime.lastError) resolve({ ok: false, detail: chrome.runtime.lastError.message });
       else resolve(r || { ok: false, detail: 'no response' });
+    });
+  });
+}
+
+function popupActiveTab() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, detail: chrome.runtime.lastError.message });
+        return;
+      }
+      const tab = tabs && tabs[0];
+      if (!tab || tab.id == null) {
+        resolve({ ok: false, detail: '扩展弹窗无法读取当前标签页' });
+        return;
+      }
+      resolve({ ok: true, tab });
     });
   });
 }
@@ -53,6 +83,14 @@ async function render() {
   $('lastsync').textContent = fmtTs(c.lastSyncAt);
   $('syncdetail').textContent = (c.lastSyncOk ? '✓ ' : '✗ ') + (c.lastSyncDetail || '—');
 
+  const b = r.bound || {};
+  $('boundState').textContent = b.tab_id ? '已绑定' : (b.detail || '未绑定');
+  $('boundAuth').textContent = b.authuser == null ? '—' : authLabel(b.authuser);
+  $('boundEmail').textContent = b.email || '—';
+  $('boundStore').textContent = b.store_id || '—';
+  $('boundUrl').textContent = b.url || '—';
+  if (!b.tab_id) $('pageDetail').textContent = b.detail || '请先绑定当前 Gemini 页';
+
   // 表单字段只在「用户不在编辑中」时回填，避免覆盖输入
   if (formFrozen()) return;
 
@@ -65,6 +103,29 @@ async function render() {
   $('keepalivePeriodMin').value = c.keepalivePeriodMin || 10;
   $('autoSyncMin').value = c.autoSyncMin || 30;
   $('refreshCooldownSec').value = c.refreshCooldownSec || 120;
+}
+
+async function readPage() {
+  const b = $('btnReadPage');
+  b.disabled = true; b.textContent = '读取中…';
+  try {
+    const r = await send('readPage');
+    if (!r.ok) {
+      $('pageDetail').textContent = r.detail || '读取失败';
+      return r;
+    }
+    const p = r.page || {};
+    $('boundState').textContent = '已绑定 · 未刷新';
+    $('boundAuth').textContent = p.authuser == null ? '—' : authLabel(p.authuser);
+    $('boundUrl').textContent = p.url || '—';
+    $('pageEmail').textContent = (p.email || '页面未暴露邮箱') + (p.account_mismatch ? '（与绑定账号不一致）' : '');
+    $('pageDetail').textContent = r.detail || '已读取';
+    $('cookieFingerprint').textContent = r.cookie_fingerprint ? r.cookie_fingerprint.slice(0, 16) : '—';
+    $('cookieSummary').textContent = renderCookieSummary(r.summary);
+    return r;
+  } finally {
+    b.disabled = false; b.textContent = '只读检查';
+  }
 }
 
 async function save() {
@@ -86,6 +147,41 @@ async function save() {
 }
 
 $('btnSave').addEventListener('click', save);
+$('btnBind').addEventListener('click', async () => {
+  const b = $('btnBind');
+  b.disabled = true; b.textContent = '绑定中…';
+  try {
+    const active = await popupActiveTab();
+    if (!active.ok) {
+      $('pageDetail').textContent = active.detail || '无法读取当前页面';
+      return;
+    }
+    const r = await send('bindCurrentPage', {
+      tabId: active.tab.id,
+      tabUrl: active.tab.url || '',
+      windowId: active.tab.windowId,
+    });
+    $('pageDetail').textContent = r.detail || (r.ok ? '已绑定' : '绑定失败');
+    if (r.ok) await readPage();
+    await render();
+  } finally { b.disabled = false; b.textContent = '绑定当前页'; }
+});
+$('btnReadPage').addEventListener('click', readPage);
+$('btnStatusSync').addEventListener('click', async () => {
+  const b = $('btnStatusSync');
+  b.disabled = true; b.textContent = '同步中…';
+  try {
+    const r = await send('syncStatus');
+    $('pageDetail').textContent = r.ok ? '插件状态已回传服务端' : (r.detail || '状态同步失败');
+    await render();
+  } finally { b.disabled = false; b.textContent = '同步插件状态'; }
+});
+$('btnUnbind').addEventListener('click', async () => {
+  const b = $('btnUnbind');
+  b.disabled = true;
+  try { await send('unbindCurrentPage'); await render(); }
+  finally { b.disabled = false; }
+});
 $('btnKa').addEventListener('click', async () => {
   $('btnKa').disabled = true; $('btnKa').textContent = '保活中…';
   await send('keepalive');

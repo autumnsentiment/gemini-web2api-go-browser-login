@@ -99,7 +99,7 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 	if cookie != a.Cookie {
 		old := a.Cookie
 		updateAccountCookie(a.ID, cookie)
-		invalidateXSRF(old)
+		invalidateXSRF(old, 0)
 	}
 	if len(names) > 0 {
 		logf("[rotate] 账号 #%d 刷新了 %s", a.ID, strings.Join(names, ", "))

@@ -351,6 +351,55 @@
   /* 逐项模式列了 7 个框，窄屏下别把弹窗撑爆 */
   .modal.wide { width: min(620px, 94vw); }
 
+  /* ── 初始化引导 ─────────────────────────────────────────────────────── */
+  .guide-env { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+               gap: 8px; margin: 2px 0 18px; }
+  .guide-env .cell { background: var(--bg); border-radius: 8px; padding: 9px 12px; min-width: 0; }
+  .guide-env .k { font-size: 11.5px; color: var(--muted); }
+  .guide-env .v { font-size: 13px; font-weight: 500; margin-top: 2px; overflow-wrap: anywhere; }
+  .guide-env .v.ok { color: var(--ok); }
+  .guide-env .v.fail { color: var(--fail); }
+  .guide-env .v.warn { color: var(--warn); }
+  .guide-steps { list-style: none; margin: 4px 0 8px; max-width: 860px; }
+  .guide-step { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 14px;
+                position: relative; padding-bottom: 20px; }
+  .guide-step:not(:last-child)::before { content: ""; position: absolute; left: 13px; top: 32px;
+                                         bottom: 4px; width: 2px; background: var(--outline-soft); }
+  .guide-step .dot { width: 28px; height: 28px; border-radius: 50%; display: flex;
+                     align-items: center; justify-content: center; font-size: 12.5px; font-weight: 500;
+                     background: var(--surface-hi); color: var(--muted); }
+  .guide-step .dot svg { width: 16px; height: 16px; fill: currentColor; }
+  .guide-step.done .dot { background: var(--ok-bg); color: var(--ok); }
+  .guide-step.current .dot { background: var(--nav-on-fg); color: #fff; }
+  .guide-step .body { min-width: 0; padding-top: 3px; }
+  .guide-step h3 { font-size: 14px; font-weight: 500; display: flex; gap: 8px; align-items: center;
+                   flex-wrap: wrap; margin-bottom: 4px; }
+  .guide-step p { color: var(--muted); font-size: 12.5px; line-height: 1.7; }
+  .guide-step .mono, .guide-kv .mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .guide-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .guide-actions .btn svg { width: 16px; height: 16px; fill: currentColor; vertical-align: -3px; margin-right: 6px; }
+  .guide-link { font-size: 12px; color: var(--muted); }
+  .guide-link:hover { color: var(--nav-on-fg); }
+  .guide-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr) 32px; gap: 6px 14px;
+              align-items: center; margin-top: 10px; padding: 10px 12px; background: var(--bg);
+              border-radius: 8px; font-size: 12.5px; }
+  .guide-kv .k { color: var(--muted); white-space: nowrap; }
+  .guide-kv .v { min-width: 0; overflow-wrap: anywhere; }
+  .icon-mini { all: unset; box-sizing: border-box; width: 32px; height: 32px; border-radius: 50%;
+               display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+               color: var(--muted); }
+  .icon-mini:hover { background: var(--surface-press); color: var(--text); }
+  .icon-mini:focus-visible { outline: 2px solid var(--g-blue); outline-offset: 1px; }
+  .icon-mini svg { width: 18px; height: 18px; fill: currentColor; }
+  .guide-list { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; font-size: 12.5px; }
+  .guide-list > div { display: flex; gap: 8px; align-items: center; min-width: 0; }
+  .guide-page .segbar { margin-bottom: 18px; }
+  .guide-faq td:first-child { width: 120px; }
+  @media (max-width: 640px) {
+    .guide-kv { grid-template-columns: minmax(0, 1fr) 32px; }
+    .guide-kv .k { grid-column: 1 / -1; margin-top: 4px; }
+    .guide-kv > span:empty { display: none; }
+  }
   @media (max-width: 1100px) { .grid-main { grid-template-columns: 1fr; } }
   @media (max-width: 900px) {
     #app { flex-direction: column; }
@@ -452,7 +501,7 @@ const pages = {
                     title="本地 RPH 限额 ${limit}"></div>` : ''}
                 </div>
                 <div class="slot-note ${noteCls}">${note} · 并发 ${u.inflight}/${u.limit_concurrent || '∞'}
-                  · RPM ${u.rpm}/${u.limit_rpm || '∞'}</div>
+                  · RPM ${u.rpm}/${u.limit_rpm || '∞'} · RPH ${rph}/${u.limit_rph || '∞'}</div>
               </div>`;
             }).join('') || '<div class="empty">还没有任何请求经过</div>'}
           </div>
@@ -710,115 +759,158 @@ const pages = {
   // docker 环境 → 检查浏览器容器；无控制器 → 提示部署或改用本机浏览器 + 扩展。
   // Windows 环境 → 前端探测本机浏览器，引导安装扩展并在登录后立刻抓取。
   guide: async () => {
-    const env = await api('api/browser/env');
-    const st = await api('api/browser/status');
-    const localBrowsers = detectLocalBrowsers();
-    const hasCookie = !!(st && st.profiles && st.profiles.some(p => p.account_id));
-    const kind = env.browser_kind || 'none';
-    const step = (n, title, body) => {
-      const bodyHtml = typeof body === 'string' ? body : body.html;
-      const btn = typeof body === 'object' && body.paramBtn
-        ? `<button class="btn muted" style="margin:6px 0" data-guide-params="${body.paramId}">查看本步参数</button>` : '';
-      return `
-      <div style="display:flex;gap:12px;margin:14px 0">
-        <div style="flex:0 0 26px;height:26px;border-radius:50%;background:var(--nav-on-fg,#0B57D0);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px">${n}</div>
-        <div style="flex:1">
-          <div style="font-weight:500;margin-bottom:4px">${title}</div>
-          <div style="font-size:13px;line-height:1.7;color:var(--muted)">${bodyHtml}</div>
-          ${btn}
-        </div>
-      </div>`;
-    };
-    // 每步的参数表（点「查看本步参数」弹窗展示）。内容来自 2026-09-17 本机 Chrome 实测。
-    const GUIDE_PARAMS = {
-      // 同时喂给弹窗函数（guideShowParams 读 GUIDE_PARAMS_DATA）
+    const [env, st] = await Promise.all([api('api/browser/env'), api('api/browser/status')]);
+    const profiles = (st && st.profiles) || [];
+    const hasContainer = (env.browser_kind || '') === 'docker-chromium';
+    const mode = guideMode || (hasContainer ? 'container' : 'local');
+    const icon = (k) => `<svg viewBox="0 0 24 24" aria-hidden="true">${GUIDE_ICONS[k]}</svg>`;
+
+    // 参数弹窗与常见问题共用这一份数据
+    GUIDE_PARAMS_DATA = {
       install: [
-        { k: '地址栏输入', v: 'chrome://extensions', why: '打开扩展管理页' },
+        { k: '地址栏输入', v: 'chrome://extensions（Edge 为 edge://extensions）', why: '打开扩展管理页' },
         { k: '开发者模式', v: '右上角开关开启', why: '不开就看不到「加载已解压的扩展程序」' },
-        { k: '加载扩展', v: '点「加载未打包的扩展程序」选解压目录', why: '目录里应有 manifest.json / background.js / popup.html / popup.js' },
-        { k: '确认安装', v: '卡片显示 Gemini Cookie Sync 1.1.0（未打包）', why: '开发者模式需保持开启' },
-      ],
-      config: [
-        { k: 'Profile 标识', v: '自定义（如 本机浏览器）', why: '入池后账号显示为 remote:<标识>' },
-        { k: '推送模式', v: '服务端（远程服务器，推荐）', why: '★ 默认是「控制器」，必须手动切换，否则推送失败 —— 最容易踩的坑' },
-        { k: '目标地址', v: 'http://<服务器IP>:8083', why: '本服务监听端口；不是控制器的 9280' },
-        { k: '密钥', v: '面板「设置」页的 API Key（sk-gemini-...）', why: '服务端模式用它鉴权；控制器模式才用共享密钥' },
-        { k: '启用扩展 / 自动保活', v: '勾选（保活 10 分钟、入池 30 分钟为默认）', why: '' },
-        { k: '保存', v: '填完必须点「保存」', why: '不保存推送仍用旧配置' },
-      ],
-      pool: [
-        { k: '确认登录', v: '本机浏览器打开并登录 gemini.google.com', why: '扩展弹窗顶部应显示「已登录 ✓」' },
-        { k: '立即入池', v: '扩展弹窗点「立即入池」', why: 'cookie 推送到服务端入库，并用默认模型自动校验一次' },
-        { k: '成功标志', v: '弹窗显示「cookie 已入库并完成模型校验」', why: 'Cookie 池出现 remote: 前缀的新账号' },
-        { k: '之后无需再管', v: '每 30 分钟自动入池、每 10 分钟自动保活', why: '抓取优先只读不刷新页面；会话失效才刷新重抓' },
+        { k: '加载扩展', v: '选择解压后的目录', why: '目录里应有 manifest.json / background.js / popup.html / popup.js' },
+        { k: '升级扩展', v: '覆盖解压目录后点卡片上的「重新加载」', why: '不用删除重装，绑定和配置会保留' },
       ],
       troubleshoot: [
         { k: '401', v: 'API Key 不对或没保存', why: '重新粘贴密钥并点「保存」' },
-        { k: 'Failed to fetch', v: '地址或端口不可达', why: '检查服务器 IP、端口 8083、防火墙' },
-        { k: '400 bad json', v: '扩展版本过旧', why: '重新下载扩展并重载' },
+        { k: 'Failed to fetch', v: '地址或端口不可达', why: '检查服务器 IP、端口、防火墙' },
+        { k: '409 账号不一致', v: '绑定页的账号与入池时读到的不同', why: '回到该账号的 Gemini 页面重新「绑定当前页」' },
+        { k: '插件休眠', v: '超过 10 分钟没有心跳', why: '在扩展里点「同步插件状态」，或检查推送模式与地址' },
         { k: '校验未通过', v: 'cookie 已入库但模型请求失败', why: '多为出口被 Google 拦（302）；稍后重试或到代理池重置' },
       ],
     };
-    // 弹窗函数从这里取参数表（GUIDE_PARAMS_DATA 声明在引导辅助区）
-    GUIDE_PARAMS_DATA = GUIDE_PARAMS;
-    let body = '';
-    body += step(1, '环境识别',
-      `运行平台：<b>${escapeHtml(env.os || 'unknown')}</b> · ` +
-      (env.in_docker ? '检测到 <b>Docker 容器</b>环境' : '非容器（本机进程）') + ' · ' +
-      `浏览器控制器：${env.has_controller
-          ? (env.controller_ok ? '<b style="color:var(--ok,#188038)">在线</b>' : '<b style="color:var(--fail,#d93025)">离线</b>')
-          : '<b>未配置</b>'}` +
-      (env.running_profiles ? ` · 运行中 profile：${env.running_profiles} 个` : ''));
-    if (kind === 'docker-chromium') {
-      body += step(2, '浏览器容器方案（已就绪）',
-        '服务端已配置浏览器控制器：每个账号对应一个隔离的 Chromium 实例。' +
-        '到「浏览器登录」页点「+ 添加账号」，然后在容器桌面（VNC）里登录 Google，' +
-        '回到面板点「抓取 cookie」即可。抓取会先用默认模型校验，不通过会自动重抓/提示。');
+
+    const ctrl = env.has_controller ? (env.controller_ok ? ['在线', 'ok'] : ['离线', 'fail']) : ['未配置', ''];
+    const envCells = [
+      ['运行平台', env.os || 'unknown', ''],
+      ['部署形态', env.in_docker ? 'Docker 容器' : '本机进程', ''],
+      ['浏览器控制器', ctrl[0], ctrl[1]],
+      ['运行中 profile', String(env.running_profiles || 0), ''],
+      ['Cookie 池', env.pool_has_cookie ? '已有账号' : '为空', env.pool_has_cookie ? 'ok' : 'warn'],
+      ['内置扩展', env.extension_version ? 'v' + env.extension_version : '未内嵌', ''],
+    ];
+    const envHtml = `<div class="guide-env">${envCells.map(([k, v, tone]) => `
+      <div class="cell"><div class="k">${escapeHtml(k)}</div>
+        <div class="v${tone ? ' ' + tone : ''}">${escapeHtml(v)}</div></div>`).join('')}</div>`;
+
+    let steps;
+    if (mode === 'local') {
+      const svc = profiles.filter(p => p.extension_mode === 'service');
+      const extSeen = svc.some(p => Number(p.extension_last_seen_at) > 0);
+      const extOnline = svc.some(p => p.extension_state === 'online');
+      const remote = profiles.filter(p => p.source === 'remote' && p.account_id);
+      const remoteOk = remote.some(p => p.status === 'enabled');
+      const origin = location.origin;
+      steps = [
+        {
+          title: '下载并安装扩展', done: extSeen,
+          html: `<p>从 GitHub Releases 下载扩展 zip 并解压，在浏览器扩展管理页以开发者模式加载。</p>
+            <div class="guide-actions">
+              <a class="btn" href="${EXT_RELEASE_ZIP_URL}" target="_blank" rel="noopener noreferrer">${icon('download')}下载扩展</a>
+              <a class="btn muted" href="${EXT_RELEASES_PAGE_URL}" target="_blank" rel="noopener noreferrer">${icon('external')}发布页</a>
+              <button class="btn muted" data-guide-params="install">安装参数</button>
+              <a class="guide-link" href="api/browser/extension" download title="GitHub 无法访问时使用本服务内置的同版本扩展">从本服务下载</a>
+            </div>`,
+        },
+        {
+          title: '配置推送并保存', done: extOnline,
+          html: `<p>打开扩展弹窗，按下表填写后点「保存」，再点「同步插件状态」。</p>
+            <div class="guide-kv">
+              <span class="k">推送模式</span><span class="v">服务端（远程服务器）</span><span></span>
+              <span class="k">目标地址</span><span class="v mono">${escapeHtml(origin)}</span>
+              <button class="icon-mini" onclick="guideCopy(${escapeHtml(JSON.stringify(origin))})" title="复制目标地址" aria-label="复制目标地址">${icon('copy')}</button>
+              <span class="k">密钥</span><span class="v">设置页的 API Key（sk-gemini-...）</span>
+              <button class="icon-mini" onclick="switchPage('settings')" title="去设置页复制 API Key" aria-label="去设置页">${icon('arrow')}</button>
+              <span class="k">Profile 标识</span><span class="v">自定义，入池后显示为 remote:&lt;标识&gt;</span><span></span>
+            </div>
+            <div class="guide-actions">
+              <button class="btn muted" onclick="browserExtensionSync(this)">${icon('sync')}刷新插件状态</button>
+              <span class="badge ${extOnline ? 'ok' : 'muted'}">${extOnline ? '插件在线' : (extSeen ? '插件休眠' : '尚未收到心跳')}</span>
+            </div>`,
+        },
+        {
+          title: '绑定账号页面并入池', done: remoteOk,
+          html: `<p>在要入池的账号的 Gemini 页面打开扩展，点「绑定当前页」，确认「绑定账号」是该账号邮箱，再点「立即入池」。
+              一个浏览器（或 Chrome 用户资料）只绑定一个账号。</p>
+            ${remote.length ? `<div class="guide-list">${remote.map(p => `
+              <div><span class="badge ${p.status === 'enabled' ? 'ok' : 'muted'}">${p.status === 'enabled' ? '已入池' : '已停用'}</span>
+                <span class="truncate">${escapeHtml(p.label || p.name)}</span>
+                <span class="muted">#${escapeHtml(String(p.account_id))}</span></div>`).join('')}</div>` : ''}
+            <div class="guide-actions">
+              <button class="btn muted" onclick="switchPage('cookies')">${icon('arrow')}查看 Cookie 池</button>
+            </div>`,
+        },
+      ];
     } else {
-      body += step(2, '选择浏览器接入方式', '当前没有可用的服务端浏览器控制器。两个选择：');
-      body += `
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 4px 38px">
-          <button class="btn" onclick="guideDeployBrowser()">部署浏览器容器（服务器端 Chromium）</button>
-          <button class="btn muted" onclick="guideUseLocalBrowser()">使用我电脑上的浏览器（扩展抓取）</button>
-        </div>`;
+      const local = profiles.filter(p => p.source === 'browser' || (!p.source && p.running));
+      const browserOk = profiles.some(p => p.source === 'browser' && p.status === 'enabled');
+      const accessUrl = (env.access_url || '').trim();
+      steps = [
+        {
+          title: '浏览器控制器', done: !!env.controller_ok,
+          html: env.has_controller
+            ? `<p>${env.controller_ok ? '控制器在线，每个账号对应一个隔离的 Chromium profile，空闲时自动休眠。'
+                : '已配置控制器但无法连通，检查 gw2a-browser-controller 服务与 BROWSER_CONTROLLER_URL。'}</p>
+               <p class="mono muted">${escapeHtml(env.controller_url || '')}</p>`
+            : `<p>未配置 BROWSER_CONTROLLER_URL，需要先在服务器部署 Chromium 与控制器。</p>
+               <div class="guide-actions"><button class="btn" onclick="guideDeployBrowser()">部署说明</button></div>`,
+        },
+        {
+          title: '添加账号并登录 Google', done: local.length > 0,
+          html: `<p>在「浏览器登录」页添加账号 profile，然后在容器桌面里登录 Google。</p>
+            <div class="guide-actions">
+              <button class="btn" onclick="switchPage('browser')">${icon('arrow')}去浏览器登录</button>
+              ${accessUrl ? `<a class="btn muted" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开容器桌面</a>` : ''}
+            </div>`,
+        },
+        {
+          title: '抓取 cookie 入池', done: browserOk,
+          html: `<p>登录完成后在「浏览器登录」页点「抓取」。入池后会用默认模型校验一次，之后按队列定时保活和刷新。</p>`,
+        },
+      ];
     }
-    body += step(3, '安装扩展（本机 Chrome / Edge）', {
-      html: '下载扩展 zip 并解压，然后在浏览器扩展管理页加载。' +
-        '<div style="margin-top:8px"><a class="btn muted" href="api/browser/extension" download>下载抓取扩展（zip）</a></div>',
-      paramId: 'install',
+    steps.push({
+      title: '完成', done: !!env.guide_completed,
+      html: `<p>${env.pool_has_cookie ? 'Cookie 池已有可用账号。' : 'Cookie 池还没有账号，完成上面的步骤后再回来。'}</p>
+        <div class="guide-actions">
+          <button class="btn" onclick="guideDone()">${icon('check')}完成引导</button>
+        </div>`,
     });
-    body += step(4, '配置扩展（推送模式 / 地址 / 密钥）', {
-      html: '点浏览器工具栏的扩展图标打开弹窗，按参数表填写并<b>保存</b>。★ 推送模式必须选「服务端」。',
-      paramId: 'config',
-    });
-    body += step(5, '登录 Gemini 并入池', {
-      html: '确保本机浏览器已登录 gemini.google.com，然后点「立即入池」——服务端会用默认模型自动校验一次。',
-      paramId: 'pool',
-    });
-    const troubleshootBtn = hasCookie
-      ? ''
-      : '<button class="btn muted" style="margin:4px 0" data-guide-params="troubleshoot">遇到问题？常见排查</button>';
-    body += step(6, '完成',
-      (hasCookie
-        ? 'Cookie 池已有浏览器来源账号，引导完成。'
-        : '抓取成功后 cookie 会自动进入 Cookie 池，并立即用默认模型校验一次。' + troubleshootBtn)
-      + `
-        <div style="margin-top:10px">
-          <button class="btn" onclick="guideDone()">完成引导</button>
-          <button class="btn muted" onclick="switchPage('browser')">去「浏览器登录」</button>
-        </div>`);
+    const current = steps.findIndex(s => !s.done);
+    const stepsHtml = steps.map((s, i) => {
+      const state = s.done ? 'done' : (i === current ? 'current' : '');
+      const tag = s.done ? '<span class="badge ok">已完成</span>'
+        : (i === current ? '<span class="badge warn">待处理</span>' : '');
+      return `
+        <li class="guide-step ${state}">
+          <span class="dot">${s.done ? icon('check') : i + 1}</span>
+          <div class="body"><h3>${escapeHtml(s.title)} ${tag}</h3>${s.html}</div>
+        </li>`;
+    }).join('');
+    const done = steps.filter(s => s.done).length;
+
     return `
-      <div class="panel page-fill">
+      <div class="panel guide-page">
         <h2>初始化引导
           <span class="controls">
-            <span class="badge ${env.guide_completed ? 'ok' : 'warn'}">${env.guide_completed ? '已完成过' : '未完成'}</span>
+            <span class="badge ${done === steps.length ? 'ok' : 'muted'}">${done}/${steps.length} 步</span>
           </span>
         </h2>
-        <p class="lede">按当前部署环境接入浏览器登录。每一步的参数细节点「查看本步参数」弹窗查看。</p>
-        ${body}
+        ${envHtml}
+        <div class="segbar" role="tablist" aria-label="接入方式">
+          <button role="tab" aria-selected="${mode === 'container'}" class="${mode === 'container' ? 'on' : ''}" onclick="guideSetMode('container')">服务器浏览器容器${hasContainer ? '' : '（未部署）'}</button>
+          <button role="tab" aria-selected="${mode === 'local'}" class="${mode === 'local' ? 'on' : ''}" onclick="guideSetMode('local')">本机浏览器扩展</button>
+        </div>
+        <ol class="guide-steps">${stepsHtml}</ol>
+        <details class="note">
+          <summary>常见问题</summary>
+          <div class="body"><table class="kv guide-faq">${GUIDE_PARAMS_DATA.troubleshoot.map(r => `
+            <tr><td>${escapeHtml(r.k)}</td><td>${escapeHtml(r.v)}<div class="muted">${escapeHtml(r.why)}</div></td></tr>`).join('')}</table></div>
+        </details>
       </div>`;
   },
-
 
   // 浏览器登录：用 Chromium(VNC) 容器里独立 profile 登录 Google/Gemini，
   // 登录态自动抓成 cookie 写入 cookie 池，按「cookie 有效期 - 5 分钟」自动刷新（最长间隔 1 小时）。
@@ -857,16 +949,25 @@ const pages = {
           ? '<span class="badge muted">已休眠</span>'
           : '<span class="badge muted">已停止</span>';
       }
+      const extMode = a.extension_mode || '';
+      const extBadge = a.extension_state === 'online'
+        ? '<span class="badge ok">插件在线</span>'
+        : '<span class="badge muted">插件休眠</span>';
+      const extModeText = extMode === 'service' ? '服务端回传' : (extMode === 'controller' ? '容器回传' : '未回传模式');
+      const canOpenContainer = !!accessUrl &&
+        (extMode === 'controller' || (!extMode && a.source === 'browser'));
       return `
       <tr>
         <td class="nw">${badge}</td>
         <td class="truncate" title="${escapeHtml(a.name)}"><b>${escapeHtml(a.name)}</b>
-          ${a.account_id ? `<div class="muted" style="font-size:12px">cookie 池 #${a.account_id}</div>` : ''}
+          ${a.account_id ? `<div class="muted" style="font-size:12px">cookie 池 #${a.account_id} · ${a.authuser > 0 ? '/u/' + a.authuser : '/u/0'}</div>` : ''}
         </td>
         <td class="nw num">${a.port || '—'}</td>
         <td class="nw">${a.account_id
             ? (a.status === 'enabled' ? '<span class="badge ok">已入池</span>' : '<span class="badge muted">已停用</span>')
-            : '<span class="badge warn">未抓取</span>'}</td>
+            : '<span class="badge warn">未抓取</span>'}
+          <div style="margin-top:4px" title="${escapeHtml(a.extension_last_detail || '')}">${extBadge}
+            <span class="muted" style="font-size:11px">${extModeText}</span></div></td>
         <td class="pre truncate" style="max-width:220px" title="${escapeHtml(a.label || a.name)}">${escapeHtml(a.label || a.name)}</td>
         <td class="nw" style="font-size:12px;color:var(--muted)">${a.last_ok_at ? fmt.ts(a.last_ok_at) : '—'}</td>
         <td class="nw" style="font-size:12px;max-width:200px" title="${escapeHtml(a.last_error || '')}">
@@ -875,7 +976,7 @@ const pages = {
         <td class="nw">
           <span class="actions">
             <button class="btn muted" onclick="browserOpenLogin('${escapeHtml(a.name)}', this)">容器内打开</button>
-            ${accessUrl ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
+            ${canOpenContainer ? `<button class="btn" onclick="browserOpenInUser('${escapeHtml(accessUrl)}', this)">在我的浏览器打开授权页</button>` : ''}
             <button class="btn muted" onclick="browserFetch('${escapeHtml(a.name)}', this)">抓取 cookie</button>
             ${a.running ? `<button class="btn muted" onclick="browserSleep('${escapeHtml(a.name)}', this)" title="立即休眠：抓完不用等空闲计时，直接收掉浏览器进程">休眠</button>` : ''}
             ${a.account_id ? `<button class="btn muted" onclick="browserAccountInPool(${a.account_id})">池中账号</button>` : ''}
@@ -892,6 +993,7 @@ const pages = {
             <span class="badge ${ok ? 'ok' : 'fail'}">${ok ? '控制器在线' : '控制器离线'}</span>
             <button class="btn" onclick="browserAdd()">+ 添加账号</button>
             <button class="btn" onclick="browserRefreshAll(this)">全部刷新</button>
+            <button class="btn muted" onclick="browserExtensionSync(this)">同步插件状态</button>
           </span>
         </h2>
         <details class="note">
@@ -1153,7 +1255,7 @@ const RT_GROUPS = [
       { k: 'per_ip_rpm', label: 'RPM', type: 'int', min: 0, max: 10000,
         hint: '滚动 60 秒窗口上限，0=不限' },
       { k: 'per_ip_rph', label: 'RPH', type: 'int', min: 0, max: 100000,
-        hint: '滚动 1 小时上限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
+        hint: '滚动 1 小时上限，0=不限。实测单出口 80-180 次被拦，默认取下沿 80。按低速率跑可以调高很多——10 次/分钟连打 800 次没被拦过' },
     ],
   },
   {
@@ -1603,6 +1705,24 @@ async function delCookieAcct(id) {
 // GUIDE_PARAMS_DATA 是引导页参数表的唯一数据源：页面渲染时把 GUIDE_PARAMS
 // 序列化进来（guide 函数负责赋值），弹窗函数按 id 取用。
 let GUIDE_PARAMS_DATA = {};
+// 引导页扩展下载：固定指向本仓库最新 Release 的同名资产（发布时上传 gw2a-cookie-sync-extension.zip）。
+const EXT_RELEASES_PAGE_URL = 'https://github.com/autumnsentiment/gemini-web2api-go-browser-login/releases/latest';
+const EXT_RELEASE_ZIP_URL = EXT_RELEASES_PAGE_URL + '/download/gw2a-cookie-sync-extension.zip';
+// 引导页当前选中的接入方式；null 时按环境自动选择。
+let guideMode = null;
+function guideSetMode(m) { guideMode = m; return refreshPage(); }
+async function guideCopy(text) {
+  try { await navigator.clipboard.writeText(text); flash('已复制到剪贴板'); }
+  catch (e) { flash('复制失败，请手动选择'); }
+}
+const GUIDE_ICONS = {
+  download: '<path d="M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z"/>',
+  external: '<path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7h-2v7z"/>',
+  copy: '<path d="M16 1H4a2 2 0 00-2 2v14h2V3h12V1zm3 4H8a2 2 0 00-2 2v14a2 2 0 002 2h11a2 2 0 002-2V7a2 2 0 00-2-2zm0 16H8V7h11v14z"/>',
+  check: '<path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>',
+  sync: '<path d="M12 4V1L8 5l4 4V6a6 6 0 016 6c0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0020 12a8 8 0 00-8-8zm0 14a6 6 0 01-6-6c0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 004 12a8 8 0 008 8v3l4-4-4-4v3z"/>',
+  arrow: '<path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z"/>',
+};
 
 // guideShowParams 用弹窗展示某一步的参数表（title + 三列 k/v/why）。
 function guideShowParams(title, paramId) {
@@ -1646,9 +1766,7 @@ document.addEventListener('click', (e) => {
   if (!t) return;
   const id = t.getAttribute('data-guide-params');
   const titles = {
-    install: '第 3 步参数：安装扩展',
-    config: '第 4 步参数：扩展配置',
-    pool: '第 5 步参数：登录并入池',
+    install: '安装扩展参数',
     troubleshoot: '常见问题排查',
   };
   guideShowParams(titles[id] || '参数', id);
@@ -1683,17 +1801,6 @@ function guideDeployBrowser() {
   });
 }
 
-function guideUseLocalBrowser() {
-  return showVerifyDialog({
-    status: 'guide', model: '', detail: '',
-    hint: '使用你电脑上的浏览器（扩展抓取）步骤：<br>' +
-      '1. 点下方「下载抓取扩展」得到 zip，解压到任意目录；<br>' +
-      '2. Chrome/Edge 打开扩展管理（chrome://extensions 或 edge://extensions）→ 开启「开发者模式」→「加载已解压的扩展程序」选择解压目录；<br>' +
-      '3. 点扩展图标进入设置：控制器地址填本服务地址，Token 填 API Key；<br>' +
-      '4. 打开并登录 https://gemini.google.com —— 扩展会在登录后立刻抓取并推送到本服务；<br>' +
-      '5. 抓取后本服务会自动用默认模型校验一次（302 时会提示重置代理池）。',
-  });
-}
 
 // 浏览器登录（Chromium profile）动作 ──────────────────────────────────────────
 async function browserAdd() {
@@ -1863,6 +1970,19 @@ async function browserRefreshAll(btn) {
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) return flash('刷新失败：' + (j.error || r.status));
     flash(j.detail || '刷新完成');
+    await refreshPage();
+  } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
+}
+
+// 主动探测扩展是否存活；service 模式依赖扩展最近心跳，controller 模式走 CDP。
+async function browserExtensionSync(btn) {
+  const old = btn && btn.textContent; if (btn) { btn.textContent = '同步中…'; btn.disabled = true; }
+  try {
+    const r = await fetch('api/browser/extension-sync', { method: 'POST', credentials: 'include' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) return flash('插件状态同步失败：' + (j.error || r.status));
+    const online = (j.items || []).filter(x => x.state === 'online').length;
+    flash('插件状态已同步：' + online + '/' + (j.items || []).length + ' 在线');
     await refreshPage();
   } finally { if (btn) { btn.textContent = old; btn.disabled = false; } }
 }

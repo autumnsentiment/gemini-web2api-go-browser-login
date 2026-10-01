@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"embed"
+	"encoding/json"
 	"io/fs"
 )
 
@@ -23,6 +24,21 @@ func extEmbedded() bool {
 	}
 	_ = f.Close()
 	return true
+}
+
+// extEmbeddedVersion 返回内嵌扩展 manifest 的版本号，读不到时为空。
+func extEmbeddedVersion() string {
+	data, err := extFS.ReadFile("ext_assets/manifest.json")
+	if err != nil {
+		return ""
+	}
+	var m struct {
+		Version string `json:"version"`
+	}
+	if json.Unmarshal(data, &m) != nil {
+		return ""
+	}
+	return m.Version
 }
 
 // buildExtZip 把内嵌的扩展目录打包成 zip 字节。

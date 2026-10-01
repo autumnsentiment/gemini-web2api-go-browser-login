@@ -40,6 +40,27 @@
   </div>
 
   <div class="card">
+    <div class="row"><span class="k">绑定页面</span><span class="v" id="boundState">未绑定</span></div>
+    <div class="row"><span class="k">绑定账号</span><span class="v mono" id="boundEmail">—</span></div>
+    <div class="row"><span class="k">账号槽位</span><span class="v mono" id="boundAuth">—</span></div>
+    <div class="row"><span class="k">Cookie 存储区</span><span class="v mono" id="boundStore">—</span></div>
+    <div class="row"><span class="k">页面地址</span><span class="v mono" id="boundUrl">—</span></div>
+    <div class="row"><span class="k">页面账号</span><span class="v mono" id="pageEmail">—</span></div>
+    <div class="row"><span class="k">页面读取</span><span class="v mono" id="pageDetail">—</span></div>
+    <div class="btns">
+      <button id="btnBind">绑定当前页</button>
+      <button id="btnReadPage" class="sec">只读检查</button>
+      <button id="btnUnbind" class="sec">解除绑定</button>
+    </div>
+    <div class="btns">
+      <button id="btnStatusSync" class="sec">同步插件状态</button>
+    </div>
+    <div class="hint">在要入池的那个账号的 Gemini 页面点「绑定当前页」，账号以页面实际登录的邮箱为准。不扫描其他账号，不刷新或新建页面。</div>
+    <div class="row"><span class="k">摘要指纹</span><span class="v mono" id="cookieFingerprint">—</span></div>
+    <div class="mono" id="cookieSummary" style="white-space:pre-wrap;max-height:96px;overflow:auto;color:var(--muted)">—</div>
+  </div>
+
+  <div class="card">
     <label class="f">Profile 标识</label>
     <input type="text" id="profile" placeholder="本机浏览器">
     <label class="f">推送模式</label>
@@ -48,7 +69,7 @@
       <option value="controller">控制器（同机/同网 Chromium）</option>
     </select>
     <label class="f">目标地址</label>
-    <input type="text" id="controller" placeholder="http://192.168.5.246:8083">
+    <input type="text" id="controller" placeholder="http://服务器IP:8083">
     <label class="f">密钥（服务端模式填 API Key；控制器模式填共享密钥，可空）</label>
     <input type="text" id="token" placeholder="sk-gemini-...">
 

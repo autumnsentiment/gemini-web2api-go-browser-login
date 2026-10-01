@@ -107,7 +107,16 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 			"last_ok_at": int64(0),
 			"last_error": "",
 			"created_at": int64(0),
+			"source":     "",
+			"authuser":   0,
 		}
+		ext := browserExtStatus(name)
+		view["extension_state"] = ext.State
+		view["extension_mode"] = ext.Mode
+		view["extension_logged_in"] = ext.LoggedIn
+		view["extension_cookie_count"] = ext.CookieCount
+		view["extension_last_seen_at"] = ext.LastSeenAt
+		view["extension_last_detail"] = ext.LastDetail
 		for _, c := range ctrlList {
 			if c["name"] == name {
 				view["port"] = c["port"]
@@ -121,6 +130,8 @@ func handleAdminBrowserStatus(w http.ResponseWriter, r *http.Request) {
 			view["last_ok_at"] = a.LastOkAt
 			view["last_error"] = a.LastError
 			view["created_at"] = a.CreatedAt
+			view["source"] = a.Source
+			view["authuser"] = a.AuthUser
 			if a.Label != "" {
 				view["label"] = a.Label
 			}
@@ -451,17 +462,18 @@ func handleAdminBrowserEnv(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, 200, map[string]interface{}{
-		"in_docker":        inDocker,
-		"os":               runtime.GOOS,
-		"has_controller":   hasController,
-		"controller_ok":    controllerHealthy,
-		"running_profiles": runningProfiles,
-		"browser_kind":     kind,
-		"controller_url":   browserControllerURL(),
-		"access_url":       browserAccessURL(),
-		"extension_ready":  true, // 扩展源码内嵌在本二进制里，见 handleAdminBrowserExtension
-		"pool_has_cookie":  hasCookie(),
-		"guide_completed":  kvGet(kvBrowserGuideDone) == "1",
+		"in_docker":         inDocker,
+		"os":                runtime.GOOS,
+		"has_controller":    hasController,
+		"controller_ok":     controllerHealthy,
+		"running_profiles":  runningProfiles,
+		"browser_kind":      kind,
+		"controller_url":    browserControllerURL(),
+		"access_url":        browserAccessURL(),
+		"extension_ready":   true, // 扩展源码内嵌在本二进制里，见 handleAdminBrowserExtension
+		"extension_version": extEmbeddedVersion(),
+		"pool_has_cookie":   hasCookie(),
+		"guide_completed":   kvGet(kvBrowserGuideDone) == "1",
 	})
 }
 

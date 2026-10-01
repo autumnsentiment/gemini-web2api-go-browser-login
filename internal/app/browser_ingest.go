@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,7 +34,7 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(origin, "chrome-extension://") {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-GW2A-Ext-Mode")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 	}
 	if r.Method == http.MethodOptions {
@@ -50,13 +51,22 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var p struct {
-		Profile   string          `json:"profile"`
-		Cookie    string          `json:"cookie"`
-		LoggedIn  *bool           `json:"logged_in"`
-		Label     string          `json:"label"`
-		Note      string          `json:"note"`
-		UserAgent string          `json:"user_agent"`
-		Client    string          `json:"client"`
+		Profile   string `json:"profile"`
+		Cookie    string `json:"cookie"`
+		LoggedIn  *bool  `json:"logged_in"`
+		Label     string `json:"label"`
+		Note      string `json:"note"`
+		UserAgent string `json:"user_agent"`
+		Client    string `json:"client"`
+		// Account 是扩展上报的 Google 账号槽位（'' / '0' = 默认账号，'1' = /u/1/…）。
+		// 多账号共用同一份 cookie，靠 URL 路径切号（见 authuser.go）。
+		Account string `json:"account"`
+		// PageAuthuser 是扩展从绑定页面 URL 明确解析出的槽位。使用指针
+		// 区分显式上报 0（默认账号）和旧扩展完全没上报该字段。
+		PageAuthuser *int `json:"page_authuser"`
+		// AccountEmail 是扩展从绑定页 WIZ_global_data 读到的账号邮箱（1.1.6+）。
+		// 服务端用它复核 /u/<page_authuser>/app 的实际账号，防止槽位猜错入池。
+		AccountEmail string `json:"account_email"`
 		// Summary 扩展发的是对象（{SID:{len,expires},...}），用 RawMessage
 		// 接住再序列化成字符串存 note，避免类型不匹配 400（2026-09-17 实测）。
 		Summary json.RawMessage `json:"summary"`
@@ -70,6 +80,30 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		profile = "remote1"
 	}
 	profile = sanitizeProfileName(profile)
+	// 旧版多账号扩展把每个 /u/N 槽位伪装成 browser1-uN，导致同一
+	// 浏览器实例不断产生幽灵账号。新扩展只允许一个 profile + 一个显式
+	// 绑定页；旧格式直接拒收，避免污染继续回流。
+	if isLegacyMultiAccountProfile(profile) {
+		logf("[ingest] reject multi-account suffix profile %q (legacy extension)", profile)
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":   "旧版多账号扩展 profile 已拒收，请更新扩展并重新绑定当前页",
+			"profile": profile,
+		})
+		return
+	}
+	// 扩展每次回传都带推送模式头；面板据此自动显示/隐藏「在我的浏览器打开
+	// 授权页」按钮（service = 用户自己的浏览器，controller = 服务器浏览器）。
+	if mode := normalizeExtMode(r.Header.Get("X-GW2A-Ext-Mode")); mode != "" {
+		// 从 summary JSON 对象中统计 cookie 数量，避免硬编码 0 覆盖心跳值
+		ingestCount := 0
+		if len(p.Summary) > 0 && p.Summary[0] == '{' {
+			var sm map[string]json.RawMessage
+			if json.Unmarshal(p.Summary, &sm) == nil {
+				ingestCount = len(sm)
+			}
+		}
+		saveBrowserExtReport(profile, mode, p.LoggedIn != nil && *p.LoggedIn, ingestCount, "cookie 回传")
+	}
 	cookie := strings.TrimSpace(p.Cookie)
 	if cookie == "" {
 		writeJSON(w, 400, map[string]string{"error": "cookie 为空"})
@@ -101,12 +135,50 @@ func handleBrowserIngest(w http.ResponseWriter, r *http.Request) {
 		note += " · summary=" + truncate(string(p.Summary), 400)
 	}
 
+	// 账号槽位：优先使用绑定页面显式上报的 page_authuser；显式的 0
+	// 也必须保留，不能再被旧的 profile/默认值覆盖。
+	authUser := 0
+	if p.PageAuthuser != nil {
+		authUser = *p.PageAuthuser
+		if authUser < 0 || authUser > 9 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "page_authuser 超出 0-9 范围"})
+			return
+		}
+	} else if strings.TrimSpace(p.Account) != "" {
+		raw := strings.TrimSpace(p.Account)
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > 9 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "account 槽位无效"})
+			return
+		}
+		authUser = n
+	} else {
+		authUser = authUserFromProfile(profile)
+	}
+
+	// 入库前复核：同一份 cookie 打开该槽位，页面账号必须就是绑定页那个邮箱。
+	// 槽位不存在会 302 回默认账号、邮箱不一致会被拒，避免把别的账号写进池子。
+	ident, verr := verifySlotIdentity(cookie, authUser, p.AccountEmail)
+	if verr != nil {
+		logf("[ingest] 拒收 profile %q 槽位 %s：%v", profile, authUserLabel(authUser), verr)
+		writeJSON(w, http.StatusConflict, map[string]interface{}{
+			"ok":     false,
+			"error":  "账号复核未通过：" + verr.Error(),
+			"detail": "请在要入池账号的 Gemini 页面重新「绑定当前页」",
+		})
+		return
+	}
+	if ident.Email != "" && !strings.Contains(label, "@") {
+		label = "remote:" + profile + " " + ident.Email
+	}
+
 	// 入库（与容器路径同一套存储逻辑，source 标 remote 以示区分）
-	if err := browserStoreCookieSource(label, profile, cookie, "remote"); err != nil {
+	if err := browserStoreCookieSourceAuthUser(label, profile, cookie, "remote", authUser); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	logf("[ingest] 远程 profile %q cookie 已入库（%d 字节, client=%s）", profile, len(cookie), truncate(p.Client, 30))
+	logf("[ingest] 远程 profile %q cookie 已入库（%d 字节, 槽位 %s, 账号 %s, client=%s）",
+		profile, len(cookie), authUserLabel(authUser), ident.Email, truncate(p.Client, 30))
 
 	// 抓取后模型校验（与容器路径一致：502 重抓提示 / 302 重置代理池）
 	vr := browserVerifyAfterFetch(label, profile, false)
