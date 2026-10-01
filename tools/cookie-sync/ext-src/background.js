@@ -50,10 +50,24 @@ const DEFAULTS = {
   lastRefreshDetail: '',
   lastTabId: 0,          // 复用的 Gemini 标签页（含被重定向到 sorry 页的情况）
   lastTabUrl: '',
+  // 单个扩展实例只绑定一个明确的 Gemini 标签页/账号槽位。
+  boundTabId: 0,
+  boundTabUrl: '',
+  boundAuthuser: 0,
+  // Email read from the bound page itself (WIZ_global_data.oPEP7c). It is
+  // re-checked before every ingest and verified again by the server.
+  boundEmail: '',
+  boundStoreId: '',
+  boundAt: 0,
+  lastReadPageAt: 0,
+  lastReadPageDetail: '',
 };
+
+const CLIENT = 'gw2a-ext/1.1.6-page-identity';
 
 const ALARM_KEEPALIVE = 'gw2a-keepalive';
 const ALARM_SYNC = 'gw2a-sync';
+const ALARM_STATUS = 'gw2a-status';
 const GEMINI_URL = 'https://gemini.google.com/app';
 // 尾部斜杠可选（https://gemini.google.com 不带斜杠也常出现），
 // 否则会对「已存在的 Gemini 页」判 false，转去 tabs.update 甚至新建。
@@ -62,6 +76,84 @@ const GEMINI_URL_RE = /^https:\/\/gemini\.google\.com(\/|$)/;
 // 被 Google 风控拦下时的落地页（www.google.com/sorry/...）。这种页面同样是
 // 「本 profile 的那个 Gemini 标签页」，必须复用而不是另开新页。
 const SORRY_URL_RE = /^https:\/\/(www\.)?google\.com\/sorry\//;
+
+function isGeminiUrl(url) {
+  return GEMINI_URL_RE.test(String(url || ''));
+}
+
+function isGeminiOrSorryUrl(url) {
+  const s = String(url || '');
+  return isGeminiUrl(s) || SORRY_URL_RE.test(s);
+}
+
+/**
+ * Parse an explicit Google account slot from /u/N or ?authuser=N.
+ * Returns null when the URL names no numeric slot (plain /app); the page
+ * session index is then used instead of silently assuming the default.
+ */
+function authuserFromUrl(url) {
+  const s = String(url || '');
+  const m = s.match(/\/u\/(\d+)(?:\/|$)/) || s.match(/[?&]authuser=(\d+)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n >= 0 && n <= 9 ? n : null;
+}
+
+function authuserLabel(n) {
+  return Number(n) > 0 ? '/u/' + Number(n) : '默认账号 /u/0';
+}
+
+function sameEmail(a, b) {
+  return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
+
+/**
+ * Read the signed-in identity of exactly one tab from the page (MAIN world).
+ * WIZ_global_data.oPEP7c is the account email, QrtxK the session index.
+ * No navigation, no reload, no other tabs.
+ */
+async function probePageIdentity(tabId) {
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const w = window.WIZ_global_data || {};
+        const raw = w.QrtxK == null ? '' : String(w.QrtxK);
+        const slot = /^\d$/.test(raw) ? Number(raw) : null;
+        let email = typeof w.oPEP7c === 'string' && w.oPEP7c.indexOf('@') > 0 ? w.oPEP7c : '';
+        if (!email) {
+          const nodes = document.querySelectorAll('a[aria-label*="@"], [data-email]');
+          for (const el of nodes) {
+            const text = (el.getAttribute('data-email') || '') + ' ' + (el.getAttribute('aria-label') || '');
+            const m = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+            if (m) { email = m[0]; break; }
+          }
+        }
+        const body = (document.body && document.body.innerText || '').slice(0, 1200);
+        return {
+          url: location.href,
+          title: document.title || '',
+          email,
+          slot,
+          has_token: typeof w.SNlM0e === 'string' && w.SNlM0e.length > 0,
+          signed_out: /Sign in to save activity|^Sign in$/m.test(body),
+        };
+      },
+    });
+    return (res && res[0] && res[0].result) || { error: '页面没有返回身份信息' };
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
+}
+
+/** An explicit URL slot wins; otherwise use the page's own session index. */
+function resolveSlot(url, probe) {
+  const fromUrl = authuserFromUrl(url);
+  if (fromUrl !== null) return { slot: fromUrl, source: 'url' };
+  if (probe && Number.isInteger(probe.slot)) return { slot: probe.slot, source: 'page' };
+  return { slot: 0, source: 'default' };
+}
 
 // 池里真正需要的 cookie（顺序即写入池的顺序，SAPISID 放最前便于人工核对）
 const COOKIE_ORDER = [
@@ -145,48 +237,75 @@ const READ_URLS = [
   'https://google.com/',
 ];
 
+/** Match the same host/path rules Chrome applies to a request for this URL. */
+function cookieCoversUrl(ck, url) {
+  const host = url.hostname.toLowerCase();
+  const domain = String(ck.domain || '').replace(/^\./, '').toLowerCase();
+  if (ck.hostOnly ? host !== domain : host !== domain && !host.endsWith('.' + domain)) return false;
+  if (ck.secure && url.protocol !== 'https:') return false;
+  const path = ck.path || '/';
+  const target = url.pathname || '/';
+  return target === path || (target.startsWith(path) &&
+    (path.endsWith('/') || target.charAt(path.length) === '/'));
+}
+
 /**
- * 读取 google 域下全部 cookie，返回 name -> cookie 对象。
- *
- * 为什么不能只用 getAll()：Chromium 152 的 chrome.cookies.getAll({domain})
- * 会漏掉 SID / HSID / APISID 这类老式登录 cookie（实测只返回 19 条，
- * 缺的正好是判定登录所必需的那几个），于是 isLoggedIn() 永远为 false。
- * 但 chrome.cookies.get({url, name}) 能逐项取到它们（实测 SID len=153）。
- * 所以：getAll 拿全量打底，再用 get() 把 COOKIE_ORDER 里缺的逐个补齐。
+ * Read only cookies applicable to the bound Gemini URL and its cookie store.
+ * Google accounts in one store may share root-path cookies; the bound URL's
+ * /u/N slot is still required to select the account on upstream requests.
  */
-async function readGoogleCookies() {
+async function readGoogleCookies(storeId, scopedUrl) {
+  const scope = scopedUrl && isGeminiUrl(scopedUrl) ? new URL(scopedUrl) : null;
+  if (scopedUrl && !scope) return new Map();
+  const opts = (base) => {
+    if (!storeId) return base;
+    return Object.assign({}, base, { storeId: String(storeId) });
+  };
   const seen = new Map();
   const score = (x) => (x.domain === '.google.com' ? 2 : 0) + (x.httpOnly ? 2 : 0) + (x.secure ? 1 : 0);
   const put = (ck) => {
     if (!ck || !ck.name) return;
+    if (scope && !cookieCoversUrl(ck, scope)) return;
     const prev = seen.get(ck.name);
     if (!prev) { seen.set(ck.name, ck); return; }
     if (!prev.value && ck.value) { seen.set(ck.name, ck); return; }
+    if (scope) {
+      const prevLength = (prev.path || '/').length;
+      const nextLength = (ck.path || '/').length;
+      if (prevLength !== nextLength) {
+        if (nextLength > prevLength) seen.set(ck.name, ck);
+        return;
+      }
+    }
     if (score(ck) > score(prev)) seen.set(ck.name, ck);
   };
   const push = (list) => { for (const ck of list) put(ck); };
 
-  try { push(await chrome.cookies.getAll({ domain: '.google.com' })); } catch (e) { log('getAll google.com failed', e); }
-  for (const u of READ_URLS) {
-    try { push(await chrome.cookies.getAll({ url: u })); } catch (e) {}
+  const urls = scope ? [scope.href] : READ_URLS;
+  try { push(await chrome.cookies.getAll(opts({ domain: '.google.com' }))); } catch (e) { log('getAll google.com failed', e); }
+  for (const u of urls) {
+    try { push(await chrome.cookies.getAll(opts({ url: u }))); } catch (e) {}
   }
-  try { push(await chrome.cookies.getAll({})); } catch (e) {}
+  if (!scope) {
+    try { push(await chrome.cookies.getAll(opts({}))); } catch (e) {}
+  }
 
-  // 补齐：getAll 在部分 Chromium 版本会漏项，逐项 get() 兜底
-  const missing = COOKIE_ORDER.filter((n) => {
+  // getAll can omit legacy auth cookies or a more specific path. In scoped
+  // mode get({url,name}) must also run for names already seen at path=/.
+  const wanted = scope ? COOKIE_ORDER : COOKIE_ORDER.filter((n) => {
     const ck = seen.get(n);
     return !ck || !ck.value;
   });
-  if (missing.length) {
-    for (const name of missing) {
-      for (const u of READ_URLS) {
+  if (wanted.length) {
+    for (const name of wanted) {
+      for (const u of urls) {
         try {
-          const ck = await chrome.cookies.get({ url: u, name });
+          const ck = await chrome.cookies.get(opts({ url: u, name }));
           if (ck && ck.value) { put(ck); break; }
         } catch (e) {}
       }
     }
-    const still = missing.filter((n) => !(seen.get(n) || {}).value);
+    const still = wanted.filter((n) => !(seen.get(n) || {}).value);
     if (still.length) log('get() 补齐后仍缺:', still.join(','));
   }
   return seen;
@@ -241,46 +360,226 @@ function isLoggedIn(map) {
 
 // ---------------------------------------------------------------- tabs
 
-// GEMINI_ANY_RE 匹配所有「该算作 Gemini 会话页」的 URL：正式站点、以及被
-// Google 风控重定向后的落地页。
-var GEMINI_ANY_RE = /^https:\/\/(gemini\.google\.com|(www\.)?google\.com\/sorry)\//;
+/** Return the cookie store containing a tab. Chrome stores cookies per
+ * profile/incognito store, not per tab; tabIds is the only reliable bridge. */
+async function cookieStoreIdForTab(tabId) {
+  try {
+    if (chrome.cookies.getAllCookieStores) {
+      const stores = await chrome.cookies.getAllCookieStores();
+      for (const store of stores || []) {
+        if ((store.tabIds || []).some((id) => Number(id) === Number(tabId))) {
+          return String(store.id || '');
+        }
+      }
+    }
+  } catch (e) { log('getAllCookieStores failed', e); }
+  return '';
+}
 
 /**
- * 找到「本 profile 的那个 Gemini 标签页」，没有则返回 null（**不创建**）。
- *
- * ★ 2026-09-17 修复「一直新建页面而不是刷新」★
- *
- * 旧实现用 chrome.tabs.query({url:['https://gemini.google.com/*']}) —— 这个
- * URL 过滤有两个致命陷阱，都会让它查不到明明存在的 Gemini 标签页：
- *   1. 标签页正在加载时（status=loading）URL 尚未确定，过滤匹配不上；
- *   2. 页面被风控重定向到 www.google.com/sorry 后不再匹配 gemini 域。
- * 查不到 → 判成「没有 Gemini 页」→ chrome.tabs.create() 又开一个 —— 每次
- * 刷新都多一个窗口，这正是用户看到的「一直创建新页面」。
- *
- * 新实现不用 URL 过滤：查**全部**标签页再本地正则匹配，并依次尝试
- * ① 上次记录的 tabId（最可靠，无论停在哪个 URL 都认）
- * ② URL 匹配 gemini 域或 sorry 落地页
- * ③ 兜底：任何 url 为空的标签页（正在加载的新页也可能属于我们）
+ * Return only the explicitly bound tab. There is deliberately no fallback to
+ * another Gemini tab, no all-tabs scan, and no account-slot probing.
  */
-async function findGeminiTab() {
+async function getBoundGeminiTab() {
   const c = await cfg();
-  // ① 上次记录的 tabId（最可靠：无论它现在停在哪个 URL 都认）
-  const remembered = Number(c.lastTabId) || 0;
-  if (remembered) {
-    try {
-      const t = await chrome.tabs.get(remembered);
-      if (t && t.id != null) return t;
-    } catch (e) { /* 已被关掉 */ }
+  // Only an explicit binding is authoritative. `lastTabId` is historical
+  // refresh state and must never resurrect a page after unbind/reload.
+  const id = Number(c.boundTabId) || 0;
+  if (!id) return { ok: false, detail: '未绑定 Gemini 页面' };
+  let tab;
+  try {
+    tab = await chrome.tabs.get(id);
+  } catch (e) {
+    return { ok: false, detail: '绑定页面已关闭，请重新绑定' };
   }
-  // ② 查全部标签页本地匹配（避免 URL 过滤在 loading 状态下漏判）
-  let all = [];
-  try { all = await chrome.tabs.query({}); } catch (e) { return null; }
-  const matched = all.filter((t) => t && t.id != null && GEMINI_ANY_RE.test(t.url || ''));
-  if (matched.length) {
-    matched.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-    return matched[0];
+  const url = String((tab && tab.url) || '');
+  if (!isGeminiOrSorryUrl(url)) {
+    return { ok: false, detail: '绑定页面已离开 Gemini，请重新绑定', tab, url };
   }
+  const currentStoreId = await cookieStoreIdForTab(id);
+  const boundAuthuser = Number.isInteger(Number(c.boundAuthuser)) ? Number(c.boundAuthuser) : 0;
+  // Only an explicit /u/N in the current URL can contradict the binding;
+  // a plain /app URL is resolved from the page at bind/ingest time.
+  const urlSlot = authuserFromUrl(url);
+  const currentAuthuser = urlSlot === null ? boundAuthuser : urlSlot;
+  if (currentAuthuser !== boundAuthuser) {
+    return {
+      ok: false,
+      detail: '绑定页面账号槽位已改变（原 ' + authuserLabel(boundAuthuser) +
+        '，当前 ' + authuserLabel(currentAuthuser) + '），请重新绑定',
+      tab, url, authuser: currentAuthuser,
+    };
+  }
+  const boundStoreId = String(c.boundStoreId || '');
+  if (boundStoreId && currentStoreId && boundStoreId !== currentStoreId) {
+    return {
+      ok: false,
+      detail: '绑定页面的 Cookie 存储区已改变，请重新绑定',
+      tab, url, authuser: currentAuthuser, store_id: currentStoreId,
+    };
+  }
+  return { ok: true, tab, url, authuser: boundAuthuser, email: String(c.boundEmail || ''),
+    storeId: boundStoreId || currentStoreId };
+}
+
+async function findGeminiTab() {
+  const bound = await getBoundGeminiTab();
+  return bound.ok ? bound.tab : null;
+}
+
+/**
+ * Return the one tab that was active when the popup was opened. Some Chrome
+ * builds report the extension popup context as `lastFocusedWindow`, so try
+ * the popup's current window first and then the last focused normal window.
+ * We never query all tabs or choose an inactive Gemini page.
+ */
+async function getPopupActiveTab() {
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tabs && tabs[0] && tabs[0].id != null) return tabs[0];
+  } catch (e) {}
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (tabs && tabs[0] && tabs[0].id != null) return tabs[0];
+  } catch (e) {}
+  try {
+    const win = await chrome.windows.getLastFocused({ populate: true });
+    if (win && win.type === 'normal') {
+      const tab = (win.tabs || []).find((item) => item && item.active && item.id != null);
+      if (tab) return tab;
+    }
+  } catch (e) {}
   return null;
+}
+
+/** Bind the explicit popup tab only. This function never navigates or reloads it. */
+async function bindCurrentPage(request) {
+  const requestedId = Number(request && (request.tabId || request.tab_id)) || 0;
+  let tab = null;
+  if (requestedId) {
+    try {
+      tab = await chrome.tabs.get(requestedId);
+    } catch (e) {
+      return { ok: false, detail: '弹窗传入的目标页面已关闭，请回到 Gemini 页面重试' };
+    }
+  } else {
+    tab = await getPopupActiveTab();
+  }
+  const url = String((tab && tab.url) || '');
+  if (!tab || tab.id == null) {
+    return { ok: false, detail: '没有获取到当前活动标签页，请在 Gemini 页面重新打开扩展弹窗' };
+  }
+  if (!isGeminiUrl(url)) {
+    return {
+      ok: false,
+      detail: '当前活动页面不是 Gemini 页面，未绑定（当前地址：' + (url || '不可读取') + '）',
+      url,
+      tab_id: tab.id,
+    };
+  }
+  const probe = await probePageIdentity(tab.id);
+  if (probe.error) {
+    return { ok: false, detail: '无法读取页面账号（' + probe.error + '），请刷新该 Gemini 页后重试', url, tab_id: tab.id };
+  }
+  if (probe.signed_out || !probe.has_token) {
+    return { ok: false, detail: '该页面未登录 Gemini（页面没有会话令牌），未绑定', url, tab_id: tab.id };
+  }
+  if (!probe.email) {
+    return { ok: false, detail: '页面未暴露账号邮箱，无法确认是哪个账号，未绑定', url, tab_id: tab.id };
+  }
+  const resolved = resolveSlot(url, probe);
+  if (resolved.source === 'url' && Number.isInteger(probe.slot) && probe.slot !== resolved.slot) {
+    return {
+      ok: false,
+      detail: '页面地址是 ' + authuserLabel(resolved.slot) + '，但页面会话是 ' +
+        authuserLabel(probe.slot) + '，请在该账号自己的页面上绑定',
+      url, tab_id: tab.id,
+    };
+  }
+  const authuser = resolved.slot;
+  const storeId = await cookieStoreIdForTab(tab.id);
+  const patch = {
+    boundTabId: tab.id,
+    boundTabUrl: url,
+    boundAuthuser: authuser,
+    boundEmail: probe.email,
+    boundStoreId: storeId,
+    boundAt: Date.now(),
+    lastTabId: tab.id,
+    lastTabUrl: url,
+  };
+  const c = await setCfg(patch);
+  const page = await inspectBoundPage();
+  return {
+    ok: true, config: c, page,
+    detail: '已绑定 ' + probe.email + '（' + authuserLabel(authuser) +
+      (resolved.source === 'page' ? '，由页面识别' : '') + '）',
+  };
+}
+
+async function unbindCurrentPage() {
+  const c = await setCfg({
+    boundTabId: 0,
+    boundTabUrl: '',
+    boundAuthuser: 0,
+    boundEmail: '',
+    boundStoreId: '',
+    boundAt: 0,
+    lastTabId: 0,
+    lastTabUrl: '',
+  });
+  return { ok: true, config: c, detail: '已解除页面绑定' };
+}
+
+/** Read visible identity from the bound page without navigation or reload. */
+async function inspectBoundPage() {
+  const bound = await getBoundGeminiTab();
+  if (!bound.ok) return { ok: false, detail: bound.detail, url: bound.url || '' };
+  const probe = await probePageIdentity(bound.tab.id);
+  const mismatch = !!(probe.email && bound.email && !sameEmail(probe.email, bound.email));
+  return {
+    ok: true,
+    tab_id: bound.tab.id,
+    url: bound.url,
+    authuser: bound.authuser,
+    store_id: bound.storeId || '',
+    email: probe.email || '',
+    bound_email: bound.email || '',
+    page_slot: Number.isInteger(probe.slot) ? probe.slot : null,
+    account_mismatch: mismatch,
+    has_token: !!probe.has_token,
+    title: probe.title || '',
+    signed_out: !!probe.signed_out,
+    error: probe.error || null,
+  };
+}
+
+/** Read the bound page and the shared cookie jar, never refreshing the page. */
+async function readCurrentPage() {
+  const page = await inspectBoundPage();
+  if (!page.ok) {
+    await setCfg({ lastReadPageAt: Date.now(), lastReadPageDetail: page.detail || '读取失败' });
+    return page;
+  }
+  const map = await readGoogleCookies(page.store_id || '', page.url);
+  const logged = isLoggedIn(map);
+  const cookie = buildCookieHeader(map);
+  const fingerprint = cookie.header ? await sha1Hex(cookie.header) : '';
+  const detail = page.signed_out
+    ? '绑定页显示未登录'
+    : page.account_mismatch
+      ? '绑定页账号已变为 ' + page.email + '（绑定时是 ' + page.bound_email + '），请重新绑定'
+      : '已读取绑定页，不刷新；' + (page.email || '页面未暴露邮箱') + ' · ' + authuserLabel(page.authuser);
+  await setCfg({ lastReadPageAt: Date.now(), lastReadPageDetail: detail });
+  return {
+    ok: true,
+    page,
+    logged_in: logged,
+    cookie_count: map.size,
+    summary: cookieSummary(map),
+    cookie_fingerprint: fingerprint,
+    detail,
+  };
 }
 /** 等某个标签页加载完成（或超时）。 */
 function waitTabComplete(tabId, timeoutMs) {
@@ -299,59 +598,31 @@ function waitTabComplete(tabId, timeoutMs) {
   });
 }
 
-/**
- * 让 Gemini 页面「刷新」一次，而不是新开页面。
- *
- *   - 已有 gemini 标签页 → chrome.tabs.reload()（同一标签、同一会话）
- *   - 没有标签页（首次）→ 才创建 1 个（pinned），之后一直复用它
- *   - 距上次刷新不足 refreshCooldownSec 秒 → 直接返回 refreshed=false，
- *     调用方只能在冷却窗口里提取 cookie，不允许再导航
- */
+/** Refresh only the bound tab. No binding means no navigation and no new tab. */
 async function refreshGeminiTab(force) {
   const c = await cfg();
   const cd = cooldownMs(c);
   const last = Number(c.lastRefreshAt) || 0;
   const since = Date.now() - last;
+  const bound = await getBoundGeminiTab();
+  if (!bound.ok) return { refreshed: false, error: bound.detail, tab: bound.tab };
   if (!force && last && since < cd) {
-    return { refreshed: false, cooldown_left_ms: cd - since, tab: await findGeminiTab() };
+    return {
+      refreshed: false,
+      cooldown_left_ms: cd - since,
+      tab: bound.tab,
+      authuser: bound.authuser,
+    };
   }
-
-  let tab = await findGeminiTab();
-  let created = false;
-  if (!tab) {
-    // ★ 2026-09-17：创建前再做一次「宽口径」检查 ★
-    // 只有确认整个浏览器里**一个标签页都没有**（全新窗口）时才创建；
-    // 只要有任何标签页，就复用它导航到 gemini —— 用户看到的是「页面跳转」
-    // 而不是「又开一个窗口」。这是「一直新建页面」的最后一道保险：
-    // findGeminiTab 依赖 URL 匹配，而 URL 在 loading 状态下可能为空。
-    let anyTab = null;
-    try {
-      const all = await chrome.tabs.query({});
-      anyTab = (all || []).find((t) => t && t.id != null) || null;
-    } catch (e) { /* ignore */ }
-    if (anyTab) {
-      tab = anyTab;
-      created = false; // 复用现有标签页，只是把 URL 指过去
-    } else {
-      try {
-        tab = await chrome.tabs.create({ url: GEMINI_URL, active: false, pinned: true });
-        created = true;
-      } catch (e) {
-        return { refreshed: false, error: '创建标签页失败: ' + e.message };
-      }
-    }
-  }
+  const tab = bound.tab;
 
   // 先记时间戳：整个加载 + 冷却窗口内都不允许再次刷新
   await setCfg({ lastRefreshAt: Date.now() });
 
   try {
-    if (!created) {
-      // 已经在 Gemini 页（含无尾斜杠、含 /app 子路径）→ reload；
-      // 否则导航过去（同一标签页，不新开窗口）。
-      if (GEMINI_URL_RE.test(tab.url || '')) await chrome.tabs.reload(tab.id);
-      else await chrome.tabs.update(tab.id, { url: GEMINI_URL });
-    }
+    // The tab was validated above. Reloading a sorry page is still limited to
+    // the same tab; we never navigate it to a different account or URL.
+    await chrome.tabs.reload(tab.id);
   } catch (e) {
     await setCfg({ lastRefreshDetail: '刷新失败: ' + e.message });
     return { refreshed: false, error: '刷新失败: ' + e.message, tab };
@@ -362,16 +633,21 @@ async function refreshGeminiTab(force) {
   let finalUrl = '';
   try { const t = await chrome.tabs.get(tab.id); finalUrl = (t && t.url) || ''; } catch (e) {}
   const sorry = SORRY_URL_RE.test(finalUrl);
+  const finalSlot = authuserFromUrl(finalUrl);
+  if (!sorry && finalSlot !== null && finalSlot !== bound.authuser) {
+    await setCfg({ lastRefreshDetail: '刷新后页面账号槽位改变，停止自动处理' });
+    return { refreshed: false, error: '刷新后页面账号槽位改变，请重新绑定', tab };
+  }
   await setCfg({
     lastTabId: tab.id,
     lastTabUrl: finalUrl,
-    lastRefreshDetail: (created ? '首次创建页面' : '刷新页面')
+    lastRefreshDetail: '刷新绑定页面'
       + (sorry ? '（被风控重定向到 sorry 页，本轮只提取 cookie）' : '')
       + ' @ ' + new Date().toISOString(),
   });
-  log('refresh gemini tab', tab.id, created ? '(首次创建)' : '(reload)',
+  log('refresh bound gemini tab', tab.id, '(reload)',
       sorry ? '[sorry 页]' : '');
-  return { refreshed: true, created, sorry, tab };
+  return { refreshed: true, created: false, sorry, tab, authuser: bound.authuser };
 }
 
 /**
@@ -379,14 +655,14 @@ async function refreshGeminiTab(force) {
  * __Secure-1PSIDTS 写回 cookie store，所以这里以 3 秒为间隔轮询，
  * 直到拿到完整登录 cookie 或窗口耗尽。整个过程中不做任何导航。
  */
-async function collectWithinCooldown(maxMs) {
+async function collectWithinCooldown(maxMs, storeId, scopedUrl) {
   const budget = Math.max(3000, maxMs || 60000);
   const deadline = Date.now() + budget;
-  let map = await readGoogleCookies();
+  let map = await readGoogleCookies(storeId, scopedUrl);
   if (isLoggedIn(map)) return { map, waited_ms: 0, exhausted: false };
   while (Date.now() < deadline) {
     await sleep(3000);
-    map = await readGoogleCookies();   // 每次调用都会刷新 SW 的空闲计时
+    map = await readGoogleCookies(storeId, scopedUrl);   // 每次调用都会刷新 SW 的空闲计时
     if (isLoggedIn(map)) {
       return { map, waited_ms: budget - Math.max(0, deadline - Date.now()), exhausted: false };
     }
@@ -431,7 +707,8 @@ async function keepalive(manual) {
       }
     }
 
-    const map = await readGoogleCookies();
+    const bound = await getBoundGeminiTab();
+    const map = bound.ok ? await readGoogleCookies(bound.storeId, bound.url) : new Map();
     const logged = isLoggedIn(map);
     const detail = (r.refreshed
       ? '已刷新页面'
@@ -500,6 +777,12 @@ async function sync(reason, _internal) {
   if (!c.enabled && reason !== 'manual' && reason !== 'host') {
     return { ok: false, detail: '扩展已停用' };
   }
+  const bound = await getBoundGeminiTab();
+  if (!bound.ok) {
+    const detail = bound.detail || '未绑定 Gemini 页面，进入休眠';
+    await setCfg({ lastSyncAt: Date.now(), lastSyncOk: false, lastSyncDetail: detail });
+    return { ok: false, detail };
+  }
   const own = !_internal;                 // 内部调用（keepalive）不重复加锁
   if (own) {
     if (!acquireBusy()) return { ok: false, detail: '上一轮任务仍在进行' };
@@ -509,7 +792,7 @@ async function sync(reason, _internal) {
     const last = Number(c.lastRefreshAt) || 0;
     const since = Date.now() - last;
     let refreshed = false;
-    let map = await readGoogleCookies();
+    let map = await readGoogleCookies(bound.storeId, bound.url);
     let logged = isLoggedIn(map);
 
     if (!logged || since >= cd) {
@@ -518,12 +801,12 @@ async function sync(reason, _internal) {
       const r = await refreshGeminiTab(false);
       refreshed = !!r.refreshed;   // 冷却未过时 r.refreshed=false，只提取不导航
       if (refreshed) {
-        const got = await collectWithinCooldown(cd);
+        const got = await collectWithinCooldown(cd, bound.storeId, bound.url);
         map = got.map;
         logged = isLoggedIn(map);
         if (got.exhausted && !logged) log('冷却窗口内仍未取到登录 cookie');
       } else {
-        map = await readGoogleCookies();
+        map = await readGoogleCookies(bound.storeId, bound.url);
         logged = isLoggedIn(map);
       }
     } else {
@@ -543,9 +826,29 @@ async function sync(reason, _internal) {
       await forceRotateCookies();
       await setCfg({ lastRotateAt: Date.now() });
       await sleep(800);                       // 等 Set-Cookie 落盘
-      map = await readGoogleCookies();
+      map = await readGoogleCookies(bound.storeId, bound.url);
     }
 
+    const current = await getBoundGeminiTab();
+    if (!current.ok || current.tab.id !== bound.tab.id || current.authuser !== bound.authuser) {
+      return { ok: false, detail: '绑定页面已改变，本轮未入池；请重新绑定当前页' };
+    }
+    const identity = await probePageIdentity(bound.tab.id);
+    if (!bound.email) {
+      const r = { ok: false, detail: '绑定记录缺少账号邮箱（旧版绑定），请重新点「绑定当前页」' };
+      await setCfg({ lastSyncAt: Date.now(), lastSyncOk: false, lastSyncDetail: r.detail });
+      return r;
+    }
+    if (!identity.email) {
+      const r = { ok: false, detail: '读不到绑定页的账号（' + (identity.error || '页面未暴露邮箱') + '），本轮未入池' };
+      await setCfg({ lastSyncAt: Date.now(), lastSyncOk: false, lastSyncDetail: r.detail });
+      return r;
+    }
+    if (!sameEmail(identity.email, bound.email)) {
+      const r = { ok: false, detail: '绑定页账号已变为 ' + identity.email + '，本轮未入池；请重新绑定' };
+      await setCfg({ lastSyncAt: Date.now(), lastSyncOk: false, lastSyncDetail: r.detail });
+      return r;
+    }
     const { header } = buildCookieHeader(map);
     const sapisid = (map.get('SAPISID') || {}).value || '';
     const ts = Math.floor(Date.now() / 1000);
@@ -556,9 +859,16 @@ async function sync(reason, _internal) {
     const profile = await profileName();
 
     const payload = {
+      // Google 多账号共用 cookie jar，真正决定账号的是绑定页的 URL 槽位。
+      account: String(bound.authuser),
+      page_authuser: bound.authuser,
+      bound_tab_id: bound.tab.id,
+      bound_url: bound.url,
+      // Server re-checks that /u/<page_authuser>/app really is this account.
+      account_email: bound.email,
       profile,
       reason: reason || 'auto',
-      url: GEMINI_URL,
+      url: bound.url,
       ts,
       cookie: header,
       sapisidhash,
@@ -567,7 +877,7 @@ async function sync(reason, _internal) {
       logged_in: true,
       user_agent: navigator.userAgent,
       summary: cookieSummary(map),
-      client: 'gw2a-ext/1.0.5',
+      client: CLIENT,
     };
 
     // ── 推送目标（两种模式，2026-09-17 新增远程模式）────────────────────
@@ -586,8 +896,10 @@ async function sync(reason, _internal) {
     try {
       const headers = { 'Content-Type': 'application/json' };
       if (mode === 'service') {
+        headers['X-GW2A-Ext-Mode'] = mode;
         if (c.token) headers['Authorization'] = 'Bearer ' + c.token;
       } else if (c.token) {
+        headers['X-GW2A-Ext-Mode'] = mode;
         headers['X-GW2A-Token'] = c.token;
       }
       const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
@@ -621,12 +933,53 @@ async function sync(reason, _internal) {
   }
 }
 
-// ---------------------------------------------------------------- alarms
+// ---------------------------------------------------------------- status + alarms
+
+/** Send a lightweight liveness report. This never refreshes or navigates the
+ * bound page; it only reads the bound store and tells the server the mode. */
+async function reportExtensionStatus(detail) {
+  const c = await cfg();
+  if (!c.enabled) return { ok: false, detail: '扩展已停用' };
+  // Liveness must not depend on a binding: an unbound extension is still
+  // alive, it just has nothing to capture. Report it as logged_in=false.
+  const bound = await getBoundGeminiTab();
+  const map = bound.ok ? await readGoogleCookies(bound.storeId, bound.url) : new Map();
+  const mode = c.pushMode === 'service' ? 'service' : 'controller';
+  const base = (c.controller || '').replace(/\/+$/, '');
+  const url = mode === 'service'
+    ? base + '/api/browser/extension-status'
+    : base + '/extension-status';
+  const headers = { 'Content-Type': 'application/json', 'X-GW2A-Ext-Mode': mode };
+  if (mode === 'service' && c.token) headers.Authorization = 'Bearer ' + c.token;
+  if (mode === 'controller' && c.token) headers['X-GW2A-Token'] = c.token;
+  const payload = {
+    profile: await profileName(),
+    push_mode: mode,
+    logged_in: bound.ok && isLoggedIn(map),
+    cookie_count: map.size,
+    account: bound.ok ? String(bound.authuser) : '',
+    page_authuser: bound.ok ? bound.authuser : null,
+    bound_tab_id: bound.ok ? bound.tab.id : 0,
+    bound_url: bound.ok ? bound.url : '',
+    account_email: bound.ok ? (bound.email || '') : '',
+    detail: bound.ok ? (detail || '扩展状态心跳') : ((detail || '扩展状态心跳') + '（' + (bound.detail || '未绑定') + '）'),
+    client: CLIENT,
+  };
+  try {
+    const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+    const body = await resp.text();
+    if (!resp.ok) return { ok: false, http: resp.status, detail: body.slice(0, 180) };
+    return { ok: true, http: resp.status };
+  } catch (e) {
+    return { ok: false, detail: String((e && e.message) || e) };
+  }
+}
 
 async function ensureAlarms() {
   const c = await cfg();
   await chrome.alarms.clear(ALARM_KEEPALIVE);
   await chrome.alarms.clear(ALARM_SYNC);
+  await chrome.alarms.clear(ALARM_STATUS);
   if (!c.enabled) return;
   if (c.autoKeepalive) {
     chrome.alarms.create(ALARM_KEEPALIVE, {
@@ -637,6 +990,10 @@ async function ensureAlarms() {
   chrome.alarms.create(ALARM_SYNC, {
     delayInMinutes: 1,
     periodInMinutes: Math.max(1, Number(c.autoSyncMin) || 30),
+  });
+  chrome.alarms.create(ALARM_STATUS, {
+    delayInMinutes: 0.5,
+    periodInMinutes: 5,
   });
 }
 
@@ -650,6 +1007,9 @@ chrome.alarms.onAlarm.addListener(async (a) => {
       // 保活关闭时退化为直接 sync。
       if (c.enabled && c.autoKeepalive) await keepalive(false);
       else await sync('alarm');
+    } else if (a.name === ALARM_STATUS) {
+      const r = await reportExtensionStatus('定时状态心跳');
+      if (!r.ok && r.detail && !/扩展已停用/.test(r.detail)) log('status heartbeat failed', r);
     }
   } catch (e) { log('alarm error', e); }
 });
@@ -659,24 +1019,28 @@ chrome.alarms.onAlarm.addListener(async (a) => {
 chrome.runtime.onInstalled.addListener(async (d) => {
   log('installed', d.reason);
   await ensureAlarms();
-  try { await sync('installed'); } catch (e) {}
+  // Installation/reload must never navigate an existing Gemini page. The
+  // user explicitly starts capture with bind/read/sync from the popup.
 });
 
 chrome.runtime.onStartup.addListener(async () => {
   await ensureAlarms();
   try { await keepalive(false); } catch (e) {}
+  try { await reportExtensionStatus('扩展启动状态'); } catch (e) {}
 });
 
 // gemini 页面加载完成时顺手同步（登录后立刻入池）。
 // 注意：sync 内部有 60 秒冷却保护，这里不会引起连环刷新。
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   if (info.status !== 'complete') return;
-  if (!tab || !GEMINI_URL_RE.test(tab.url || '')) return;
+  const bound = await getBoundGeminiTab();
+  if (!bound.ok || !tab || tabId !== bound.tab.id) return;
+  if (!isGeminiUrl(tab.url || '')) return;
   if (BUSY) return;                       // 自己刷新引起的加载，直接忽略
   try {
     const c = await cfg();
     if (!c.enabled) return;
-    const map = await readGoogleCookies();
+    const map = await readGoogleCookies(bound.storeId, bound.url);
     if (isLoggedIn(map)) await sync('page-load');
   } catch (e) { log('onUpdated sync error', e); }
 });
@@ -687,14 +1051,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       switch (msg && msg.type) {
         case 'status': {
           const c = await cfg();
-          const map = await readGoogleCookies();
+          const bound = await getBoundGeminiTab();
+          const map = bound.ok ? await readGoogleCookies(bound.storeId, bound.url) : new Map();
           const last = Number(c.lastRefreshAt) || 0;
           const cd = cooldownMs(c);
           sendResponse({
             ok: true, config: c, logged_in: isLoggedIn(map),
             cookie_count: map.size, summary: cookieSummary(map),
             cooldown_left_ms: Math.max(0, cd - (Date.now() - last)),
-            tabs: (await chrome.tabs.query({ url: ['https://gemini.google.com/*'] })).length,
+            bound: bound.ok ? {
+              tab_id: bound.tab.id,
+              url: bound.url,
+              authuser: bound.authuser,
+              store_id: bound.storeId || '',
+              email: bound.email || '',
+              detail: '已绑定 ' + (bound.email ? bound.email + ' · ' : '') + authuserLabel(bound.authuser),
+            } : { tab_id: 0, url: '', authuser: null, detail: bound.detail },
           });
           break;
         }
@@ -705,8 +1077,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'keepalive':
           sendResponse(await keepalive(true));
           break;
+        case 'bindCurrentPage':
+          sendResponse(await bindCurrentPage(msg));
+          break;
+        case 'unbindCurrentPage':
+          sendResponse(await unbindCurrentPage());
+          break;
+        case 'readPage':
+          sendResponse(await readCurrentPage());
+          break;
         case 'sync':
           sendResponse(await sync('manual'));
+          break;
+        case 'syncStatus':
+          sendResponse(await reportExtensionStatus('用户手动同步状态'));
           break;
         default:
           sendResponse({ ok: false, detail: 'unknown message ' + (msg && msg.type) });
@@ -729,7 +1113,7 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
       if (cfgPatch) await setCfg(cfgPatch);
       switch (msg && msg.type) {
         case 'ping':
-          sendResponse({ ok: true, pong: true, client: 'gw2a-ext/1.0.5' });
+          sendResponse({ ok: true, pong: true, client: CLIENT });
           break;
         case 'keepalive':
           sendResponse(await keepalive(true));
@@ -739,11 +1123,14 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
           break;
         case 'status': {
           const c = await cfg();
-          const map = await readGoogleCookies();
+          const bound = await getBoundGeminiTab();
+          const map = bound.ok ? await readGoogleCookies(bound.storeId, bound.url) : new Map();
           const cd = cooldownMs(c);
           sendResponse({
             ok: true, config: c, logged_in: isLoggedIn(map), cookie_count: map.size,
             cooldown_left_ms: Math.max(0, cd - (Date.now() - (Number(c.lastRefreshAt) || 0))),
+            bound: bound.ok ? { tab_id: bound.tab.id, url: bound.url, authuser: bound.authuser,
+              store_id: bound.storeId || '' } : { detail: bound.detail },
           });
           break;
         }

@@ -1234,7 +1234,7 @@ func browserCDPHost() string {
 
 // browserStoreCookie 把抓到的 cookie 写进 accounts 表（容器抓取路径，source=browser）。
 func browserStoreCookie(label, profile, cookie string) error {
-	return browserStoreCookieSource(label, profile, cookie, "browser")
+	return browserStoreCookieSourceAuthUser(label, profile, cookie, "browser", 0)
 }
 
 // browserStoreCookieSource 把 cookie 写进 accounts 表。
@@ -1247,29 +1247,37 @@ func browserStoreCookie(label, profile, cookie string) error {
 // 去重：最新写入获胜（source 跟随最新来源），同 profile 其它行合并删除
 // （与服务器侧 pool.py 的策略一致）。
 func browserStoreCookieSource(label, profile, cookie, source string) error {
+	return browserStoreCookieSourceAuthUser(label, profile, cookie, source, 0)
+}
+
+// browserStoreCookieSourceAuthUser stores one browser-managed session for a
+// profile and one Google account slot. Google multi-account tabs share the
+// cookie jar, so authuser is part of the account identity even when the cookie
+// string is identical across slots.
+func browserStoreCookieSourceAuthUser(label, profile, cookie, source string, authuser int) error {
 	if source == "" {
 		source = "browser"
 	}
 	var id int64
 	var prevSource string
 	err := getDB().QueryRow(
-		`SELECT id, source FROM accounts WHERE profile=? ORDER BY id DESC LIMIT 1`,
-		profile).Scan(&id, &prevSource)
+		`SELECT id, source FROM accounts WHERE profile=? AND authuser=? ORDER BY id DESC LIMIT 1`,
+		profile, authuser).Scan(&id, &prevSource)
 	if err == nil && id > 0 {
 		// 更新 cookie，并清错误/失败；source 跟随最新写入的来源
 		_, e := getDB().Exec(
 			`UPDATE accounts SET cookie=?, label=?, note=CASE WHEN ?<>'' THEN note ELSE note END,
-			     last_ok_at=?, last_error='', fail_count=0, source=?,
+				 last_ok_at=?, last_error='', fail_count=0, source=?, authuser=?,
 			     last_used_at=last_used_at
 			 WHERE id=?`,
-			cookie, strings.TrimSpace(label), "", time.Now().Unix(), source, id)
+			cookie, strings.TrimSpace(label), "", time.Now().Unix(), source, authuser, id)
 		if e != nil {
 			return e
 		}
 		logf("[browser] profile %q cookie 已刷新 -> 账号 #%d（source=%s，原 %s）", profile, id, source, prevSource)
 		// 合并同 profile 的其它历史行（比如两条路径各自建过一行）
 		if _, e := getDB().Exec(
-			`DELETE FROM accounts WHERE profile=? AND id<>?`, profile, id); e != nil {
+			`DELETE FROM accounts WHERE profile=? AND authuser=? AND id<>?`, profile, authuser, id); e != nil {
 			logf("[browser] 合并 profile %q 旧记录失败: %v", profile, e)
 		}
 		return nil
@@ -1283,13 +1291,13 @@ func browserStoreCookieSource(label, profile, cookie, source string) error {
 		label = profile
 	}
 	nid, e := insertID(
-		`INSERT INTO accounts(label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile)
-		 VALUES (?,?,'enabled',?,?,?,'',0,0,0,?,?)`,
-		strings.TrimSpace(label), cookie, note, time.Now().Unix(), time.Now().Unix(), source, profile)
+		`INSERT INTO accounts(label, cookie, status, note, created_at, last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile, authuser)
+		 VALUES (?,?,'enabled',?,?,?,'',0,0,0,?,?,?)`,
+		strings.TrimSpace(label), cookie, note, time.Now().Unix(), time.Now().Unix(), source, profile, authuser)
 	if e != nil {
 		return e
 	}
-	logf("[browser] profile %q cookie 已入库 -> 新账号 #%d（source=%s）", profile, nid, source)
+	logf("[browser] profile %q cookie 已入库 -> 新账号 #%d（槽位 %s, source=%s）", profile, nid, authUserLabel(authuser), source)
 	return nil
 }
 
@@ -1302,7 +1310,7 @@ func browserDeleteByProfile(profile string) {
 func browserAccounts() []BrowserAccount {
 	rows, err := getDB().Query(
 		`SELECT id, label, cookie, status, note, created_at, last_used_at, last_ok_at,
-		        last_error, fail_count, proxy_id, profile, source
+		        last_error, fail_count, proxy_id, profile, source, authuser
 		 FROM accounts WHERE source IN ('browser','remote') ORDER BY id`)
 	if err != nil {
 		return nil
@@ -1314,7 +1322,7 @@ func browserAccounts() []BrowserAccount {
 		var prof, src string
 		if err := rows.Scan(&a.ID, &a.Label, &a.Cookie, &a.Status, &a.Note,
 			&a.CreatedAt, &a.LastUsedAt, &a.LastOkAt, &a.LastError,
-			&a.FailCount, &a.ProxyID, &prof, &src); err != nil {
+			&a.FailCount, &a.ProxyID, &prof, &src, &a.AuthUser); err != nil {
 			continue
 		}
 		a.Profile = prof

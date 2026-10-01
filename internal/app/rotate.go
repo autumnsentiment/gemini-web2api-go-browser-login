@@ -60,6 +60,10 @@ var rotateInitRe = regexp.MustCompile(`init\('([^']{4,64})'\s*,\s*([0-9.]+)\s*,[
 // rotateAccount 给一个账号做一次保活：先刷 1PSIDTS，再刷 SIDCC。
 // 返回服务端建议的下次间隔，以及这一轮实际刷新的 cookie 名。
 func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
+	if browserManagedCookie(a) {
+		return defaultRotateInterval, nil, nil
+	}
+
 	proxyURL := ""
 	if a.ProxyID > 0 {
 		proxyURL = proxyURLByID(a.ProxyID)
@@ -95,7 +99,7 @@ func rotateAccount(a CookieAccount) (time.Duration, []string, error) {
 	if cookie != a.Cookie {
 		old := a.Cookie
 		updateAccountCookie(a.ID, cookie)
-		invalidateXSRF(old)
+		invalidateXSRF(old, 0)
 	}
 	if len(names) > 0 {
 		logf("[rotate] 账号 #%d 刷新了 %s", a.ID, strings.Join(names, ", "))

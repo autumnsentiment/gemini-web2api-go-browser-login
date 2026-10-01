@@ -107,6 +107,26 @@ if (BROWSER_PROXY) {
 // ── Cookie 池写入（扩展 → 控制器 → 容器 SQLite）──────────────────────────
 const POOL_PY = process.env.GW2A_POOL_PY || '/opt/gw2a-cookie-sync/pool.py';
 const PY = process.env.GW2A_PYTHON || '/usr/bin/python3';
+
+// 账号槽位解析：Google 多账号靠 URL 的 /u/N/ 切号（cookie 是共用的）。
+// 扩展显式上报的 account 优先；没带就从 profile 名的 -uN 后缀推断。
+function accountToAuthUser(account, profile) {
+  const s = String(account == null ? '' : account).trim();
+  if (s) {
+    const n = parseInt(s, 10);
+    if (!isNaN(n) && n >= 0 && n <= 9) return n;
+  }
+  const m = /-u(\d+)$/.exec(String(profile || '').trim());
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (!isNaN(n) && n >= 0 && n <= 9) return n;
+  }
+  return 0;
+}
+
+function isLegacyMultiAccountProfile(profile) {
+  return /-u\d+$/.test(String(profile || '').trim());
+}
 const GW2A_API = (process.env.GW2A_API || 'http://127.0.0.1:8083').replace(/\/+$/, '');
 const GW2A_ADMIN_TOKEN = process.env.GW2A_ADMIN_TOKEN || '';
 // 浏览器所用出口在 gemini-web2api 代理表里的 id（0 = 自动按 URL 匹配）
@@ -267,8 +287,28 @@ async function handleCookieSync(body, clientIp) {
 
   const cookie = (body && body.cookie || '').trim();
   const profile = (body && body.profile || 'browser1').trim();
+  if (isLegacyMultiAccountProfile(profile)) {
+    syncLog('reject multi-account suffix profile ' + profile + ' (legacy extension)');
+    return { error: '旧版多账号 profile 已拒收，请更新扩展并绑定当前页', code: 409 };
+  }
   if (!cookie) return { error: 'cookie 为空' };
   if (!/SAPISID=/.test(cookie)) return { error: 'cookie 缺少 SAPISID，未登录或抓取不完整' };
+
+  // 扩展回传的推送模式（controller/service）同步给服务端 kv，
+  // 面板据此决定「在我的浏览器打开授权页」按钮是否显示。
+  const extMode = (body && (body._mode || body.push_mode || 'controller')) || 'controller';
+  const summary = body && body.summary;
+  const cookieCount = summary && typeof summary === 'object' ? Object.keys(summary).length : 0;
+  const extStatus = await runPool('ext_status', {
+    profile: profile,
+    mode: extMode,
+    logged_in: !(body && body.logged_in === false),
+    cookie_count: cookieCount,
+    detail: 'cookie-sync 回传',
+  });
+  if (extStatus && extStatus.error) {
+    syncLog('ext_status 记录失败（不影响入池）: ' + extStatus.error);
+  }
 
   // ★ 扩展 v1.1.0 起会上报真实登录态（以页面 SNlM0e 为准）。
   // 会话被 Google 判匿名时，cookie 名字仍然齐、有效期还很长，但服务端不认；
@@ -283,9 +323,15 @@ async function handleCookieSync(body, clientIp) {
 
   const label = (body && body.label) || ('browser:' + profile);
   const note = (body && body.note) || ('auto by extension @ ' + new Date().toISOString() + ' (' + (body && body.reason || 'auto') + ')');
+  // 账号槽位：扩展上报 body.account（'' = 默认账号 / '1' = /u/1/ …）。
+  // Google 多账号共用同一份 cookie，切号靠 URL 的 /u/N/，所以入池必须带上槽位，
+  // 否则池里所有行都是 authuser=0，服务端永远只请求默认账号 —— 用户固定到
+  // 第二个账号页面抓取，池里那行却仍然按默认账号请求，表现为「没抓新账号」。
+  // profile 名（browser1-u1）也能推断，两条都算，account 优先。
+  const authuser = accountToAuthUser(body && body.account, profile);
   const up = await runPool('upsert', {
     profile: profile, label: label, note: note,
-    cookie: cookie, source: 'browser',
+    cookie: cookie, source: 'browser', authuser: authuser,
   });
   if (up && up.error) { syncLog('upsert 失败: ' + up.error); return { error: '入池失败: ' + up.error }; }
 
@@ -742,11 +788,19 @@ const server = http.createServer(async (req, res) => {
     if (p === '/cookie-sync' && req.method === 'POST') {
       const body = await readJSON(req);
       const tok = body._token || req.headers['x-gw2a-token'] || '';
+      const extMode = req.headers['x-gw2a-ext-mode'] || body.push_mode || '';
       const sock = req.socket || {};
       const ip = sock.remoteAddress || (sock.socket && sock.socket.remoteAddress) || '';
-      const out = await handleCookieSync(Object.assign({}, body, { _token: tok }), ip);
+      const out = await handleCookieSync(Object.assign({}, body, { _token: tok, _mode: extMode }), ip);
       if (out && out.error) return send(res, out.code || 400, out);
       return send(res, 200, out);
+    }
+    if (p === '/extension-status' && req.method === 'POST') {
+      const body = await readJSON(req);
+      const mode = req.headers['x-gw2a-ext-mode'] || body.mode || body.push_mode || 'controller';
+      const out = await runPool('ext_status', Object.assign({}, body, { mode: mode }));
+      if (out && out.error) return send(res, 400, out);
+      return send(res, 200, { ok: true, mode: mode });
     }
     if (p === '/cookie-pool' && req.method === 'GET') {
       const list = await runPool('list', {});

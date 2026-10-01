@@ -100,8 +100,9 @@ func Run() {
 	getDB()
 	initRuntimeConfig() // 面板改过的运行时配置盖在启动配置之上
 	loadProxies()
-	seedProxiesFromConfig() // --proxy / 遗留静态代理并进代理池
-	seedCookiesFromConfig() // --cookie-file / 遗留单 cookie 并进 cookie 池
+	seedProxiesFromConfig()   // --proxy / 遗留静态代理并进代理池
+	seedCookiesFromConfig()   // --cookie-file / 遗留单 cookie 并进 cookie 池
+	purgeLegacySlotProfiles() // 清掉旧版多账号扩展留下的 profile-uN 幽灵账号与状态
 	resolvedAPIKey := initAPIKey(*apiKey)
 	initTokenizer()
 	startScheduler()
@@ -141,6 +142,27 @@ func Run() {
 	// /v1/videos —— OpenAI(Sora) 形状的异步视频生成。POST 建任务，GET 轮询，GET .../content 下 MP4。
 	mux.HandleFunc("/v1/videos", requireAPIKey(handleCreateVideo))
 	mux.HandleFunc("/v1/videos/", requireAPIKey(handleVideoItem))
+	// /v1/images/* —— OpenAI 图像 API 形状，内部转 chat 链（见 images.go）。
+	mux.HandleFunc("/v1/images/generations", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "OPTIONS":
+			handleOptions(w, r)
+		case "POST":
+			handleImageGenerations(w, r)
+		default:
+			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		}
+	}))
+	mux.HandleFunc("/v1/images/edits", requireAPIKey(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "OPTIONS":
+			handleOptions(w, r)
+		case "POST":
+			handleImageEdits(w, r)
+		default:
+			writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		}
+	}))
 	// MCP over HTTP（Streamable HTTP）：跟 OpenAI 接口同进程同端口，暴露 web_search。
 	// 用同一把 API key 鉴权，客户端配 Authorization: Bearer <key> 连这个 URL。
 	mux.HandleFunc("/mcp", requireAPIKey(handleMCPHTTP))
@@ -177,6 +199,7 @@ func Run() {
 		mux.HandleFunc("/admin/api/browser/access-url", requireAuth(handleAdminBrowserAccessURL))
 		mux.HandleFunc("/admin/api/browser/guide-done", requireAuth(handleAdminBrowserGuideDone))
 		mux.HandleFunc("/admin/api/browser/extension", requireAuth(handleAdminBrowserExtension))
+		mux.HandleFunc("/admin/api/browser/extension-sync", requireAuth(handleAdminBrowserExtensionSync))
 		// 远程浏览器扩展推送 cookie。OPTIONS 预检必须免鉴权（浏览器发预检时
 		// 不带 Authorization，被拦的话扩展 fetch 直接 Failed to fetch），CORS
 		// 头与 OPTIONS 响应在 handleBrowserIngest 内处理；实际 POST 仍需 API key。
@@ -186,6 +209,13 @@ func Run() {
 				return
 			}
 			requireAPIKey(handleBrowserIngest)(w, r)
+		})
+		mux.HandleFunc("/api/browser/extension-status", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodOptions {
+				handleBrowserExtensionStatus(w, r)
+				return
+			}
+			requireAPIKey(handleBrowserExtensionStatus)(w, r)
 		})
 		mux.HandleFunc("/admin/api/test", requireAuth(handleAdminTest))
 	}

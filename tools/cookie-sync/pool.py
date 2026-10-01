@@ -2,12 +2,13 @@
 """gemini-web2api cookie 池读写助手（宿主机侧，直接操作容器共享的 SQLite）。
 
 子命令：
-  upsert   从 stdin 读 JSON {profile,label,cookie,note,source}，按 (source,profile)
+  upsert   从 stdin 读 JSON {profile,label,cookie,note,source,authuser}，按 (source,profile,authuser)
            找到既有账号则更新 cookie（保号），否则新增；同时删除该 profile 的
-           其它历史记录（只留最新一条）。输出 JSON {id, action, removed}
+           其它同槽位历史记录（只留最新一条）。输出 JSON {id, action, removed}
   set_ok   从 stdin 读 JSON {id}：标记账号可用（status=enabled, last_ok_at=now, fail_count=0）
   set_fail 从 stdin 读 JSON {id,error}：标记账号失败（last_error, fail_count+1）
   set_proxy 从 stdin 读 JSON {id,proxy_id}：把账号绑定到指定出口（0=直连）
+  ext_status 从 stdin 读 JSON {profile,mode,logged_in,cookie_count,detail}：记录扩展心跳/模式到 kv
   list     列出浏览器来源的账号（不含完整 cookie）
   get      从 stdin 读 JSON {id}：输出该账号（含 cookie）
 
@@ -49,41 +50,50 @@ def cmd_upsert():
     label = (d.get("label") or "").strip()
     note = (d.get("note") or "").strip()
     source = (d.get("source") or "browser").strip()
+    authuser = int(d.get("authuser") or 0)
+    # Defense in depth: old extensions represented Google URL slots as
+    # separate profiles (browser1-u1 ... -u9), creating phantom accounts.
+    import re
+    if re.search(r"-u\d+$", profile):
+        print(json.dumps({"error": "reject multi-account suffix profile"}))
+        return 2
     if not cookie:
         print(json.dumps({"error": "empty cookie"}))
         return 2
     con = connect()
     try:
-        # 2026-09-17: dedupe by profile globally, not per-source.
-        # Same profile may be pushed by both the remote extension (source=remote)
-        # and the server controller (source=browser) - same login, two paths,
-        # not two accounts. Newest write wins; other rows for this profile merge.
+        # 2026-09-24: dedupe by (profile, authuser).
+        # Google multi-account shares the same cookie; switching accounts is via
+        # /u/N/ URL. Extension writes different profiles per slot (browser1-u1).
+        # Adding authuser prevents different slots on the same base profile
+        # (fallback case) from overwriting each other.
         row = con.execute(
-            "SELECT id FROM accounts WHERE profile=? "
-            "ORDER BY id DESC LIMIT 1", (profile,)).fetchone()
+            "SELECT id FROM accounts WHERE profile=? AND authuser=? "
+            "ORDER BY id DESC LIMIT 1",
+            (profile, authuser)).fetchone()
         t = now()
         if row:
             aid = row[0]
             con.execute(
                 "UPDATE accounts SET cookie=?, label=?, note=?, status='enabled', "
-                "last_error='', last_ok_at=?, fail_count=0 WHERE id=?",
-                (cookie, label, note, t, aid))
+                "last_error='', last_ok_at=?, fail_count=0, authuser=? WHERE id=?",
+                (cookie, label, note, t, authuser, aid))
             action = "updated"
         else:
             cur = con.execute(
                 "INSERT INTO accounts (label, cookie, status, note, created_at, "
-                "last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile) "
-                "VALUES (?,?,'enabled',?,?,0,?,'',0,0,?,?)",
-                (label, cookie, note, t, t, source, profile))
+                "last_used_at, last_ok_at, last_error, fail_count, proxy_id, source, profile, authuser) "
+                "VALUES (?,?,'enabled',?,?,0,?,'',0,0,?,?,?)",
+                (label, cookie, note, t, t, source, profile, authuser))
             aid = cur.lastrowid
             action = "inserted"
-        # 清掉同一 profile 的其它历史记录：每次抓取只保留最新一条，
-        # 否则池子里会堆一串同账号的旧 cookie（有的已失效），轮询到就报错。
+        # 清掉同一 profile 同槽位的其它历史记录。不同槽位是不同账号，不能误删。
         removed = con.execute(
-            "DELETE FROM accounts WHERE profile=? AND id<>?",
-            (profile, aid)).rowcount
+            "DELETE FROM accounts WHERE profile=? AND authuser=? AND id<>?",
+            (profile, authuser, aid)).rowcount
         print(json.dumps({"id": aid, "action": action, "profile": profile,
-                          "cookie_len": len(cookie), "ts": t, "removed": removed}))
+                          "authuser": authuser, "cookie_len": len(cookie),
+                          "ts": t, "removed": removed}))
         return 0
     finally:
         con.close()
@@ -122,6 +132,40 @@ def cmd_set_proxy():
     finally:
         con.close()
 
+def cmd_ext_status():
+    d = read_stdin_json()
+    profile = (d.get("profile") or "").strip()
+    mode = str(d.get("mode") or "controller").strip().lower()
+    if mode not in ("controller", "service"):
+        mode = "controller"
+    if not profile:
+        print(json.dumps({"error": "empty profile"}))
+        return 2
+    import re
+    if re.search(r"-u\d+$", profile):
+        # Legacy multi-account extensions reported one fake profile per slot.
+        print(json.dumps({"error": "reject multi-account suffix profile"}))
+        return 2
+    t = now()
+    con = connect()
+    try:
+        rows = {
+            "ext_mode:" + profile: mode,
+            "ext_seen_at:" + profile: str(t),
+            "ext_logged_in:" + profile: "1" if d.get("logged_in") else "0",
+            "ext_cookie_count:" + profile: str(int(d.get("cookie_count") or 0)),
+        }
+        detail = str(d.get("detail") or "")[:300]
+        if detail:
+            rows["ext_last_detail:" + profile] = detail
+        for k, v in rows.items():
+            con.execute("INSERT INTO kv (k, v) VALUES (?, ?) "
+                        "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        print(json.dumps({"ok": True, "profile": profile, "mode": mode, "ts": t}))
+        return 0
+    finally:
+        con.close()
+
 def cmd_list():
     con = connect()
     try:
@@ -156,6 +200,7 @@ def cmd_get():
 CMDS = {
     "upsert": cmd_upsert, "set_ok": cmd_set_ok, "set_fail": cmd_set_fail,
     "set_proxy": cmd_set_proxy,
+    "ext_status": cmd_ext_status,
     "list": cmd_list, "get": cmd_get,
 }
 

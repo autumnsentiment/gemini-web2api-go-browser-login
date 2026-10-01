@@ -19,8 +19,8 @@ const uploadHost = "https://push.clients6.google.com/upload/"
 //
 // 匿名也能传成功，但传上去的文件在对话里引用会被回 1100，所以调用方要自己确保有 cookie。
 // proxyURL 必须跟正式请求同一出口，否则在 Google 眼里是两个会话共用文件。
-func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string, error) {
-	pushID, pctx, err := getUploadTokens(cookie, proxyURL)
+func uploadBytes(cookie, proxyURL string, authuser int, data []byte, filename string) (string, error) {
+	pushID, pctx, err := getUploadTokens(cookie, proxyURL, authuser)
 	if err != nil {
 		return "", fmt.Errorf("取上传页面参数失败: %w", err)
 	}
@@ -29,14 +29,15 @@ func uploadBytes(cookie, proxyURL string, data []byte, filename string) (string,
 	}
 
 	base := map[string]string{
-		"Origin":         "https://gemini.google.com",
-		"Referer":        "https://gemini.google.com/",
-		"X-Tenant-Id":    "bard-storage",
-		"Push-ID":        pushID,
-		"Accept":         "*/*",
-		"Sec-Fetch-Site": "same-site",
-		"Sec-Fetch-Mode": "cors",
-		"Sec-Fetch-Dest": "empty",
+		"Origin":          "https://gemini.google.com",
+		"Referer":         geminiRootURL(authuser),
+		"X-Tenant-Id":     "bard-storage",
+		"X-Goog-AuthUser": authUserHeaderValue(authuser),
+		"Push-ID":         pushID,
+		"Accept":          "*/*",
+		"Sec-Fetch-Site":  "same-site",
+		"Sec-Fetch-Mode":  "cors",
+		"Sec-Fetch-Dest":  "empty",
 	}
 	if pctx != "" {
 		base["X-Client-Pctx"] = pctx

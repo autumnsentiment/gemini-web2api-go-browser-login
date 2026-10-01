@@ -24,7 +24,7 @@ func TestModelHeader(t *testing.T) {
 		if mc.HexID != c.wantHex {
 			t.Errorf("%s: hex=%s want %s", c.name, mc.HexID, c.wantHex)
 		}
-		h := buildGeminiHeaders("", "", mc.HexID)
+		h := buildGeminiHeaders("", "", mc.HexID, 0)
 		got := h["x-goog-ext-525001261-jspb"]
 		want := `[1,null,null,null,"` + c.wantHex + `"]`
 		if got != want {
