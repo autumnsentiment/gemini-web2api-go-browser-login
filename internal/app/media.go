@@ -242,6 +242,7 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 	var dlURLs []string
 	var lastBody string
 	var pollErrs int
+	var textOnlySince time.Time
 	for i := 0; i < maxPolls; i++ {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			logf("[media] 轮询到总预算上限，停止（已轮询 %d/%d）", i, maxPolls)
@@ -253,6 +254,11 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 			logf("[media] 轮询 %d/%d 失败: %v", i+1, maxPolls, err)
 		} else {
 			lastBody = body
+			// 每 5 轮打一行进度，排查「一直等不到」时能看出上游是在生成中还是回了错误码。
+			if i%5 == 0 {
+				logf("[media] 轮询 %d/%d cid=%s bodyLen=%d generating=%v",
+					i+1, maxPolls, cid, len(body), strings.Contains(body, "generating your video"))
+			}
 			if picked := pickResponseDataURLs(collectDownloadURLs(body)); len(picked) > 0 {
 				dlURLs = picked
 				break
@@ -260,6 +266,22 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 			// 视频被内容政策拒时 hNvQHb 里是「I can't generate that video」，别干等到超时。
 			if strings.Contains(body, "can't generate that video") {
 				return nil, fmt.Errorf("视频被内容政策拒绝（换个 prompt 再试）")
+			}
+			// 回复已落库（有 rc_ 候选）但既没有视频任务也没有「生成中」：模型把它当
+			// 普通对话回了一段文字（prompt 不像视频请求，如「hi」/渠道测试），
+			// 不会再出视频，别空等 8 分钟。
+			// 实测正常视频请求刚提交时 hNvQHb 也可能短暂是这个形状（「生成中」还没
+			// 写进历史），所以要连续 60 秒以上都是纯文字才判定，免得误杀。
+			if videoTextOnlyReply(body) {
+				if textOnlySince.IsZero() {
+					textOnlySince = time.Now()
+				}
+			} else {
+				textOnlySince = time.Time{}
+			}
+			if !textOnlySince.IsZero() && time.Since(textOnlySince) >= 60*time.Second {
+				_ = os.WriteFile("/tmp/hnv_textonly_"+cid+".txt", []byte(body), 0644)
+				return nil, fmt.Errorf("上游没有启动视频生成，只回复了文字（prompt 需要明确描述要生成的视频画面）")
 			}
 		}
 		time.Sleep(interval)
@@ -329,6 +351,18 @@ func fetchDownloadArtifacts(cid, cookie, sapisid, xsrf, proxyURL, defaultMime st
 		}
 	}
 	return arts, nil
+}
+
+// videoTextOnlyReply 判断 hNvQHb 历史里这轮回复是不是纯文字（没启动视频任务）。
+// 生成中会带「generating your video」，完成后带 video_generation 工具标记，
+// 两者都没有、但已有回复候选（rc_）时才算纯文字。
+func videoTextOnlyReply(body string) bool {
+	if !strings.Contains(body, "\"rc_") {
+		return false
+	}
+	return !strings.Contains(body, "generating your video") &&
+		!strings.Contains(body, "video_generation") &&
+		!strings.Contains(body, "video_gen_chip")
 }
 
 // protobufVarint 解析一个 varint，返回 (值, 下一偏移)。

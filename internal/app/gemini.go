@@ -708,7 +708,15 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		//
 		// 判据是**有没有内容帧**，不是 BardErrorInfo：正常响应的结束帧里也带错误码
 		// （1096 = 会话未持久化），拿它判错会把每个正常响应都判成失败。
-		if !hasContentFrame(string(raw)) {
+		// 视频例外（2026-10-01 线上实测）：Veo 改成纯异步后，StreamGenerate 只回
+		// 会话 id + 标题（约 1KB），正文「I'm generating your video」挪到了 hNvQHb
+		// 历史里。这种响应没有内容帧，但视频其实已经在生成 —— 把它当空响应重试
+		// 只会再提交一个视频任务。拿到会话 id 就放行，交给下面的产物轮询。
+		videoAccepted := mc.Tool == toolVideo && extractConversationID(string(raw)) != ""
+		if videoAccepted && !hasContentFrame(string(raw)) {
+			logf("[media] 视频请求已受理（无正文帧，异步生成），转入产物轮询 cid=%s", extractConversationID(string(raw)))
+		}
+		if !hasContentFrame(string(raw)) && !videoAccepted {
 			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
 			if pickedOK {
 				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
@@ -777,6 +785,8 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 				result.Artifacts = arts
 				logf("[media] 取回 %d 份产物", len(arts))
 			}
+			// 总耗时要含产物轮询（视频大头在这），否则请求记录里只看到几秒。
+			result.TotalMs = time.Since(t0).Milliseconds()
 		}
 		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
 		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
