@@ -47,6 +47,11 @@ type Config struct {
 	// 匿名优先（#20）：这次请求不需要登录态能力（纯文本、非思考、无工具、无图）时
 	// 不占用 cookie 账号，走匿名省额度；需要登录才挑号。默认 false。见 modelNeedsLogin。
 	AnonFirst bool `json:"anon_first"`
+	// 临时对话（#34）：发请求时塞 inner[45]=1，走 Gemini 网页端原生「临时对话」——
+	// 会话不进账号的会话列表、不用于训练，天然取代 auto_delete_conversation（无需再发删除
+	// RPC）。只登录态有意义（匿名本就不落账号）。与 multi_turn 冲突：multi_turn 开着时不发，
+	// 见 temporaryChatEligible。默认 false。
+	TemporaryChat bool `json:"temporary_chat"`
 
 	// ── 浏览器登录（Chromium CDP）本地增强 ────────────────────────────────
 	// BrowserControllerURL: controller.js 的 HTTP 基址（如 http://172.21.0.1:9280），
@@ -75,7 +80,7 @@ func defaultConfig() Config {
 		RetryAttempts:  3,
 		RetryDelaySec:  2,
 		RequestTimeout: 180,
-		GeminiBL:       "boq_assistant-bard-web-server_20260525.09_p0",
+		GeminiBL:       "boq_gemini-web-uiserver_20261007.01_p0",
 		DefaultModel:   "gemini-3.6-flash",
 		LogRequests:    true,
 		CookieFile:     "",
@@ -102,6 +107,7 @@ func defaultConfig() Config {
 		MultiTurn:              false,
 		AutoDeleteConversation: false,
 		AnonFirst:              false,
+		TemporaryChat:          false,
 		BrowserRefreshMinutes:  10,
 		MediaUseAutoBL:         true,
 	}

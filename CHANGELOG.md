@@ -2,6 +2,31 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 4.22.0-browser-login.1
+
+### 同步上游（zexadev/gemini-web2api-go 4.20.2 → 4.22.0）
+
+- **bl 自动跟随适配上游服务改名**（上游 4.20.2）。2026-10 上游把 bl 服务名从
+  `assistant-bard-web-server` 改成 `gemini-web-uiserver`，校验正则原来把服务名钉死，
+  改名后自动跟随会把抓到的新值当"形状不对"拒掉、永远回退到旧值。放宽成只校验
+  `boq_<服务名>_<日期>.<版本>_p<数字>` 的总体形状；兜底值同步更新。
+- **临时对话 `temporary_chat`**（上游 4.21.0，#34）。开启后请求塞 `inner[45]=1`，走
+  Gemini 网页端原生「临时对话」：会话压根不进账号的会话列表、不用于训练，比「自动删
+  网页会话」更干净，还省掉那次 `GzXR5e` 删除请求。只对登录号有意义；与「服务端多轮
+  续接」互斥（`multi_turn` 开着时不生效）。面板「设置」可开关，默认关。
+- **`gemini-4-argon` / `gemini-4-argon-thinking`**（上游 4.22.0，#35/#36）。接入网页端
+  「4 Argon」（复杂任务）。付费 / Ultra 账号专属，免费号发它会被静默降级成 3.5 Flash-Lite。
+  真正选中它靠 `MODE=8`（header 下标 14 / `inner[79]`）而不是 hex。
+  `-thinking` 版带 `reasoning_content`。
+- **依赖升级**：Go 1.26.8，`x/crypto` / `x/net` / `x/sys` / `x/text` 升补丁版
+  （修 govulncheck 报的漏洞）。
+
+### 修复
+
+- **视频产物取回（Veo 纯异步）**。上游把视频生成改成完全异步后，StreamGenerate 只回
+  会话 id + 标题、没有正文帧，被当成空响应重试，视频其实已在生成。现在拿到会话 id
+  就放行、转入产物轮询；纯文字回复连续 60 秒才判定并快速失败；轮询加进度日志。
+
 ## 4.20.1-browser-login.1
 
 ### 浏览器登录（本分支）

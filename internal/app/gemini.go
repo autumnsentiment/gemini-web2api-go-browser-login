@@ -28,6 +28,12 @@ const (
 	// "当前 Flash" 泛指针，老批次号发它拿到的是 3.6，会冒充 3.7。老批次号发这个主 hex
 	// 会干净降级成 3.5 Flash-Lite（跟 3.1 Pro 一样），所以 gate 成要 cookie。
 	hexFlash38 = "56fdd199312815e2" // 3.8 Flash（原记 3.7；Google 把这个 hex 原地升成 3.8，HAR 响应帧显示名已是 "3.8 Flash"）
+	// 4 Argon（#35）：otAQ7b 清单里主 hex 95a4c0abcba24364、短名 Argon、代号 Argon4p0、
+	// 显示名 "4 Argon"。付费/Ultra 号专属。实测**真正选中它靠的是 MODE=8（header 下标 14 /
+	// inner[79]），不是 hex**：借来的 Ultra 号上，hex=Argon 配 mode=1 回报 "3.8 Flash"（mode 1
+	// 那个模型），hex=3.8Flash 配 mode=8 反而回报 "4 Argon"——mode 决定、hex 被忽略。所以 Argon
+	// 条目的 Mode 必须填 8。仍按浏览器把 hex 配成 Argon 主 hex（最忠实、将来若改回认 hex 也不塌）。
+	hexArgon4 = "95a4c0abcba24364"
 )
 
 // innerSlots 是 payload 里 inner 数组的长度。浏览器发 97-98 槽，我们原来只开 80，
@@ -78,6 +84,9 @@ var Models = map[string]ModelConfig{
 	// gemini-3.7-flash 保留为别名（同 hex）。
 	"gemini-3.8-flash": {HexID: hexFlash38, Mode: 1, Desc: "3.8 Flash; needs a signed-in PAID Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
 	"gemini-3.7-flash": {HexID: hexFlash38, Mode: 1, Desc: "alias of gemini-3.8-flash (same hex; Google renamed 3.7→3.8)"},
+	// 4 Argon（#35）：Mode=8 是真正的选择开关（见 hexArgon4 注释）。付费/Ultra 号专属，
+	// 免费号发它会被静默降级成 3.5 Flash-Lite，所以 gate 成要 cookie（modelNeedsLogin）。
+	"gemini-4-argon": {HexID: hexArgon4, Mode: 8, Desc: "4 Argon (complex tasks); needs a signed-in PAID/Ultra Google account (free accounts get downgraded to 3.5 Flash-Lite)"},
 
 	// 扩展思考版。inner[80]=2 跟模型 hex 正交，都能开；但只在登录态生效，
 	// 所以跟 3.1 Pro 一样在没 cookie 时不暴露。
@@ -86,6 +95,10 @@ var Models = map[string]ModelConfig{
 	"gemini-3.1-pro-thinking":        {HexID: hexPro31, Mode: 3, Thinking: true, Desc: "3.1 Pro with extended thinking; needs a signed-in cookie"},
 	"gemini-3.8-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Desc: "3.8 Flash with extended thinking; needs a signed-in cookie"},
 	"gemini-3.7-flash-thinking":      {HexID: hexFlash38, Mode: 1, Thinking: true, Desc: "alias of gemini-3.8-flash-thinking"},
+	// 4 Argon + 扩展思考：Mode=8（选 Argon）+ inner[80]=2（上游现在把这档叫 "High"）。
+	// 实测回报 "4 Argon High" 且带思考链（硬题 985 字符，走既有 [4][0][37][0][0] 路径，
+	// 无需改抽取代码）→ 映射成 reasoning_content。付费/Ultra 专属。
+	"gemini-4-argon-thinking": {HexID: hexArgon4, Mode: 8, Thinking: true, Desc: "4 Argon with extended thinking (High reasoning tier); emits reasoning_content; needs a signed-in PAID/Ultra account"},
 
 	// 媒体生成。inner[49] 一填，服务端换后端模型出图/出乐；产物走 hNvQHb + 下载 host
 	// 取回，以 base64 data URL 塞进 content 返回。都要登录态，没 cookie 时不暴露。
@@ -111,7 +124,17 @@ func hasCookie() bool {
 // 逐模型核对等价：那三个正名的 HexID 就是 hexPro31 / hexFlash38，其余登录模型都被
 // Thinking 或 Tool 覆盖。
 func modelNeedsLogin(mc ModelConfig) bool {
-	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.Thinking || mc.Tool > 0
+	return mc.HexID == hexPro31 || mc.HexID == hexFlash38 || mc.HexID == hexArgon4 || mc.Thinking || mc.Tool > 0
+}
+
+// temporaryChatEligible 判断这次请求该不该走网页端原生「临时对话」（inner[45]=1，#34）。
+//
+// 与 multi_turn 冲突：临时对话不进会话列表，而 multi_turn 要按历史认出续接、靠服务端
+// 留着这串对话——两个一起开，续接那半就没了。所以 multi_turn 开着时一律不发 inner[45]，
+// 由 multi_turn 决定会话怎么留。调用点还会再要求有登录 cookie：匿名本来就不落账号，
+// 发 inner[45] 是没验过的无谓偏离。
+func temporaryChatEligible() bool {
+	return rtCfg().TemporaryChat && !rtCfg().MultiTurn
 }
 
 // anonFirstEligible 判断「匿名优先」开关下这次请求能不能走匿名（不占 cookie 账号）：
@@ -531,6 +554,12 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 	// 我们原来写 [2]，是早期抄来的值、协议层已被证伪。含义仍未知，
 	// 匿名两个值都能通，但没有理由继续偏离浏览器。
 	inner[41] = []interface{}{1}
+	// 临时对话（#34）：inner[45]=1 让这条不进账号的会话列表、不入训练。只在有登录
+	// cookie 时发——匿名本就不落账号，发了也没意义且没验过。multi_turn 开着时
+	// temporaryChatEligible 直接为假（两者冲突，见那里）。
+	if temporaryChatEligible() && cookieStr != "" {
+		inner[45] = 1
+	}
 	inner[53] = 0
 	reqUUID := uuid.NewString()
 	inner[59] = reqUUID
@@ -790,7 +819,10 @@ func streamGenerateWithFiles(prompt, latest string, mc ModelConfig, pending []pe
 		}
 		// #19 自动删会话：出完结果把 gemini.google.com 上留下的这条会话删掉，避免
 		// 用户账号里堆一堆。只登录态能删（要 XSRF），异步 best-effort，不影响响应。
-		if rtCfg().AutoDeleteConversation && cookieStr != "" && xsrfToken != "" {
+		//
+		// 临时对话（#34）生效时跳过：那条压根没进会话列表，删它是多发一次 RPC 删空气。
+		// 这正是临时对话比 create-then-delete 省的那一次出站请求。
+		if rtCfg().AutoDeleteConversation && !temporaryChatEligible() && cookieStr != "" && xsrfToken != "" {
 			if cid := extractConversationID(string(raw)); cid != "" {
 				go deleteConversation(cid, cookieStr, sapisid, xsrfToken, proxyURL, authUser)
 			}

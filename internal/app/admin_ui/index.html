@@ -1280,6 +1280,8 @@ const RT_GROUPS = [
         hint: '上游前端版本号。请求大面积失败时先看这里是不是过期了' },
       { k: 'gemini_bl_auto', label: '自动跟随 bl 版本', type: 'bool',
         hint: '每 6 小时从 /app 页面抓一次最新版本号，抓到就用抓到的。抓不到或格式不对就继续用上面钉的值' },
+      { k: 'temporary_chat', label: '临时对话', type: 'bool',
+        hint: '走网页端原生「临时对话」（inner[45]=1）：会话压根不进账号的会话列表、不用于训练，比「自动删网页会话」更干净，还省掉那次删除请求。只登录态有意义；开了「服务端多轮续接」时不生效（临时对话不留列表，多轮要靠服务端留会话）' },
       { k: 'auto_delete_conversation', label: '自动删网页会话', type: 'bool',
         hint: '出完结果自动删掉 gemini.google.com 上留下的这条会话，免得登录号里堆一堆。只登录态生效，异步 best-effort，删失败不影响响应' },
       { k: 'multi_turn', label: '服务端多轮续接', type: 'bool',

@@ -50,6 +50,8 @@ var modelGuardFallbackRe = regexp.MustCompile(`(?i)flash[- ]?lite`)
 var modelGuardPremiumHints = map[string]bool{
 	"gemini-3.1-pro":                 true,
 	"gemini-3.7-flash":               true,
+	"gemini-4-argon":                 true,
+	"gemini-4-argon-thinking":        true,
 	"gemini-3.1-pro-thinking":        true,
 	"gemini-3.5-flash-lite-thinking": true,
 	"gemini-3.6-flash-thinking":      true,
